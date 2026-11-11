@@ -495,6 +495,8 @@ private:
     void ShowGameNotice(const QString& text);
     /// Kizuna (Ctrl+G): frame generation on (at its multiplier) or off, live.
     void ToggleFrameGeneration();
+    /// Kizuna: a notice over the game while Windows has under 3 GiB of commit left.
+    void WarnLowSystemMemory();
     /// Switches Ocarina of Time's high refresh rate mode while it runs, saves the setting when it
     /// worked, and says how it went in the status bar.
     void SetOotHighRefresh(bool on);

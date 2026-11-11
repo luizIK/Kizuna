@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 
@@ -29,6 +31,18 @@ struct MemoryInfo {
 /// minus what is committed. No value where the host reports no such limit (anything but Windows).
 /// From zortos293/Lichii#1210.
 [[nodiscard]] std::optional<u64> GetSystemCommitRoom();
+
+/// Kizuna (Windows): the programs holding the most commit, by executable name (all of a
+/// browser's processes together), largest first, e.g. "chrome.exe 6.2 GiB (31 processes),
+/// ...; in no program 3.1 GiB" for the `count` largest. Takes ~10 to 50 ms (it opens every
+/// process): not for the GPU thread. Empty elsewhere.
+[[nodiscard]] std::string TopCommitPrograms(size_t count);
+/// The last list TopCommitPrograms made (empty before the first), for the crash report: a
+/// static buffer, nothing allocated.
+[[nodiscard]] const char* LastTopCommitPrograms();
+/// Runs TopCommitPrograms(8) on a thread of its own and logs it with `reason`; at most one at a
+/// time, and at most once every `min_interval_s` seconds.
+void LogTopCommitProgramsAsync(const char* reason, int min_interval_s);
 
 struct ProcessMemoryUsage {
     u64 working_set{};

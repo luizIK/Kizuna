@@ -251,21 +251,51 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
     } catch (const vk::Exception& e) {
         // Out of memory: free every idle staging buffer and try once more.
-        size_t freed = 0;
-        for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
-            for (StagingBuffers& level : *cache) {
-                const size_t before = level.entries.size();
-                std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                    return !entry.deferred && scheduler.IsFree(entry.tick);
-                });
-                freed += before - level.entries.size();
-                level.iterate_index = 0;
-                level.delete_index = 0;
+        const auto free_idle = [this] {
+            size_t freed = 0;
+            for (StagingBuffersCache* cache :
+                 {&device_local_cache, &upload_cache, &download_cache}) {
+                for (StagingBuffers& level : *cache) {
+                    const size_t before = level.entries.size();
+                    std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                        return !entry.deferred && scheduler.IsFree(entry.tick);
+                    });
+                    freed += before - level.entries.size();
+                    level.iterate_index = 0;
+                    level.delete_index = 0;
+                }
             }
-        }
+            return freed;
+        };
+        const size_t freed = free_idle();
         LOG_WARNING(Render_Vulkan, "Staging buffer of {} MiB could not be made ({}); freed {} idle "
                     "staging buffers and retrying", buffer_ci.size >> 20, e.what(), freed);
-        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        try {
+            buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        } catch (const vk::Exception&) {
+            // Kizuna: the system's commit is full (2026-11-11: 1.8 GiB of 49 GiB left, 27 GiB
+            // in other programs, on the way to Hyrule Field). The GPU finishes its work so the
+            // staging buffers it still reads are free too, all of them go back, and the request
+            // is tried a few more times (each waits a few seconds for memory): a long freeze
+            // the player can end by closing a program, rather than the emulator ending.
+            scheduler.Finish();
+            const size_t freed_after_finish = free_idle();
+            constexpr int MoreTries = 3;
+            for (int attempt = 1;; ++attempt) {
+                LOG_WARNING(Render_Vulkan,
+                            "Staging buffer of {} MiB: Windows is out of memory; GPU idle, {} "
+                            "more staging buffers freed, try {} of {}",
+                            buffer_ci.size >> 20, freed_after_finish, attempt, MoreTries);
+                try {
+                    buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+                    break;
+                } catch (const vk::Exception&) {
+                    if (attempt == MoreTries) {
+                        throw;
+                    }
+                }
+            }
+        }
     }
     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);

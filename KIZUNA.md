@@ -96,6 +96,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   3x, 4x; live). Fritchii turned frame generation off for its builds (`Settings::FrameGenActive`)
   and hid its settings; Kizuna builds offer it, off by default, with the settings in Graphics.
 
+- **Windows out of memory (commit).** Windows refuses memory past its commit limit (RAM plus
+  virtual memory) whatever the card has free, and device memory counts against it too. Under
+  3 GiB left a notice over the game says so (`MainWindow::WarnLowSystemMemory`). The log lists
+  the programs holding the commit at the start and every minute while under 8 GiB is left
+  (`Common::TopCommitPrograms`, on a thread of its own), and the crash report carries the last
+  list. A staging buffer that still does not fit after the idle ones are freed waits for the GPU
+  to finish, frees the rest and is tried three more times before the emulator gives up.
+
 ## Keeping the "Preparing shaders" cache valid
 
 The marker of a finished preparation (`precompiled_prepared.fork-v54.txt`) holds the precompiled

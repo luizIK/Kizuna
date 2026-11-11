@@ -5300,6 +5300,8 @@ void MainWindow::UpdateStatusBar() {
     else
         tas_label->clear();
 
+    WarnLowSystemMemory();
+
     auto results = QtCommon::system->GetAndResetPerfStats();
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
@@ -5413,6 +5415,28 @@ void MainWindow::ShowGameNotice(const QString& text) {
     if (FritchiiUi::Enabled() && emulation_running && render_window != nullptr) {
         FritchiiUi::ShowNotice(render_window, text);
     }
+}
+
+void MainWindow::WarnLowSystemMemory() {
+    // Kizuna: Windows refuses memory past its commit limit (RAM plus virtual memory), and the
+    // emulator ends when a texture or buffer does not fit. Under 3 GiB left (a scene change takes
+    // ~6), a notice over the game says so, at most every 45 s (2026-11-11: 27 GiB in other
+    // programs, a crash on the way to Hyrule Field).
+    static auto last_warning = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last_warning != std::chrono::steady_clock::time_point{} &&
+        now - last_warning < std::chrono::seconds{45}) {
+        return;
+    }
+    const std::optional<u64> room = Common::GetSystemCommitRoom();
+    constexpr u64 Warn = u64{3} << 30;
+    if (!room || *room >= Warn) {
+        return;
+    }
+    last_warning = now;
+    ShowGameNotice(tr("Windows is almost out of memory (%1 GB left): close other programs or "
+                      "raise the virtual memory")
+                       .arg(static_cast<double>(*room) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1));
 }
 
 void MainWindow::ToggleFrameGeneration() {

@@ -835,6 +835,19 @@ void LogMemoryTrace(const Device& device) {
              process.private_bytes >> 20, process.working_set >> 20,
              process.private_working_set >> 20,
              process.system_commit >> 20, process.system_commit_limit >> 20);
+    // Kizuna: which programs hold the system's commit, once at the start and every minute while
+    // less than 8 GiB of it is left (2026-11-11: 27 GiB in other programs, and the PC's 49 GiB
+    // limit reached on the way to Hyrule Field). On a thread of its own: it opens every process.
+    {
+        static bool first = true;
+        const bool tight = process.system_commit_limit != 0 &&
+                           process.system_commit + (u64{8} << 30) > process.system_commit_limit;
+        if (first || tight) {
+            Common::LogTopCommitProgramsAsync(first ? "at the start" : "less than 8 GiB left",
+                                              first ? 0 : 60);
+            first = false;
+        }
+    }
 #ifdef _WIN32
     // This process's use of the card's memory (local) and of system memory for the GPU
     // (non-local: host memory types, and what the OS moved out of video memory).

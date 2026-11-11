@@ -19,6 +19,7 @@
 #include <dbghelp.h>
 
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/scm_rev.h"
 
 namespace KizunaCrash {
@@ -126,6 +127,12 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* info) {
                            static_cast<unsigned long long>(memory.ullTotalPageFile >> 20),
                            static_cast<unsigned long long>(memory.ullAvailPhys >> 20),
                            static_cast<unsigned long long>(memory.ullTotalPhys >> 20)));
+    }
+    // The programs holding the commit, as last measured while playing (the start, then every
+    // minute while it was tight): a static buffer, nothing measured here.
+    if (const char* programs = Common::LastTopCommitPrograms(); programs[0] != '\0') {
+        Append(length, std::snprintf(text + length, size - length, "Programs by commit: %s\r\n",
+                                     programs));
     }
     void* frames[32]{};
     const USHORT count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);

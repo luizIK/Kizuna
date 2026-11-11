@@ -19,15 +19,26 @@
 #endif
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <map>
 #include <mutex>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 #ifdef _MSC_VER
 #include <malloc.h>
 #endif
 
+#include "common/logging.h"
 #include "common/memory_detect.h"
+#ifdef _WIN32
+#include "common/string_util.h"
+#endif
 
 namespace Common {
 
@@ -187,6 +198,119 @@ HeapUsage SampleHeapUsage() {
 HeapUsage LastHeapUsage() {
     std::scoped_lock lock{g_heap_usage_mutex};
     return g_heap_usage;
+}
+
+namespace {
+std::mutex g_top_commit_mutex;
+char g_top_commit_text[1024]{};
+std::atomic<bool> g_top_commit_running{false};
+std::atomic<s64> g_top_commit_last_s{-1000000};
+} // Anonymous namespace
+
+std::string TopCommitPrograms(size_t count) {
+#ifdef _WIN32
+    std::vector<DWORD> pids(8192);
+    DWORD bytes = 0;
+    if (!EnumProcesses(pids.data(), static_cast<DWORD>(pids.size() * sizeof(DWORD)), &bytes)) {
+        return {};
+    }
+    pids.resize(bytes / sizeof(DWORD));
+    struct Program {
+        u64 commit{};
+        u32 processes{};
+    };
+    std::map<std::wstring, Program> programs;
+    u64 listed{};
+    for (const DWORD pid : pids) {
+        if (pid == 0) {
+            continue;
+        }
+        HANDLE process =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (process == nullptr) {
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        }
+        if (process == nullptr) {
+            continue;
+        }
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        counters.cb = sizeof(counters);
+        wchar_t path[MAX_PATH]{};
+        DWORD length = MAX_PATH;
+        if (GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters)) &&
+            QueryFullProcessImageNameW(process, 0, path, &length)) {
+            const std::wstring_view full{path, length};
+            const size_t slash = full.find_last_of(L"\\/");
+            Program& program = programs[std::wstring{
+                slash == std::wstring_view::npos ? full : full.substr(slash + 1)}];
+            program.commit += counters.PrivateUsage;
+            ++program.processes;
+            listed += counters.PrivateUsage;
+        }
+        CloseHandle(process);
+    }
+    std::vector<std::pair<std::wstring, Program>> sorted(programs.begin(), programs.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.commit > b.second.commit; });
+    std::string text;
+    char line[160];
+    for (size_t i = 0; i < (std::min)(count, sorted.size()); ++i) {
+        const auto& [name, program] = sorted[i];
+        std::snprintf(line, sizeof(line), "%s%s %.1f GiB (%u process%s)", i == 0 ? "" : ", ",
+                      UTF16ToUTF8(name).c_str(),
+                      static_cast<double>(program.commit) / (1024.0 * 1024.0 * 1024.0),
+                      program.processes, program.processes == 1 ? "" : "es");
+        text += line;
+    }
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        // Commit charged to no process: the guest memory section, the drivers' and the kernel's
+        // own, virtual machines (WSL, Hyper-V).
+        const u64 total = u64{performance.CommitTotal} * performance.PageSize;
+        std::snprintf(line, sizeof(line), "; in no program %.1f GiB of %.1f GiB committed",
+                      static_cast<double>(total > listed ? total - listed : 0) /
+                          (1024.0 * 1024.0 * 1024.0),
+                      static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0));
+        text += line;
+    }
+    {
+        std::scoped_lock lock{g_top_commit_mutex};
+        std::snprintf(g_top_commit_text, sizeof(g_top_commit_text), "%s", text.c_str());
+    }
+    return text;
+#else
+    static_cast<void>(count);
+    return {};
+#endif
+}
+
+const char* LastTopCommitPrograms() {
+    return g_top_commit_text;
+}
+
+void LogTopCommitProgramsAsync(const char* reason, int min_interval_s) {
+#ifdef _WIN32
+    const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - g_top_commit_last_s.load(std::memory_order_relaxed) < min_interval_s ||
+        g_top_commit_running.exchange(true)) {
+        return;
+    }
+    g_top_commit_last_s.store(now, std::memory_order_relaxed);
+    std::thread([reason] {
+        const std::string text = TopCommitPrograms(8);
+        if (!text.empty()) {
+            LOG_INFO(Common_Memory, "Programs by commit ({}): {}", reason, text);
+        }
+        g_top_commit_running.store(false);
+    }).detach();
+#else
+    static_cast<void>(reason);
+    static_cast<void>(min_interval_s);
+#endif
 }
 
 std::optional<u64> GetSystemCommitRoom() {

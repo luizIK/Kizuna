@@ -491,6 +491,13 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
         const u64 budget = runtime.GetDeviceMemoryBudget();
         max_critical = (std::max)(max_critical, budget / 8 * 5);
+        // Kizuna: on an 8 GB card the budget is not steady: other programs and four monitors took
+        // 2 GB of it in the middle of a game (7379 -> 5141 MiB, 5532 MiB at the crash), so a cache
+        // that fills 5 GiB is over the new budget before it can shrink. 4.5 GiB leaves that room;
+        // EDEN_NX2_TC_CEILING_MIB below lowers it further.
+        if (budget != 0 && budget < 9_GiB) {
+            max_critical = (std::min)(max_critical, u64{4608_MiB});
+        }
         // Cards with 10 GiB or more of budget: 5/8 left ~7.3 GiB on a 12 GB RX 6700 XT, under what
         // Ocarina's Kokiri Forest keeps alive, so every aggressive pass evicted its CostlyLoad ASTC
         // textures (a 6144x6144 5x5 one, 31 MiB) and the game re-created them ~128 frames later:
@@ -743,12 +750,27 @@ void TextureCache<P>::TickFrame() {
                 }
             }
         }
+        // Kizuna: the allocator keeps a block of device memory for buffers, which it gives back
+        // when one does not fit (a buffer that fits nowhere ended build 6). With a gigabyte of
+        // room under the critical threshold it is taken again, a few seconds apart.
+        if constexpr (requires { runtime.RestoreMemoryReserve(); }) {
+            if (native_thresholds_applied && frame_tick % 120 == 0 &&
+                total_used_memory + 1_GiB < critical_memory) {
+                runtime.RestoreMemoryReserve();
+            }
+        }
     }
     // EDEN_NX2_MEM_TRACE=1 (from zortos293/Lichii#951): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
-    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    // Kizuna: on by default, every 10 s (EDEN_NX2_MEM_TRACE=0 turns it off, any other value
+    // brings back the 2 s period): the cache's share of the device memory, next to what the
+    // process and the driver report, is what tells where the video memory goes.
+    static const char* const mem_trace_env = std::getenv("EDEN_NX2_MEM_TRACE");
+    static const bool mem_trace = mem_trace_env == nullptr || mem_trace_env[0] != '0';
+    static const auto mem_trace_period =
+        std::chrono::seconds{mem_trace_env != nullptr ? 2 : 10};
     if (const auto now = std::chrono::steady_clock::now();
-        mem_trace && now - mem_trace_time >= std::chrono::seconds{2}) {
+        mem_trace && now - mem_trace_time >= mem_trace_period) {
         mem_trace_time = now;
         u64 image_bytes{};
         u64 gpu_written_bytes{};

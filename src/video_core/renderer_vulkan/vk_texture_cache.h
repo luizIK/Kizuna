@@ -156,6 +156,12 @@ public:
         return image_pool_bytes;
     }
 
+    /// Kizuna: the allocator holds its block of device memory for buffers again, if there is room
+    /// (MemoryAllocator::RestoreReserve).
+    void RestoreMemoryReserve() const {
+        memory_allocator.RestoreReserve();
+    }
+
     /// Gives the pool's device memory back now (an allocation failed mid-frame). True when the
     /// pool held any.
     bool ReleaseImagePool() {

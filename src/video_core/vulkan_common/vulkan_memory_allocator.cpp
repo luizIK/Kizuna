@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <thread>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -217,7 +219,147 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
     }
 }
 
-MemoryAllocator::~MemoryAllocator() = default;
+MemoryAllocator::~MemoryAllocator() {
+    ReleaseReserve();
+}
+
+namespace {
+// Kizuna: device memory kept free for buffers (MemoryAllocator::RestoreReserve). 192 MiB covers a
+// dozen of the 16 MiB buffers the buffer cache makes, and the texture cache gets it back by
+// collecting harder once it is given back (it counts as a pressure event).
+constexpr VkDeviceSize ReserveBytes = VkDeviceSize{192} << 20;
+// Cards with less budget than this keep no reserve: it would be most of what they have.
+constexpr u64 MinBudgetForReserve = u64{3} << 30;
+} // Anonymous namespace
+
+void MemoryAllocator::RestoreReserve() const {
+    std::scoped_lock lock{reserve_mutex};
+    if (reserve_buffer != VK_NULL_HANDLE) {
+        return;
+    }
+    const u64 budget = device.GetDeviceMemoryBudget();
+    if (budget != 0 && budget < MinBudgetForReserve) {
+        return;
+    }
+    const VkBufferCreateInfo ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = ReserveBytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    // Its own vkAllocateMemory (so that giving it back returns the memory to the driver, not to
+    // one of VMA's blocks), within the budget (no room: no reserve, and nothing is made worse).
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT |
+                 VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .preferredFlags = 0,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.f,
+    };
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    if (vmaCreateBuffer(allocator, &ci, &alloc_ci, &buffer, &allocation, nullptr) == VK_SUCCESS) {
+        reserve_buffer = buffer;
+        reserve_allocation = allocation;
+    }
+}
+
+bool MemoryAllocator::ReleaseReserve() const {
+    std::scoped_lock lock{reserve_mutex};
+    if (reserve_buffer == VK_NULL_HANDLE) {
+        return false;
+    }
+    vmaDestroyBuffer(allocator, reserve_buffer, reserve_allocation);
+    reserve_buffer = VK_NULL_HANDLE;
+    reserve_allocation = VK_NULL_HANDLE;
+    return true;
+}
+
+bool MemoryAllocator::HasReserve() const {
+    std::scoped_lock lock{reserve_mutex};
+    return reserve_buffer != VK_NULL_HANDLE;
+}
+
+namespace {
+// Kizuna: a buffer that did not fit the device memory budget. `create` makes it with the given
+// allocation info (leaving the handles null when it fails). In order: the reserve given back and
+// the same request again (the right answer when the card was merely full); over the budget (the
+// driver pages); as a last resort host memory for device-local buffers (slow, but valid). When
+// even that is refused, the card or the system's commit is full at this moment: other programs
+// and our own deleted images give memory back within moments, so it waits for them for a few
+// seconds (a stall) rather than ending the process (a crash). Build 6: a 16 MiB buffer, uncaught.
+constexpr u32 MaxBufferWaits = 40;
+constexpr auto BufferWaitStep = std::chrono::milliseconds{100};
+
+template <typename Create>
+[[nodiscard]] VkResult RescueBuffer(const MemoryAllocator& memory_allocator, Create&& create,
+                                    const VmaAllocationCreateInfo& alloc_ci, MemoryUsage usage,
+                                    VkDeviceSize size, VkResult first_result, const char* what,
+                                    std::atomic<u32>& pressure_events) {
+    VmaAllocationCreateInfo over_budget = alloc_ci;
+    over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    VmaAllocationCreateInfo host = over_budget;
+    host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    host.preferredFlags = 0;
+    host.memoryTypeBits = 0;
+    const bool device_local = usage == MemoryUsage::DeviceLocal;
+
+    VkResult result = first_result;
+    const char* outcome = "made anyway";
+    VkResult reserve_result = VK_NOT_READY; // not tried
+    VkResult over_result = VK_NOT_READY;
+    VkResult host_result = VK_NOT_READY;
+    if (memory_allocator.ReleaseReserve()) {
+        reserve_result = create(alloc_ci);
+        result = reserve_result;
+        outcome = "made after giving back the reserve";
+    }
+    if (result != VK_SUCCESS) {
+        over_result = create(over_budget);
+        result = over_result;
+        outcome = "made anyway";
+    }
+    if (result != VK_SUCCESS && device_local) {
+        host_result = create(host);
+        result = host_result;
+        outcome = "made in host memory";
+    }
+    u32 waits = 0;
+    while (result != VK_SUCCESS && waits < MaxBufferWaits) {
+        std::this_thread::sleep_for(BufferWaitStep);
+        ++waits;
+        result = create(over_budget);
+        if (result != VK_SUCCESS && device_local) {
+            result = create(host);
+        }
+        outcome = "made after waiting";
+    }
+    if (device_local) {
+        pressure_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
+        LOG_WARNING(Render_Vulkan,
+                    "{} of {} KiB (usage {}) over the memory budget: {} (first {}, reserve {}, "
+                    "over budget {}, host {}, waited {} ms; system commit left {} MiB)",
+                    what, size >> 10, static_cast<u32>(usage),
+                    result == VK_SUCCESS ? outcome : "failed", static_cast<int>(first_result),
+                    static_cast<int>(reserve_result), static_cast<int>(over_result),
+                    static_cast<int>(host_result), waits * BufferWaitStep.count(),
+                    commit_room ? static_cast<s64>(*commit_room >> 20) : s64{-1});
+    }
+    return result;
+}
+} // Anonymous namespace
 
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
@@ -465,31 +607,16 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         // square after 36 minutes).
         // Kizuna: the same for device-local buffers. A card at its budget (5135 of 5141 MiB on
         // an 8 GB RX 6600 shared with other programs) refused one and the exception ended the
-        // process without a word; over the budget the driver pages, and as a last resort the
-        // buffer goes to host memory (slow, but valid).
+        // process without a word: RescueBuffer gives the reserve back, goes over the budget,
+        // then to host memory, then waits a few seconds, before the exception is left to end it.
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
-            VmaAllocationCreateInfo over_budget = alloc_ci;
-            over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-            result = vmaCreateBuffer(allocator, &ci, &over_budget, &handle, &allocation,
-                                     &alloc_info);
-            const char* outcome = "made anyway";
-            if (result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
-                VmaAllocationCreateInfo host = over_budget;
-                host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-                host.preferredFlags = 0;
-                host.memoryTypeBits = 0;
-                result = vmaCreateBuffer(allocator, &ci, &host, &handle, &allocation, &alloc_info);
-                outcome = "made in host memory";
-            }
-            if (usage == MemoryUsage::DeviceLocal) {
-                pressure_events.fetch_add(1, std::memory_order_relaxed);
-            }
-            static u32 buffer_logged{};
-            if (buffer_logged++ < 32) {
-                LOG_WARNING(Render_Vulkan, "Buffer of {} KiB (usage {}) over the memory budget: {}",
-                            ci.size >> 10, static_cast<u32>(usage),
-                            result == VK_SUCCESS ? outcome : "failed");
-            }
+            result = RescueBuffer(
+                *this,
+                [&](const VmaAllocationCreateInfo& info) {
+                    return vmaCreateBuffer(allocator, &ci, &info, &handle, &allocation,
+                                           &alloc_info);
+                },
+                alloc_ci, usage, ci.size, result, "Buffer", pressure_events);
         }
         vk::Check(result);
     }
@@ -552,29 +679,14 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
                                                            &handle, &allocation, &alloc_info);
     if (aligned_result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
         aligned_result == VK_ERROR_OUT_OF_HOST_MEMORY) {
-        // Kizuna: as in CreateBuffer above: over the budget, then host memory, not an abort.
-        VmaAllocationCreateInfo over_budget = alloc_ci;
-        over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        aligned_result = vmaCreateBufferWithAlignment(allocator, &ci, &over_budget, min_alignment,
-                                                      &handle, &allocation, &alloc_info);
-        if (aligned_result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
-            VmaAllocationCreateInfo host = over_budget;
-            host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-            host.preferredFlags = 0;
-            host.memoryTypeBits = 0;
-            aligned_result = vmaCreateBufferWithAlignment(allocator, &ci, &host, min_alignment,
-                                                          &handle, &allocation, &alloc_info);
-        }
-        if (usage == MemoryUsage::DeviceLocal) {
-            pressure_events.fetch_add(1, std::memory_order_relaxed);
-        }
-        static u32 aligned_logged{};
-        if (aligned_logged++ < 32) {
-            LOG_WARNING(Render_Vulkan,
-                        "Aligned buffer of {} KiB (usage {}) over the memory budget: {}",
-                        ci.size >> 10, static_cast<u32>(usage),
-                        aligned_result == VK_SUCCESS ? "made anyway" : "failed");
-        }
+        // Kizuna: as in CreateBuffer above: the reserve, over the budget, host memory, waiting.
+        aligned_result = RescueBuffer(
+            *this,
+            [&](const VmaAllocationCreateInfo& info) {
+                return vmaCreateBufferWithAlignment(allocator, &ci, &info, min_alignment, &handle,
+                                                    &allocation, &alloc_info);
+            },
+            alloc_ci, usage, ci.size, aligned_result, "Aligned buffer", pressure_events);
     }
     vk::Check(aligned_result);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);

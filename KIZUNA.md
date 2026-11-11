@@ -15,9 +15,19 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   budget free (at most 1.25 GiB) instead of 1/8 (1 GiB), gives the image pool's idle images back
   once it is past its critical threshold, and logs a "Memory census" (what the cache holds, the
   largest images, the main formats) the first four times device memory runs out.
-- **No abort for a buffer that does not fit.** Device-local buffers over the budget are made
-  anyway and, failing that, in host memory (images already had this fallback), instead of
-  throwing out of the GPU thread.
+- **No abort for a buffer that does not fit.** The allocator keeps a 192 MiB block of device
+  memory in reserve (taken again by the texture cache whenever it has a gigabyte of room under its
+  critical threshold; none on cards with a budget under 3 GiB). A buffer the budget refuses first
+  gets the reserve back and tries again, then goes over the budget, then (device-local buffers) to
+  host memory, then waits up to 4 s for memory to come back, and only then throws. The log line
+  says which step worked or failed (Vulkan result of each) and how much system commit was left.
+  Build 6 died on a 16 MiB buffer at 7650 MiB with a 5.6 GiB budget.
+- **A lower ceiling on 8 GB cards.** On cards with a budget under 9 GiB the cache's critical
+  threshold is at most 4.5 GiB (5 GiB before): Windows moved the budget by 2 GB mid-game.
+  `EDEN_NX2_TC_CEILING_MIB` still lowers it further.
+- **Memory trace on by default.** Every 10 s the log has a "Memory trace" line (the cache's
+  images and bytes next to the device's usage) plus the process, DXGI and VMA lines, to see where
+  the video memory goes. `EDEN_NX2_MEM_TRACE=0` turns it off, any other value makes it every 2 s.
 - **A last word before dying.** An exception nobody catches is written to the log
   (`Fatal: uncaught ...`) before the process aborts, so a crash leaves its cause behind.
 - The update checker is off in the Windows build, so it never offers upstream builds over this one.

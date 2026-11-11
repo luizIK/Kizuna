@@ -147,6 +147,18 @@ namespace Vulkan {
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
 
+        /// Kizuna: takes a block of device memory (192 MiB) that nothing uses, if there is
+        /// room within the budget and none is held. A buffer that does not fit gives it back
+        /// (ReleaseReserve) instead of ending the process: a 16 MiB buffer killed build 6 with
+        /// the card at its budget. The texture cache calls this when it has room again.
+        void RestoreReserve() const;
+
+        /// Gives the reserve back to the driver. True when there was one.
+        bool ReleaseReserve() const;
+
+        /// True while the reserve is held.
+        [[nodiscard]] bool HasReserve() const;
+
         /**
          * Commits a memory with the specified requirements.
          *
@@ -184,6 +196,9 @@ namespace Vulkan {
         u32 valid_memory_types{~0u};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::atomic<u32> failed_images{0};
+        mutable std::mutex reserve_mutex;
+        mutable VkBuffer reserve_buffer{};         ///< RestoreReserve's block, null when given back.
+        mutable VmaAllocation reserve_allocation{};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;

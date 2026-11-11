@@ -30,6 +30,10 @@ wchar_t crash_dir[MAX_PATH * 2]{};
 char report[8192];
 wchar_t path_buffer[MAX_PATH * 2 + 64];
 LONG entered = 0;
+// MinGW's own filter (crt0's _gnu_exception_handler): it continues the GCC C++ exceptions nobody
+// caught, so that std::terminate runs and the renderer's terminate handler logs the error. v1.6
+// replaced it, and a VK_ERROR thrown at a scene change left only "0x20474343" here.
+LPTOP_LEVEL_EXCEPTION_FILTER previous_filter = nullptr;
 
 using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
                                           PMINIDUMP_EXCEPTION_INFORMATION,
@@ -75,7 +79,7 @@ void Append(int& length, int written) {
 LONG WINAPI Filter(EXCEPTION_POINTERS* info) {
     if (InterlockedExchange(&entered, 1) != 0 || crash_dir[0] == L'\0' || info == nullptr ||
         info->ExceptionRecord == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
+        return previous_filter ? previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
     }
     const EXCEPTION_RECORD& record = *info->ExceptionRecord;
     // Breakpoints and C++ exceptions that something catches never get here; a debugger's
@@ -170,7 +174,9 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* info) {
             }
         }
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    // A C++ exception goes on to std::terminate (the log names it); anything else ends here.
+    // Only the first exception gets a report (entered stays set): the same second's file name.
+    return previous_filter ? previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 
 } // Anonymous namespace
@@ -186,7 +192,7 @@ void Install() {
             return;
         }
         std::wmemcpy(crash_dir, wide.c_str(), wide.size() + 1);
-        SetUnhandledExceptionFilter(Filter);
+        previous_filter = SetUnhandledExceptionFilter(Filter);
     } catch (...) {
         // No report is better than no start.
     }

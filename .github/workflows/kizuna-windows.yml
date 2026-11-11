@@ -218,6 +218,10 @@ jobs:
         run: |
           Compress-Archive -Path build/release/bin/* -DestinationPath "Kizuna-windows-x86_64-pgo.zip"
           Get-Item Kizuna-windows-x86_64-pgo.zip | Select-Object Name, Length
+          # The linker map, for reading crash reports (lichii.exe+offset); not needed to play.
+          if (Test-Path build/release/lichii.map) {
+            Compress-Archive -Path build/release/lichii.map -DestinationPath "Kizuna-symbols.zip"
+          }
 
       - name: Upload zip
         uses: actions/upload-artifact@v7
@@ -246,7 +250,9 @@ jobs:
           Commit ${GITHUB_SHA::7}, workflow run ${GITHUB_RUN_NUMBER}.
 
           Extract the zip and run lichii.exe, or use Help > Check for Updates in Kizuna."
-          gh release create "$tag" Kizuna-windows-x86_64-pgo.zip \
+          files=(Kizuna-windows-x86_64-pgo.zip)
+          if [ -f Kizuna-symbols.zip ]; then files+=(Kizuna-symbols.zip); fi
+          gh release create "$tag" "${files[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --latest \

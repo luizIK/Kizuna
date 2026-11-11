@@ -238,7 +238,8 @@ enum class UnevenAstcMode {
 }
 
 // Past this size the last level a cut view keeps would shimmer far away: such images stay RGBA8.
-constexpr u32 MaxUnevenTailTexels = 32;
+// 64: Ocarina's town has hundreds of 576x576 textures (even down to 36x36), 1.7 MiB each as RGBA8.
+constexpr u32 MaxUnevenTailTexels = 64;
 
 // ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
 // an AMD driver, which samples the BC copy wrong from the first uneven level on: dark lines along
@@ -3082,29 +3083,7 @@ void TextureCacheRuntime::TickFrame() {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    RecycleTranscodes();
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -3118,6 +3097,50 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
         return scheduler.IsFree(pending.first);
     });
+}
+
+namespace {
+// Device memory of a transcode's RGBA8 decode image.
+[[nodiscard]] u64 TranscodeDecodeBytes(u32 width, u32 height, u32 levels, u32 layers) {
+    u64 bytes{};
+    for (u32 level = 0; level < levels; ++level) {
+        bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+    }
+    return bytes * layers;
+}
+} // Anonymous namespace
+
+bool TextureCacheRuntime::WaitOldestTranscode() {
+    if (pending_transcodes.empty()) {
+        return false;
+    }
+    // Submits the recording first if the decode is still in it.
+    scheduler.Wait(pending_transcodes.front().tick);
+    RecycleTranscodes();
+    return true;
+}
+
+void TextureCacheRuntime::RecycleTranscodes() {
+    // Finished decode images wait for the next texture of their shape, up to this much memory.
+    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    const auto bytes_of = [](const PendingTranscode& t) {
+        return TranscodeDecodeBytes(t.width, t.height, t.levels, t.layers);
+    };
+    u64 free_bytes{};
+    for (const PendingTranscode& t : free_transcodes) {
+        free_bytes += bytes_of(t);
+    }
+    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        PendingTranscode& done = pending_transcodes.front();
+        const u64 bytes = bytes_of(done);
+        pending_transcode_bytes -= (std::min)(pending_transcode_bytes, bytes);
+        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
+            done.unused_frames = 0;
+            free_bytes += bytes;
+            free_transcodes.push_back(std::move(done));
+        }
+        pending_transcodes.pop_front();
+    }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -5275,6 +5298,17 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    // Kizuna: a scene change (Ocarina's town to Hyrule Field) decodes hundreds of textures before
+    // the next frame, and every decode image lived until that frame's tick: gigabytes of RGBA8 at
+    // once, and a card out of memory before the field loaded. The ones the GPU is done with are
+    // reused at once now, and past MaxPendingTranscodeBytes the oldest are waited for: a longer
+    // load instead of a crash.
+    static constexpr u64 MaxPendingTranscodeBytes = u64{192} << 20;
+    const u64 needed_bytes = TranscodeDecodeBytes(width, height, levels, layers);
+    RecycleTranscodes();
+    while (pending_transcode_bytes + needed_bytes > MaxPendingTranscodeBytes &&
+           WaitOldestTranscode()) {
+    }
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
@@ -5306,6 +5340,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
+            free_transcodes.clear();
+            decode = memory_allocator.TryCreateImage(decode_ci, true);
+        }
+        if (!decode && !pending_transcodes.empty()) {
+            // Kizuna: the decodes still on the GPU, waited for and freed, then once more.
+            while (WaitOldestTranscode()) {
+            }
             free_transcodes.clear();
             decode = memory_allocator.TryCreateImage(decode_ci, true);
         }
@@ -5392,6 +5433,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
+    pending_transcode_bytes += needed_bytes;
     pending_transcodes.push_back(std::move(pending));
 }
 

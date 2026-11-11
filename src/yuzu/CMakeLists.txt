@@ -304,6 +304,11 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
+# Kizuna: a linker map beside the build (lichii.map), published with each release: the crash
+# reports in user/crash_dumps give lichii.exe+offset, which the map turns into function names.
+if (MINGW AND CXX_CLANG)
+    target_link_options(yuzu PRIVATE "-Wl,-Map=${CMAKE_BINARY_DIR}/lichii.map")
+endif()
 # fritchii/ includes ui_main.h, which AutoUic already generates for main_window.cpp.
 set_source_files_properties(fritchii/fritchii_ui.cpp fritchii/main_window_fritchii.cpp
     PROPERTIES SKIP_AUTOUIC ON)

@@ -364,6 +364,15 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    /// Kizuna: device memory of the decode images in pending_transcodes.
+    u64 pending_transcode_bytes = 0;
+
+    /// Kizuna: moves the decode images the GPU is done with from pending_transcodes to
+    /// free_transcodes (up to its cap; the others are freed).
+    void RecycleTranscodes();
+
+    /// Kizuna: waits for the oldest pending decode, then recycles. False when none is pending.
+    bool WaitOldestTranscode();
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

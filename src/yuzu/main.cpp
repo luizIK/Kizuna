@@ -36,6 +36,7 @@
 
 #include "main_window.h"
 #include "fritchii/fritchii_ui.h"
+#include "kizuna_crash_report.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
 #endif
@@ -243,6 +244,8 @@ int main(int argc, char* argv[]) {
     Updater::PrepareLaunch();
 #endif
     LoadNx2Switches(argv[0]);
+    // Kizuna: a native crash leaves its cause in user\crash_dumps (kizuna_crash_report.h).
+    KizunaCrash::Install();
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
     // also reads these variables, for this process only (nothing system-wide changes). A value
@@ -392,7 +395,7 @@ int main(int argc, char* argv[]) {
                     &MainWindow::OnAppFocusStateChanged);
         return app.exec();
     } catch (const std::exception& exception) {
-        QMessageBox::critical(nullptr, QObject::tr("Fritchii startup stopped"),
+        QMessageBox::critical(nullptr, QObject::tr("Kizuna startup stopped"),
                               QString::fromUtf8(exception.what()));
         return EXIT_FAILURE;
     }

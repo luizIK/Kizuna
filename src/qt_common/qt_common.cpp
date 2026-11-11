@@ -13,6 +13,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/kizuna_branding.h"
 #include "common/scm_rev.h"
 #include "common/cpu_features.h"
 #include "core/memory.h"
@@ -218,7 +219,8 @@ std::string BuildVersionString() {
 
     const auto yuzu_build =
         std::string_view{Common::g_build_name} == "Fritchii"
-            ? fmt::format("Fritchii {} | {}-{}", Common::g_build_version, branch_name, description)
+            ? fmt::format("{} {} | {}-{}", Common::DisplayBuildName(),
+                          Common::DisplayBuildVersion(), branch_name, description)
             : fmt::format("Lichii Development Build | {}-{}", branch_name, description);
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

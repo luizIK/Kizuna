@@ -324,7 +324,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Load_Amiibo, tr("&Load or Remove Amiibo..."));
     Rename(ui.action_Firmware_From_Folder, tr("From &Folder..."));
     Rename(ui.action_Firmware_From_ZIP, tr("From &ZIP..."));
-    Rename(ui.action_About, tr("&About Fritchii"));
+    Rename(ui.action_About, tr("&About Kizuna"));
     Rename(ui.action_Eden_Dependencies, tr("&Open-Source Components"));
 }
 
@@ -554,8 +554,8 @@ void CopyDataFromOldFolder(QMainWindow& window) {
     namespace fs = std::filesystem;
     using namespace Common::FS;
     if (IsPortableMode()) {
-        QMessageBox::information(&window, QStringLiteral("Fritchii"),
-                                 QObject::tr("This Fritchii keeps its data in the user folder next to "
+        QMessageBox::information(&window, QStringLiteral("Kizuna"),
+                                 QObject::tr("This Kizuna keeps its data in the user folder next to "
                                     "lichii.exe."));
         return;
     }
@@ -563,7 +563,7 @@ void CopyDataFromOldFolder(QMainWindow& window) {
         std::array{LegacyEdenDir, LichiiDir, YuzuDir, SuyuDir, SudachiDir, CitronDir},
         [](EmuPath path) { return fs::is_directory(GetLegacyPath(path)); });
     if (!any) {
-        QMessageBox::information(&window, QStringLiteral("Fritchii"),
+        QMessageBox::information(&window, QStringLiteral("Kizuna"),
                                  QObject::tr("No eden or lichii folder was found in %APPDATA%."));
         return;
     }
@@ -575,7 +575,7 @@ void CopyDataFromOldFolder(QMainWindow& window) {
     try {
         FrontendCommon::RequestProfileImport(choice->Serialize());
     } catch (const std::exception& error) {
-        QMessageBox::warning(&window, QStringLiteral("Fritchii"), QString::fromUtf8(error.what()));
+        QMessageBox::warning(&window, QStringLiteral("Kizuna"), QString::fromUtf8(error.what()));
         return;
     }
     // The copy runs when Fritchii starts, before anything reads the settings.

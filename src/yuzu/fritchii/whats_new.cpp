@@ -19,6 +19,7 @@
 #include <QTextDocument>
 #include <QVBoxLayout>
 
+#include "common/kizuna_branding.h"
 #include "common/scm_rev.h"
 #include "qt_common/config/uisettings.h"
 
@@ -85,11 +86,14 @@ void SetNotes(QTextBrowser* browser, const QString& markdown) {
 }
 
 QString VersionName() {
-    QString version = QString::fromUtf8(Common::g_build_version);
-    if (!version.isEmpty() && !version.startsWith(QLatin1Char('v'))) {
+    QString version = QString::fromStdString(Common::DisplayBuildVersion());
+    if (!version.isEmpty() && !version.startsWith(QLatin1Char('v')) &&
+        !version.startsWith(QLatin1String("build"))) {
         version.prepend(QLatin1Char('v'));
     }
-    return QStringLiteral("Fritchii %1").arg(version).trimmed();
+    return QStringLiteral("%1 %2")
+        .arg(QString::fromStdString(Common::DisplayBuildName()), version)
+        .trimmed();
 }
 
 bool ShouldShowWhatsNew(bool used_before) {

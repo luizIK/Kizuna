@@ -53,7 +53,7 @@ fs::path SaveRoot(const fs::path& nand) {
 std::vector<Place> Places() {
     using namespace Common::FS;
     std::vector<Place> places{
-        {QStringLiteral("Fritchii"), SaveRoot(GetEdenPath(EdenPath::NANDDir))}};
+        {QStringLiteral("Kizuna"), SaveRoot(GetEdenPath(EdenPath::NANDDir))}};
     constexpr std::array<std::pair<EmuPath, const char*>, 2> others{
         {{LegacyEdenDir, "Eden"}, {LichiiDir, "Lichii"}}};
     for (const auto& [path, name] : others) {
@@ -229,11 +229,11 @@ void ShowSavesWindow(QWidget* parent, const std::function<bool()>& emulation_run
         }
         if (Profiles(fritchii).empty()) {
             QMessageBox::information(&dialog, QObject::tr("Saves"),
-                                     QObject::tr("Fritchii has no saves yet."));
+                                     QObject::tr("Kizuna has no saves yet."));
             return;
         }
         const QString name =
-            QObject::tr("Fritchii saves %1.zip")
+            QObject::tr("Kizuna saves %1.zip")
                 .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd")));
         const QString file = !TestFile().isEmpty() ? TestFile() : QFileDialog::getSaveFileName(
             &dialog, QObject::tr("Export saves"),
@@ -283,8 +283,8 @@ void ShowSavesWindow(QWidget* parent, const std::function<bool()>& emulation_run
                 throw std::runtime_error("no saves in that zip file");
             }
             const auto backup_path = BackupPath(fritchii);
-            if (!confirm(QObject::tr("Import these saves into Fritchii? The games' saves in "
-                                     "Fritchii are replaced."),
+            if (!confirm(QObject::tr("Import these saves into Kizuna? The games' saves in "
+                                     "Kizuna are replaced."),
                          backup_path)) {
                 fs::remove_all(temp);
                 return;
@@ -337,7 +337,7 @@ void ShowSavesWindow(QWidget* parent, const std::function<bool()>& emulation_run
         QString question = QObject::tr("Copy the saves from %1 to %2? The games' saves in %2 "
                                        "are replaced.")
                                .arg(source.name, target.name);
-        if (target.name != QStringLiteral("Fritchii")) {
+        if (target.name != QStringLiteral("Kizuna")) {
             question += QObject::tr(" Close %1 first.").arg(target.name);
         }
         const auto backup_path = BackupPath(target.root);
@@ -380,7 +380,7 @@ void ShowSavesWindow(QWidget* parent, const std::function<bool()>& emulation_run
                 return;
             }
             const auto backup_path = BackupPath(fritchii);
-            if (!confirm(QObject::tr("Move the saves that don't show up into your Fritchii "
+            if (!confirm(QObject::tr("Move the saves that don't show up into your Kizuna "
                                      "profile?"),
                          backup_path)) {
                 return;

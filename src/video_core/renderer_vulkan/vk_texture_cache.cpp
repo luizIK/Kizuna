@@ -214,6 +214,18 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
 // arrays.
 [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
+    // Kizuna: off unless EDEN_NX2_ASTC_UNEVEN_RGBA8=1. RGBA8 is 4x the memory of BC3 and 8x that
+    // of BC1, and Ocarina's scene changes make hundreds of such textures (768x768, 1536x1536,
+    // 683x683) in seconds: the log of build 8 had 4975 MiB of device memory against 1717 MiB
+    // counted for the cache's images (it counts the ASTC size) and the card ran out. The cost is
+    // the dark lines on distant terrain this was added against on AMD; if they show, set it.
+    static const bool keep_rgba8 = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_RGBA8");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!keep_rgba8) {
+        return false;
+    }
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||

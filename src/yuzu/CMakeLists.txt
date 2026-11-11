@@ -202,6 +202,8 @@ add_executable(yuzu
     multiplayer/validation.h
     startup_checks.cpp
     startup_checks.h
+    kizuna_crash_report.cpp
+    kizuna_crash_report.h
     set_play_time_dialog.cpp
     set_play_time_dialog.h
     util/clickable_label.cpp

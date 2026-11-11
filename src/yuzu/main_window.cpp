@@ -145,6 +145,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/kizuna_branding.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
@@ -3903,7 +3904,7 @@ void MainWindow::OnConfigure() {
 
         if (!restore.isEmpty() && !FritchiiUi::RestoreSettingsFiles(restore)) {
             QMessageBox::warning(this, tr("Restore Settings"),
-                                 tr("Some settings could not be restored. Fritchii's defaults "
+                                 tr("Some settings could not be restored. Kizuna's defaults "
                                     "fill the gaps."));
         }
         config = std::make_unique<QtConfig>();
@@ -5077,7 +5078,7 @@ void MainWindow::OnEmulatorUpdateAvailable() {
         QString text;
         switch (result.failure) {
         case UpdateChecker::Failure::RateLimited:
-            text = tr("Could not check for updates: GitHub rate limit reached. Fritchii will try "
+            text = tr("Could not check for updates: GitHub rate limit reached. Kizuna will try "
                       "again at the next start.");
             break;
         case UpdateChecker::Failure::Http:
@@ -5100,8 +5101,8 @@ void MainWindow::OnEmulatorUpdateAvailable() {
         if (manual) {
             QMessageBox::information(this, tr("Check for Updates"),
                                      tr("You have the latest version (%1 %2).")
-                                         .arg(QString::fromLatin1(Common::g_build_name),
-                                              QString::fromLatin1(Common::g_build_version)));
+                                         .arg(QString::fromStdString(Common::DisplayBuildName()),
+                                              QString::fromStdString(Common::DisplayBuildVersion())));
         }
         return;
     }
@@ -5144,7 +5145,7 @@ void MainWindow::ShowRestartNote() {
         QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
         return;
     }
-    QMessageBox::information(this, tr("Fritchii"), restart_note);
+    QMessageBox::information(this, tr("Kizuna"), restart_note);
 }
 
 void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {
@@ -5204,8 +5205,8 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
                                    std::string_view gpu_vendor) {
     static const std::string build_id = std::string{Common::g_build_id};
     static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+        fmt::format("{} | {} | {}", Common::DisplayBuildName(), Common::DisplayBuildVersion(),
+                    std::string{Common::g_compiler_id});
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

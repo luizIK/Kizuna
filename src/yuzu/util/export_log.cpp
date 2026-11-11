@@ -121,10 +121,10 @@ QString Gigabytes(u64 bytes) {
 QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records,
                       const QStringList& included) {
     QString text;
-    text += QStringLiteral("Fritchii log export, made %1\n\n")
+    text += QStringLiteral("Kizuna log export, made %1\n\n")
                 .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
 
-    text += QStringLiteral("== Fritchii ==\n");
+    text += QStringLiteral("== Kizuna ==\n");
     text += Line(QStringLiteral("Version"), QString::fromStdString(QtCommon::BuildVersionString()));
     text += Line(QStringLiteral("Build"), QStringLiteral("%1, %2, %3")
                                               .arg(QString::fromUtf8(Common::g_build_fullname),
@@ -288,7 +288,7 @@ void ShowInExplorer(const QString& path) {
 void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_records) {
     const QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
     const QString default_name =
-        QStringLiteral("Fritchii-log-%1.zip")
+        QStringLiteral("Kizuna-log-%1.zip")
             .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd-HHmm")));
     QString path = QFileDialog::getSaveFileName(
         parent, QObject::tr("Export Log"), QDir(desktop).filePath(default_name),
@@ -334,10 +334,10 @@ void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_
             QObject::tr("the log of this session"));
     if (usual_locked) {
         add_log(usual_path, QStringLiteral("log-stuck-process.txt"),
-                QObject::tr("the log of a Fritchii that was still running when this one started"));
+                QObject::tr("the log of a Kizuna that was still running when this one started"));
         included << QStringLiteral(
             "WARNING: another lichii.exe was still running when this session started. End it in "
-            "Task Manager (or restart the PC), then start Fritchii again.");
+            "Task Manager (or restart the PC), then start Kizuna again.");
     } else {
         add_log(previous_path, QStringLiteral("log-previous-session.txt"),
                 QObject::tr("the log of the session before"));
@@ -380,7 +380,7 @@ void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_
         "<br><br>What's inside:"
         "<ul style='margin-left:-20px'>"
         "<li>Your log from this session and the one before</li>"
-        "<li>Your Fritchii version and the settings that matter for support</li>"
+        "<li>Your Kizuna version and the settings that matter for support</li>"
         "<li>A short summary of your PC: Windows version, CPU, graphics card and driver, RAM "
         "and screen</li>"
         "</ul>"

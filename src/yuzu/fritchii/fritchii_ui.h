@@ -38,6 +38,10 @@ bool ApplyTheme();
 /// The same icon in one fixed colour (e.g. the dark play glyph on the violet button).
 [[nodiscard]] QIcon Glyph(const QString& name, unsigned rgb, int px);
 
+/// Kizuna: the logo (the cat holding a console, no background) at `width` device-independent
+/// pixels, sharp on high-DPI screens.
+[[nodiscard]] QPixmap Logo(int width);
+
 struct MenuHooks {
     std::function<void()> export_log;
     std::function<void()> whats_new;

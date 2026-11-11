@@ -63,6 +63,11 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   names Kizuna, credits Fritchii, Lichii, Eden and yuzu, and links to this repository and the
   license. lichii.exe's file description is "Kizuna" (Task Manager).
 - **Built for Zen 3.** `-march=x86-64-v3 -mtune=znver3` on top of PGO.
+- **Look.** The "Ink" theme: the logo's navy (#1a1f28) and cream (#f0ebdf) in place of Fritchii's
+  near-black and violet (palette in `fritchii_ui.cpp`, widgets in `style.qss`). The logo
+  (`fritchii/kizuna_logo.png`, transparent) sits at the top of the rail, on the Preparing shaders
+  screen and in About; the home page has the Kizuna name. The app icon is `dist/kizuna.ico`
+  (the rounded square with transparent corners, 16 to 256 px).
 
 ## Keeping the "Preparing shaders" cache valid
 

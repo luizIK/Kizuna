@@ -18,6 +18,7 @@
 #include <QFont>
 #include <QFontDatabase>
 #include <QIcon>
+#include <QImage>
 #include <QImageReader>
 #include <QLocale>
 #include <QMainWindow>
@@ -52,17 +53,17 @@
 namespace FritchiiUi {
 namespace {
 
-// Graphite
-const QColor Background{0x11, 0x11, 0x13};
-const QColor Raised{0x1b, 0x1b, 0x1f};
-const QColor Field{0x18, 0x18, 0x1b};
-const QColor Button{0x1f, 0x1f, 0x24};
-const QColor Text{0xec, 0xec, 0xf1};
-const QColor TextSecondary{0x9a, 0x9a, 0xa8};
-const QColor TextDisabled{0x55, 0x55, 0x5f};
-const QColor IconIdle{0x6b, 0x6b, 0x78};
-const QColor Accent{0xa7, 0x8b, 0xfa};
-const QColor OnAccent{0x1c, 0x14, 0x33};
+// Kizuna "Ink": the navy and cream of the logo (was Fritchii's Graphite, near-black and violet).
+const QColor Background{0x1a, 0x1f, 0x28};
+const QColor Raised{0x23, 0x2a, 0x36};
+const QColor Field{0x1e, 0x24, 0x2f};
+const QColor Button{0x26, 0x2e, 0x3b};
+const QColor Text{0xf0, 0xeb, 0xdf};
+const QColor TextSecondary{0xa9, 0xae, 0xb8};
+const QColor TextDisabled{0x5c, 0x65, 0x75};
+const QColor IconIdle{0x7d, 0x85, 0x96};
+const QColor Accent{0xf0, 0xeb, 0xdf};
+const QColor OnAccent{0x1a, 0x1f, 0x28};
 
 QPalette GraphitePalette() {
     QPalette p;
@@ -81,11 +82,11 @@ QPalette GraphitePalette() {
     p.setColor(QPalette::HighlightedText, OnAccent);
     p.setColor(QPalette::Link, Accent);
     p.setColor(QPalette::LinkVisited, Accent);
-    p.setColor(QPalette::Light, QColor(0x2e, 0x2e, 0x35));
-    p.setColor(QPalette::Midlight, QColor(0x26, 0x26, 0x2c));
-    p.setColor(QPalette::Mid, QColor(0x22, 0x22, 0x27));
-    p.setColor(QPalette::Dark, QColor(0x0c, 0x0c, 0x0e));
-    p.setColor(QPalette::Shadow, QColor(0x05, 0x05, 0x06));
+    p.setColor(QPalette::Light, QColor(0x38, 0x41, 0x52));
+    p.setColor(QPalette::Midlight, QColor(0x2c, 0x34, 0x43));
+    p.setColor(QPalette::Mid, QColor(0x2a, 0x32, 0x40));
+    p.setColor(QPalette::Dark, QColor(0x14, 0x18, 0x20));
+    p.setColor(QPalette::Shadow, QColor(0x0b, 0x0d, 0x12));
     for (const auto role : {QPalette::WindowText, QPalette::Text, QPalette::ButtonText}) {
         p.setColor(QPalette::Disabled, role, TextDisabled);
     }
@@ -188,6 +189,18 @@ QIcon Glyph(const QString& name, unsigned rgb, int px) {
         return {};
     }
     return QIcon(RenderSvg(file.readAll(), QColor::fromRgb(rgb), px));
+}
+
+QPixmap Logo(int width) {
+    static const QImage logo(QStringLiteral(":/fritchii/kizuna_logo.png"));
+    if (logo.isNull()) {
+        return {};
+    }
+    const qreal ratio = qApp->devicePixelRatio();
+    QPixmap pixmap = QPixmap::fromImage(logo.scaledToWidth(
+        static_cast<int>(width * ratio), Qt::SmoothTransformation));
+    pixmap.setDevicePixelRatio(ratio);
+    return pixmap;
 }
 
 void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& hooks) {
@@ -442,7 +455,7 @@ QProgressBar {
   max-height: 6px;
 }
 QProgressBar::chunk {
-  background-color: #a78bfa;
+  background-color: #f0ebdf;
   border-radius: 3px;
 })";
 }

@@ -38,6 +38,7 @@ AboutDialog::AboutDialog(QWidget* parent)
         setWindowTitle(tr("About %1").arg(name));
         ui->labelYuzu->setText(QStringLiteral("<span style='font-size:30px'>%1</span>").arg(name));
         if (name == QStringLiteral("Kizuna")) {
+            ui->labelLogo->setPixmap(FritchiiUi::Logo(200));
             // Kizuna: what it is, the projects it comes from (GPLv3 keeps their notices), and
             // where its source is.
             ui->labelAbout->setText(

@@ -26,7 +26,9 @@ concurrency:
 jobs:
   build:
     name: Windows x86_64 (MinGW PGO)
-    runs-on: windows-2022
+    # windows-2025: on 2026-11-11 two windows-2022 runs never got a runner (one failed after 16
+    # minutes, one stayed queued), as in the image's deprecation brownouts.
+    runs-on: windows-2025
     permissions:
       contents: write
     env:

@@ -203,6 +203,14 @@ QWidget* Home::MakeRail() {
     layout->setContentsMargins(11, 16, 11, 16);
     layout->setSpacing(8);
 
+    // Kizuna: the logo at the top of the rail.
+    auto* mark = new QLabel(rail);
+    mark->setPixmap(Logo(42));
+    mark->setAlignment(Qt::AlignHCenter);
+    mark->setToolTip(QStringLiteral("Kizuna"));
+    layout->addWidget(mark);
+    layout->addSpacing(14);
+
     library_button = RailButton(QStringLiteral("library"), tr("Library"));
     library_button->setCheckable(true);
     connect(library_button, &QToolButton::clicked, this, &Home::ShowHome);
@@ -269,6 +277,10 @@ QWidget* Home::MakePage() {
     // (they point at Fritchii's community and its owner, not at this fork).
     auto* links = new QHBoxLayout;
     links->setSpacing(10);
+    // Kizuna: the name at the top left, under the rail's logo.
+    auto* wordmark = new QLabel(QStringLiteral("Kizuna"), page);
+    wordmark->setObjectName(QStringLiteral("KizunaWordmark"));
+    links->addWidget(wordmark, 0, Qt::AlignVCenter);
     links->addStretch(1);
     // v5.8.3: the Saves window (export, import, copy between Fritchii, Eden and Lichii).
     auto* saves = new QPushButton(Icon(QStringLiteral("list"), 18), tr("Saves"), page);
@@ -355,14 +367,14 @@ void Home::Refresh() {
         cover->show();
         title->setText(hero->title);
         play->setText(tr("Play"));
-        play->setIcon(Glyph(QStringLiteral("play"), 0x1c1433, 18));
+        play->setIcon(Glyph(QStringLiteral("play"), 0x1a1f28, 18));
     } else {
         hero_path.clear();
         hero_id = 0;
         cover->hide();
         title->setText(tr("Add your games"));
         play->setText(tr("Add Folder"));
-        play->setIcon(Glyph(QStringLiteral("plus"), 0x1c1433, 18));
+        play->setIcon(Glyph(QStringLiteral("plus"), 0x1a1f28, 18));
     }
 
     // The small row: the other games, then "All games" and "Add folder".

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "yuzu/fritchii/precompile_gate.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 #include <algorithm>
 
@@ -183,6 +184,12 @@ void PrecompileGate::ShowScreen() {
     column_row->addStretch(1);
     auto* column = new QVBoxLayout;
     column->setSpacing(0);
+
+    // Kizuna: the logo above the title.
+    auto* logo = new QLabel;
+    logo->setPixmap(FritchiiUi::Logo(180));
+    column->addWidget(logo, 0, Qt::AlignLeft);
+    column->addSpacing(28);
 
     auto* title = new QLabel(tr("Preparing shaders"));
     title->setObjectName(QStringLiteral("FritchiiHeroTitle"));

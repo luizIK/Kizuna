@@ -366,7 +366,9 @@ std::optional<u32> ParseKizunaTag(std::string_view tag) {
 
 Source KizunaSource() {
     return {.origin = "https://api.github.com",
-            .api_path = fmt::format("/repos/{}/releases?per_page=30", KizunaRepo)};
+            // 100, the most per page: GitHub orders releases by tag name as text
+            // (kizuna-build-10 after kizuna-build-4), so the newest can be anywhere in the list.
+            .api_path = fmt::format("/repos/{}/releases?per_page=100", KizunaRepo)};
 }
 
 std::optional<Common::Net::Asset> SelectKizunaAsset(const Common::Net::Release& release,

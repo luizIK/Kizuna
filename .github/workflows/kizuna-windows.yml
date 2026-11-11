@@ -193,6 +193,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # A full release marked Latest: GitHub lists releases by tag name as text (build-10
+          # after build-4), so the Latest badge and /releases/latest are what point at the newest.
           tag="kizuna-build-${GITHUB_RUN_NUMBER}"
           # The commit message is what the in-app updater shows as the release notes.
           notes="$(git log -1 --format=%B | grep -v -e '^Co-Authored-By:' -e '^Claude-Session:' || true)"
@@ -202,6 +204,6 @@ jobs:
           gh release create "$tag" Kizuna-windows-x86_64-pgo.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --prerelease \
+            --latest \
             --title "Kizuna build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
             --notes "$notes"

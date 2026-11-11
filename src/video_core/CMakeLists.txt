@@ -524,7 +524,8 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
-    target_link_libraries(video_core PRIVATE advapi32)
+    # dwmapi: vk_host_pacer.cpp (its #pragma comment(lib) is ignored by MinGW's linker).
+    target_link_libraries(video_core PRIVATE advapi32 dwmapi)
 endif()
 
 # Shader warm-up builder: game archives use zstd (also with dictionaries) and zlib.

@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,6 +53,29 @@
 #endif
 namespace Vulkan {
 namespace {
+
+// Kizuna: an exception nobody catches (a Vulkan allocation that failed on the GPU thread, say)
+// ends the process through std::terminate, and the log stops without a word. Say what it was,
+// flush the log, then abort as before.
+[[noreturn]] void LogUncaughtAndAbort() {
+    try {
+        if (std::current_exception()) {
+            throw;
+        }
+        LOG_CRITICAL(Render_Vulkan, "Fatal: std::terminate called without an exception");
+    } catch (const vk::Exception& e) {
+        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught Vulkan error {} ({})",
+                     static_cast<int>(e.GetResult()), e.what());
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught exception: {}", e.what());
+    } catch (...) {
+        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught exception of an unknown type");
+    }
+    Common::Log::Stop();
+    std::abort();
+}
+
+[[maybe_unused]] const bool terminate_logger_installed = (std::set_terminate(LogUncaughtAndAbort), true);
 
 constexpr VkExtent2D CaptureImageSize{
     .width = VideoCore::Capture::LinearWidth,

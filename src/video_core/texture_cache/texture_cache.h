@@ -575,6 +575,70 @@ void TextureCache<P>::TickFrame() {
                         budget_check_frames = 0; // thresholds are recomputed below
                         LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
                                     pressure_margin >> 20);
+                        // Kizuna: what the cache holds when memory runs out (first 4 times), to
+                        // see what to shrink: totals by kind and the largest images.
+                        static u32 census_logged{};
+                        if (census_logged++ < 4) {
+                            u64 all_bytes{};
+                            u64 written_bytes{};
+                            u64 big_bytes{};
+                            size_t images{};
+                            size_t big_images{};
+                            std::vector<std::pair<u64, const Image*>> largest;
+                            std::map<u32, std::pair<u64, u32>> by_format;
+                            for (const auto [image_id, image] : slot_images) {
+                                const u64 bytes = GetScaledImageSizeBytes(*image);
+                                all_bytes += bytes;
+                                ++images;
+                                if (True(image->flags & ImageFlagBits::GpuModified)) {
+                                    written_bytes += bytes;
+                                }
+                                if (bytes >= 8_MiB) {
+                                    big_bytes += bytes;
+                                    ++big_images;
+                                }
+                                largest.emplace_back(bytes, image);
+                                auto& format = by_format[static_cast<u32>(image->info.format)];
+                                format.first += bytes;
+                                ++format.second;
+                            }
+                            LOG_WARNING(HW_GPU,
+                                        "Memory census: {} images {} MiB ({} MiB GPU-written, {} "
+                                        "images of 8 MiB or more hold {} MiB), device usage {} MiB "
+                                        "(expected {} MiB, critical {} MiB)",
+                                        images, all_bytes >> 20, written_bytes >> 20, big_images,
+                                        big_bytes >> 20, total_used_memory >> 20,
+                                        expected_memory >> 20, critical_memory >> 20);
+                            const size_t top = (std::min<size_t>)(8, largest.size());
+                            std::partial_sort(largest.begin(), largest.begin() + top, largest.end(),
+                                              [](const auto& a, const auto& b) {
+                                                  return a.first > b.first;
+                                              });
+                            for (size_t i = 0; i < top; ++i) {
+                                const Image& image = *largest[i].second;
+                                LOG_WARNING(HW_GPU,
+                                            "  largest {} MiB: {}x{}x{} layers {} levels {} "
+                                            "format {} made {} frames ago, flags {:#x}",
+                                            largest[i].first >> 20, image.info.size.width,
+                                            image.info.size.height, image.info.size.depth,
+                                            image.info.resources.layers, image.info.resources.levels,
+                                            static_cast<u32>(image.info.format),
+                                            frame_tick > image.allocation_tick
+                                                ? frame_tick - image.allocation_tick
+                                                : u64{0},
+                                            static_cast<u32>(image.flags));
+                            }
+                            std::vector<std::pair<u64, u32>> formats;
+                            for (const auto& [format, total] : by_format) {
+                                formats.emplace_back(total.first, format);
+                            }
+                            std::sort(formats.rbegin(), formats.rend());
+                            for (size_t i = 0; i < (std::min<size_t>)(6, formats.size()); ++i) {
+                                LOG_WARNING(HW_GPU, "  format {}: {} MiB in {} images",
+                                            formats[i].second, formats[i].first >> 20,
+                                            by_format[formats[i].second].second);
+                            }
+                        }
                     } else if (pressure_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
                         pressure_margin -= (std::min)(pressure_margin, 128_MiB);
                         budget_check_frames = 0;
@@ -585,7 +649,11 @@ void TextureCache<P>::TickFrame() {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    // Kizuna: 1/6 of the budget (at most 1.25 GiB) instead of 1/8 (1 GiB). The
+                    // usage compared here is the whole device's, buffers and blocks included, and
+                    // on an 8 GB card shared with a browser and four monitors (budget 5.1 GB) the
+                    // old margin let it sit at 5135 of 5141 MiB until an image did not fit.
+                    const u64 margin = (std::min)(budget / 6, 1280_MiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -667,6 +735,13 @@ void TextureCache<P>::TickFrame() {
         // EXP42's pooled images are deleted images too: the pool caps and ages them itself.
         if constexpr (requires { runtime.PooledImageBytes(); }) {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
+            // Kizuna: past the critical threshold even without the pool, its idle images are
+            // memory the next allocation needs: give them back to the driver now.
+            if constexpr (requires { runtime.ReleaseImagePool(); }) {
+                if (total_used_memory >= critical_memory && runtime.PooledImageBytes() != 0) {
+                    runtime.ReleaseImagePool();
+                }
+            }
         }
     }
     // EDEN_NX2_MEM_TRACE=1 (from zortos293/Lichii#951): every 2 s, what the cache holds next to

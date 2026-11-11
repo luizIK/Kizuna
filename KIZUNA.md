@@ -11,6 +11,15 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   collection, waits for the GPU, drops the image pool) and looks the target up again, instead of
   binding the null image view. Draws and clears whose target still cannot be made are skipped.
 - `ImageView::IsRescaled()` tolerates the null view.
+- **Less pressure on a card at its budget.** The texture cache keeps 1/6 of the driver's VRAM
+  budget free (at most 1.25 GiB) instead of 1/8 (1 GiB), gives the image pool's idle images back
+  once it is past its critical threshold, and logs a "Memory census" (what the cache holds, the
+  largest images, the main formats) the first four times device memory runs out.
+- **No abort for a buffer that does not fit.** Device-local buffers over the budget are made
+  anyway and, failing that, in host memory (images already had this fallback), instead of
+  throwing out of the GPU thread.
+- **A last word before dying.** An exception nobody catches is written to the log
+  (`Fatal: uncaught ...`) before the process aborts, so a crash leaves its cause behind.
 - The update checker is off in the Windows build, so it never offers upstream builds over this one.
 
 ## Keeping the "Preparing shaders" cache valid

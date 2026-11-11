@@ -462,16 +462,34 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
                                           &alloc_info);
         // Staging buffers live in system memory, where the budget is the OS's soft hint: going
         // over it pages, refusing aborted the emulator (a texture upload in Ocarina's town
-        // square after 36 minutes). Device-local buffers keep the budget.
-        if ((result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
-            usage != MemoryUsage::DeviceLocal) {
+        // square after 36 minutes).
+        // Kizuna: the same for device-local buffers. A card at its budget (5135 of 5141 MiB on
+        // an 8 GB RX 6600 shared with other programs) refused one and the exception ended the
+        // process without a word; over the budget the driver pages, and as a last resort the
+        // buffer goes to host memory (slow, but valid).
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
             VmaAllocationCreateInfo over_budget = alloc_ci;
             over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &ci, &over_budget, &handle, &allocation,
                                      &alloc_info);
-            LOG_WARNING(Render_Vulkan,
-                        "Buffer of {} KiB (usage {}) over the memory budget: {}", ci.size >> 10,
-                        static_cast<u32>(usage), result == VK_SUCCESS ? "made anyway" : "failed");
+            const char* outcome = "made anyway";
+            if (result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
+                VmaAllocationCreateInfo host = over_budget;
+                host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                host.preferredFlags = 0;
+                host.memoryTypeBits = 0;
+                result = vmaCreateBuffer(allocator, &ci, &host, &handle, &allocation, &alloc_info);
+                outcome = "made in host memory";
+            }
+            if (usage == MemoryUsage::DeviceLocal) {
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+            static u32 buffer_logged{};
+            if (buffer_logged++ < 32) {
+                LOG_WARNING(Render_Vulkan, "Buffer of {} KiB (usage {}) over the memory budget: {}",
+                            ci.size >> 10, static_cast<u32>(usage),
+                            result == VK_SUCCESS ? outcome : "failed");
+            }
         }
         vk::Check(result);
     }
@@ -530,8 +548,35 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    VkResult aligned_result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment,
+                                                           &handle, &allocation, &alloc_info);
+    if (aligned_result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+        aligned_result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        // Kizuna: as in CreateBuffer above: over the budget, then host memory, not an abort.
+        VmaAllocationCreateInfo over_budget = alloc_ci;
+        over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        aligned_result = vmaCreateBufferWithAlignment(allocator, &ci, &over_budget, min_alignment,
+                                                      &handle, &allocation, &alloc_info);
+        if (aligned_result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
+            VmaAllocationCreateInfo host = over_budget;
+            host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            host.preferredFlags = 0;
+            host.memoryTypeBits = 0;
+            aligned_result = vmaCreateBufferWithAlignment(allocator, &ci, &host, min_alignment,
+                                                          &handle, &allocation, &alloc_info);
+        }
+        if (usage == MemoryUsage::DeviceLocal) {
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+        }
+        static u32 aligned_logged{};
+        if (aligned_logged++ < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Aligned buffer of {} KiB (usage {}) over the memory budget: {}",
+                        ci.size >> 10, static_cast<u32>(usage),
+                        aligned_result == VK_SUCCESS ? "made anyway" : "failed");
+        }
+    }
+    vk::Check(aligned_result);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);

@@ -53,7 +53,8 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   already finished is left as it is.
 - **Versions.** Releases are `Kizuna vX.Y`, tagged `kizuna-vX.Y`: build 4 was v1.0 and each
   release is one minor up. The workflow's Version step picks the next one from the releases and
-  renamed the earlier `kizuna-build-N` releases once (4 -> v1.0, 6 -> v1.1 ... 10 -> v1.5). New
+  titles the earlier `kizuna-build-N` releases Kizuna v1.0 to v1.5 (4 -> v1.0 ... 10 -> v1.5); they
+  keep their tags, which the job's token may not move. New
   releases are full releases marked Latest (GitHub lists releases by tag name as text).
 - **In-app updater.** Help > Check for Updates (and the check at startup) looks for newer
   `kizuna-vX.Y` releases of luizIK/Kizuna only, verifies the zip's SHA-256 from GitHub and

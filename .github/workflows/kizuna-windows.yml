@@ -39,10 +39,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
-      # Versions: build 4 was v1.0, then each release one minor up (v1.1, v1.2...). The releases
-      # tagged kizuna-build-N before that are renamed once, in build order, to kizuna-vX.Y
-      # (the release moved to a new tag on the same commit, the old tag deleted). The next version is the
-      # highest kizuna-vX.Y release plus one minor; a failed build takes no number.
+      # Versions: build 4 was v1.0, then each release one minor up (v1.1, v1.2...), tagged
+      # kizuna-vX.Y. The releases made before that keep their kizuna-build-N tags (the job's token
+      # may not make or move tags, HTTP 403) and get the titles Kizuna v1.0 to v1.5, in build
+      # order. The next version is the highest kizuna-vX.Y release plus one minor, or v1.K after
+      # the K old releases; a failed build takes no number.
       - name: Version
         id: version
         shell: bash
@@ -52,38 +53,28 @@ jobs:
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
-          versions() {
-            gh api "repos/$repo/releases?per_page=100" --jq \
-              '.[].tag_name | select(test("^kizuna-v[0-9]+[.][0-9]+$")) | ltrimstr("kizuna-v")'
-          }
-          if [ "$PUBLISH" = "true" ]; then
-            mapfile -t old < <(gh api "repos/$repo/releases?per_page=100" --jq \
-              '.[].tag_name | select(test("^kizuna-build-[0-9]+$"))' | sort -t- -k3,3n)
-            last="$(versions | sort -t. -k1,1n -k2,2n | tail -n 1)"
-            next_minor=0
-            if [ -n "$last" ]; then next_minor=$(( ${last#*.} + 1 )); fi
-            for tag in "${old[@]}"; do
-              new="kizuna-v1.${next_minor}"
-              sha="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
-              id="$(gh api "repos/$repo/releases/tags/$tag" --jq .id)"
-              # Through the releases API, which makes the new tag on that commit: the job's
-              # token may not create a ref with the git API (a commit that touches a workflow
-              # needs the workflows permission there).
-              gh api -X PATCH "repos/$repo/releases/$id" -f tag_name="$new" \
-                -f target_commitish="$sha" -f name="Kizuna v1.${next_minor}" > /dev/null
-              test "$(gh api "repos/$repo/releases/$id" --jq .tag_name)" = "$new"
-              # The old tag is only a name for the same commit now: deleted if the token may.
-              gh api -X DELETE "repos/$repo/git/refs/tags/$tag" > /dev/null 2>&1 ||
-                echo "Kept the old tag $tag (the token may not delete it)"
-              echo "Renamed $tag to $new"
-              next_minor=$(( next_minor + 1 ))
-            done
-          fi
-          last="$(versions | sort -t. -k1,1n -k2,2n | tail -n 1)"
-          if [ -z "$last" ]; then
-            version="1.0"
-          else
+          tags="$(gh api "repos/$repo/releases?per_page=100" --jq '.[].tag_name')"
+          mapfile -t old < <(printf '%s\n' "$tags" | grep -E '^kizuna-build-[0-9]+$' |
+            sort -t- -k3,3n || true)
+          last="$(printf '%s\n' "$tags" | grep -E '^kizuna-v[0-9]+[.][0-9]+$' |
+            sed 's/^kizuna-v//' | sort -t. -k1,1n -k2,2n | tail -n 1 || true)"
+          if [ -n "$last" ]; then
             version="${last%%.*}.$(( ${last#*.} + 1 ))"
+          else
+            version="1.${#old[@]}"
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            minor=0
+            for tag in "${old[@]}"; do
+              id="$(gh api "repos/$repo/releases/tags/$tag" --jq .id)"
+              if gh api -X PATCH "repos/$repo/releases/$id" -f name="Kizuna v1.${minor}" \
+                  > /dev/null; then
+                echo "$tag is Kizuna v1.${minor}"
+              else
+                echo "::warning::Could not retitle $tag as Kizuna v1.${minor}"
+              fi
+              minor=$(( minor + 1 ))
+            done
           fi
           echo "Kizuna v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"

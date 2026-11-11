@@ -162,6 +162,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
+    /// Set when JoinImages left an image out for lack of memory; FindRenderTargetView reads and
+    /// clears it, then reclaims memory and looks the render target up again.
+    bool join_out_of_memory{};
+    u32 emergency_reclaims{};
+    u32 emergency_reclaim_failures{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
     /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
@@ -292,6 +297,10 @@ public:
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
+
+    /// A render target that could not be allocated is bound as the null view; drawing to it
+    /// must be skipped (the null view has no image, no slot vector and no attachment).
+    [[nodiscard]] bool RenderTargetsFailed() const noexcept;
 
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
@@ -503,8 +512,14 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
-    /// Runs the Garbage Collector.
-    void RunGarbageCollector(bool out_of_memory);
+    /// Runs the Garbage Collector. `emergency` (a render target could not be allocated) lets it
+    /// evict images used only a couple of frames ago, not just the ones idle for 10 or more.
+    void RunGarbageCollector(bool out_of_memory, bool emergency = false);
+
+    /// Frees device memory now, mid-frame, after an allocation failed: emergency collection plus
+    /// waiting for the GPU so the images it deleted give their memory back. Returns false when
+    /// there was nothing to free. Only called with no image ids held by the caller.
+    bool ReclaimMemoryNow();
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

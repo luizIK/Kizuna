@@ -4637,7 +4637,8 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
 }
 
 bool ImageView::IsRescaled() const noexcept {
-    return (*slot_images)[image_id].IsRescaled();
+    // The null view (a render target or texture left out for lack of memory) has no slot vector.
+    return slot_images != nullptr && (*slot_images)[image_id].IsRescaled();
 }
 
 vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,

@@ -156,6 +156,14 @@ public:
         return image_pool_bytes;
     }
 
+    /// Gives the pool's device memory back now (an allocation failed mid-frame). True when the
+    /// pool held any.
+    bool ReleaseImagePool() {
+        const bool held = image_pool_bytes != 0;
+        TrimImagePool(0);
+        return held;
+    }
+
     void LogMemoryStatistics() const;
 
     /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).

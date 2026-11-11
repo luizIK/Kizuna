@@ -147,7 +147,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -165,6 +165,12 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        if (emergency) {
+            // A render target could not be allocated: this pass has to free enough for it, so it
+            // may take images idle for only a couple of frames (the next frame re-uploads them).
+            ticks_to_destroy = (std::max)(min_age, u64{2});
+            num_iterations = 48;
+        }
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
                           &evict_old_costly, out_of_memory](ImageId image_id) {
@@ -288,6 +294,52 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         Configure(true);
         Collect();
     }
+}
+
+template <class P>
+bool TextureCache<P>::ReclaimMemoryNow() {
+    const u64 deleted_before = images_deleted;
+    RunGarbageCollector(true, true);
+    bool freed = images_deleted != deleted_before;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (!gpu_sentenced_images.empty()) {
+            // The images just deleted (and earlier ones) still hold their memory until the GPU is
+            // past them. A failed render target is worth one wait: without it the frame is drawn
+            // into the null view (a skipped draw, or a crash) and the memory only comes back on a
+            // later frame.
+            runtime.Finish();
+            while (!gpu_sentenced_images.empty() &&
+                   runtime.IsFree(gpu_sentenced_images.front().tick)) {
+                if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
+                    gpu_sentenced_images.front().image.ReleaseToPool();
+                }
+                gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
+                gpu_sentenced_images.pop_front();
+            }
+            freed = true;
+        }
+    }
+    if constexpr (requires { runtime.ReleaseImagePool(); }) {
+        freed |= runtime.ReleaseImagePool();
+    }
+    ++(freed ? emergency_reclaims : emergency_reclaim_failures);
+    static u32 logged{};
+    if (logged++ < 32) {
+        LOG_WARNING(HW_GPU, "Out of memory for a render target: {} (images deleted: {})",
+                    freed ? "reclaimed memory and retrying" : "nothing left to evict",
+                    images_deleted - deleted_before);
+    }
+    return freed;
+}
+
+template <class P>
+bool TextureCache<P>::RenderTargetsFailed() const noexcept {
+    for (const ImageViewId view : render_targets.color_buffer_ids) {
+        if (view == NULL_IMAGE_VIEW_ID) {
+            return true;
+        }
+    }
+    return render_targets.depth_buffer_id == NULL_IMAGE_VIEW_ID;
 }
 
 template <class P>
@@ -1546,6 +1598,13 @@ bool TextureCache<P>::RescaleRenderTargets() {
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
+
+        if (has_deleted_images) {
+            // A lookup above deleted images (the collector after a failed render target, or an
+            // overlap): the ids saved so far may name them. The loop runs again with every
+            // render target dirty.
+            continue;
+        }
 
         if (can_rescale) {
             rescaled = any_rescaled || scale_rating >= 2;
@@ -3929,6 +3988,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                           new_info.size.width, new_info.size.height, new_info.size.depth, gpu_addr,
                           static_cast<u32>(new_info.format));
             }
+            join_out_of_memory = true;
             return ImageId{};
         }
     }
@@ -4394,11 +4454,28 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
-    do {
+    // A render target that fails to allocate is bound as the null view and its frame is lost (or
+    // worse). Free memory right here and look it up again, twice at most; no image id is held
+    // across ReclaimMemoryNow, and the images it deletes set has_deleted_images, which the
+    // callers (RescaleRenderTargets) already treat as "look the render targets up again".
+    for (u32 attempt = 0;; ++attempt) {
+        join_out_of_memory = false;
+        do {
+            has_deleted_images = false;
+            image_id = FindOrInsertImage(info, gpu_addr);
+            delete_state |= has_deleted_images;
+        } while (has_deleted_images);
+        if (image_id || !join_out_of_memory || attempt >= 2) {
+            break;
+        }
         has_deleted_images = false;
-        image_id = FindOrInsertImage(info, gpu_addr);
+        const bool freed = ReclaimMemoryNow();
         delete_state |= has_deleted_images;
-    } while (has_deleted_images);
+        if (!freed) {
+            break;
+        }
+    }
+    join_out_of_memory = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;

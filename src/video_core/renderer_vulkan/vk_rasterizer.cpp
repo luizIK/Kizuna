@@ -1735,6 +1735,9 @@ void RasterizerVulkan::DrawTexture() {
     std::scoped_lock l{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
+    if (texture_cache.RenderTargetsFailed()) {
+        return; // no memory for a render target: skip the draw
+    }
 
     UpdateDynamicStates(nullptr);
 
@@ -1859,6 +1862,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.ResetRenderTargetStats();
     texture_cache.UpdateRenderTargets(true);
+    if (texture_cache.RenderTargetsFailed()) {
+        return; // no memory for a render target: skip the clear (see TextureCache::ReclaimMemoryNow)
+    }
     clear_targets_ready = std::chrono::steady_clock::now();
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     clear_tc_stats = texture_cache.TakeRenderTargetStats();

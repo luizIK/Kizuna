@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <QPixmap>
 #include <QString>
 #include <QStringList>
 

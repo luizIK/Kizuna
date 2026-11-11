@@ -9,6 +9,16 @@
 
 #include "video_core/pipeline_cache_files.h"
 
+#if defined(_WIN32) && !defined(_MSC_VER)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace VideoCommon {
 namespace {
 
@@ -306,19 +316,39 @@ std::optional<size_t> MergeUsedPipelineLists(const std::filesystem::path& source
     return added;
 }
 
+s64 FileWriteTicks(const std::filesystem::path& path, std::error_code& error) {
+#if defined(_WIN32) && !defined(_MSC_VER)
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        error = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+        return 0;
+    }
+    error.clear();
+    return static_cast<s64>((static_cast<u64>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+                            data.ftLastWriteTime.dwLowDateTime);
+#else
+    // MSVC's file_time_type already counts FILETIME ticks; other platforms keep their own count.
+    const auto time = std::filesystem::last_write_time(path, error);
+    if (error) {
+        return 0;
+    }
+    return static_cast<s64>(time.time_since_epoch().count());
+#endif
+}
+
 std::optional<PipelineCacheFileStamp> StampPipelineCacheFile(const std::filesystem::path& file) {
     std::error_code error;
     const u64 size = std::filesystem::file_size(file, error);
     if (error) {
         return std::nullopt;
     }
-    const auto modified = std::filesystem::last_write_time(file, error);
+    const s64 modified = FileWriteTicks(file, error);
     if (error) {
         return std::nullopt;
     }
     return PipelineCacheFileStamp{
         .size = size,
-        .modified = static_cast<s64>(modified.time_since_epoch().count()),
+        .modified = modified,
     };
 }
 

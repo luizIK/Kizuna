@@ -3437,12 +3437,12 @@ std::optional<WarmStamp> CurrentStamp(const std::filesystem::path& file, const D
     if (ec) {
         return std::nullopt;
     }
-    const auto time = std::filesystem::last_write_time(file, ec);
+    const s64 time = VideoCommon::FileWriteTicks(file, ec);
     if (ec) {
         return std::nullopt;
     }
     return WarmStamp{size,
-                     static_cast<s64>(time.time_since_epoch().count()),
+                     time,
                      entries,
                      device.GetDriverVersion(),
                      device.GetDeviceID(),
@@ -4077,7 +4077,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
         return;
     }
-    const auto modified = std::filesystem::last_write_time(path, error).time_since_epoch().count();
+    // Kizuna: FILETIME ticks whatever the standard library (see VideoCommon::FileWriteTicks), so
+    // the marker a Fritchii (MSVC) build wrote for this file is still the one this build expects.
+    const s64 modified = VideoCommon::FileWriteTicks(path, error);
     // The driver keeps what it compiled; the step runs again for another file, driver, GPU or
     // shader translator. Not the commit (2026-11-09, owner: every dev build re-ran the ~20 minute
     // preparation), and since v5.8 not the release either (every release re-ran it for every

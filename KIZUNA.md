@@ -24,6 +24,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 
 ## Keeping the "Preparing shaders" cache valid
 
+The marker of a finished preparation (`precompiled_prepared.fork-v54.txt`) holds the precompiled
+file's size and last write time, the driver, the shader stamp and the GPU. The time has to be
+read the way the Fritchii (MSVC) builds read it, as FILETIME ticks (100 ns since 1601):
+the MinGW standard library counts nanoseconds from another epoch and drops the fractions of a
+second, so a marker written by Fritchii never matched and the whole preparation ran again.
+`VideoCommon::FileWriteTicks` (`pipeline_cache_files.cpp`) reads it with the Windows API on
+MinGW; the marker, the warm-up stamps and the merge log use it.
+
 Upstream stamps the shader preparation (`NX2_SHADER_STAMP`, `CMakeModules/Nx2ShaderStamp.cmake`)
 with a hash of the shader recompiler and of `vk_graphics_pipeline.*`, `vk_compute_pipeline.*`,
 `fixed_pipeline_state.*` and `nx2_precompile.*`. Any edit to those files changes the stamp, and

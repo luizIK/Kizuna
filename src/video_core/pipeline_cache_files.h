@@ -162,6 +162,14 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
 std::optional<size_t> MergeUsedPipelineLists(const std::filesystem::path& source,
                                              const std::filesystem::path& destination, u32 magic);
 
+/// The last write time of `path` as MSVC's std::filesystem::file_time_type counts it: FILETIME,
+/// 100 ns ticks since 1601-01-01 UTC. The MinGW standard library counts nanoseconds from another
+/// epoch and drops the fractions of a second, so a stamp an MSVC build wrote (the Fritchii
+/// releases) never matched one a MinGW build read, and every cache keyed on a file's time (the
+/// "Preparing shaders" marker, the warm-up stamps, the merge log) looked changed. 0, with `error`
+/// set, when the time cannot be read.
+[[nodiscard]] s64 FileWriteTicks(const std::filesystem::path& path, std::error_code& error);
+
 /// Size and modification time of a file, to tell whether it changed since it was merged.
 struct PipelineCacheFileStamp {
     u64 size{};

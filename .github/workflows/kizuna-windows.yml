@@ -3,7 +3,8 @@ name: kizuna-windows
 # Kizuna: Windows build of this fork, based on Fritchii v5.8.4. MinGW clang with the repo's PGO
 # profile, the same build release-binaries.yml calls windows-x86_64-pgo. The MSVC build is not
 # used: frizti_settings.cpp declares parameters named `values`, which MSVC rejects (C4459, an
-# error here). release-binaries.yml (the upstream workflow) is left untouched.
+# error here). Warnings are not errors (ENABLE_WERROR=OFF): clang's -Wshadow also stops v5.8.4,
+# in nx2_video_decoder.cpp. release-binaries.yml (the upstream workflow) is left untouched.
 on:
   workflow_dispatch:
     inputs:
@@ -98,6 +99,7 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_WERROR=OFF \
             -DLICHII_BUILD_TAG=kizuna-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=windows-x86_64-pgo \
             -DUSE_DISCORD_PRESENCE=OFF \
@@ -119,7 +121,8 @@ jobs:
         shell: msys2 {0}
         run: |
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          # -k 0: keep going past a failed file, so one run lists every error.
+          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k 0
           ccache --show-stats
 
       - name: Save compiler objects

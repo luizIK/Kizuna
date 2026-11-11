@@ -15,6 +15,6 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 
 ## Building
 
-The `kizuna-windows` workflow (`.github/workflows/kizuna-windows.yml`) builds the Windows (MSVC)
+The `kizuna-windows` workflow (`.github/workflows/kizuna-windows.yml`) builds the Windows (MinGW clang, PGO)
 zip on GitHub Actions. Run it from the Actions tab, or push to the `kizuna` branch. The zip is
 attached to the run and published as a pre-release.

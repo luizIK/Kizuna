@@ -41,7 +41,7 @@ jobs:
 
       # Versions: build 4 was v1.0, then each release one minor up (v1.1, v1.2...). The releases
       # tagged kizuna-build-N before that are renamed once, in build order, to kizuna-vX.Y
-      # (new tag on the same commit, release moved to it, old tag deleted). The next version is the
+      # (the release moved to a new tag on the same commit, the old tag deleted). The next version is the
       # highest kizuna-vX.Y release plus one minor; a failed build takes no number.
       - name: Version
         id: version
@@ -65,14 +65,16 @@ jobs:
             for tag in "${old[@]}"; do
               new="kizuna-v1.${next_minor}"
               sha="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
-              if ! gh api "repos/$repo/git/ref/tags/$new" > /dev/null 2>&1; then
-                gh api -X POST "repos/$repo/git/refs" -f ref="refs/tags/$new" -f sha="$sha" > /dev/null
-              fi
               id="$(gh api "repos/$repo/releases/tags/$tag" --jq .id)"
+              # Through the releases API, which makes the new tag on that commit: the job's
+              # token may not create a ref with the git API (a commit that touches a workflow
+              # needs the workflows permission there).
               gh api -X PATCH "repos/$repo/releases/$id" -f tag_name="$new" \
-                -f name="Kizuna v1.${next_minor}" > /dev/null
+                -f target_commitish="$sha" -f name="Kizuna v1.${next_minor}" > /dev/null
               test "$(gh api "repos/$repo/releases/$id" --jq .tag_name)" = "$new"
-              gh api -X DELETE "repos/$repo/git/refs/tags/$tag"
+              # The old tag is only a name for the same commit now: deleted if the token may.
+              gh api -X DELETE "repos/$repo/git/refs/tags/$tag" > /dev/null 2>&1 ||
+                echo "Kept the old tag $tag (the token may not delete it)"
               echo "Renamed $tag to $new"
               next_minor=$(( next_minor + 1 ))
             done

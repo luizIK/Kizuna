@@ -1461,11 +1461,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
+        // KIZUNA-STAMP-NEUTRAL-BEGIN
+        // (changes no compiled pipeline, so it stays out of NX2_SHADER_STAMP: Nx2ShaderStamp.cmake)
         if (texture_cache.RenderTargetsFailed()) {
             // No memory for a render target even after reclaiming: skip this draw. The next frame
             // looks it up again; drawing into the null view would use an attachment that is not there.
             return false;
         }
+        // KIZUNA-STAMP-NEUTRAL-END
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&

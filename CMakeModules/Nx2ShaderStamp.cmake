@@ -13,7 +13,31 @@ list(SORT inputs)
 set(all "")
 foreach(path IN LISTS inputs)
     if (EXISTS "${path}")
-        file(SHA256 "${path}" hash)
+        # Kizuna: a block between KIZUNA-STAMP-NEUTRAL-BEGIN and KIZUNA-STAMP-NEUTRAL-END (one per
+        # file, each marker alone on its line) is left out of the hash. It marks code that changes
+        # no compiled pipeline (a guard in the draw path, say), so the shader cache a player
+        # already built stays valid. Files without the marker are hashed as is, like upstream.
+        file(STRINGS "${path}" neutral_marker REGEX "KIZUNA-STAMP-NEUTRAL-BEGIN" LIMIT_COUNT 1)
+        if (neutral_marker)
+            # file(READ) drops the carriage returns of a CRLF checkout (Windows CI): put them back
+            # after cutting the block, so the hash is the one of the file without the block.
+            file(READ "${path}" text)
+            file(SIZE "${path}" file_size)
+            string(LENGTH "${text}" text_size)
+            set(crlf FALSE)
+            if (file_size GREATER text_size)
+                set(crlf TRUE)
+            endif()
+            string(REGEX REPLACE
+                   "[ \t]*//[ \t]*KIZUNA-STAMP-NEUTRAL-BEGIN\n.*[ \t]*//[ \t]*KIZUNA-STAMP-NEUTRAL-END\n"
+                   "" text "${text}")
+            if (crlf)
+                string(REPLACE "\n" "\r\n" text "${text}")
+            endif()
+            string(SHA256 hash "${text}")
+        else()
+            file(SHA256 "${path}" hash)
+        endif()
         get_filename_component(name "${path}" NAME)
         string(APPEND all "${name}:${hash};")
     endif()

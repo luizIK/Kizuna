@@ -39,7 +39,7 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   from a broken level. Those whose last even level would still be over 32 texels (683x683, uneven
   from level 1) stay RGBA8. `EDEN_NX2_ASTC_UNEVEN_RGBA8=1` keeps all of them RGBA8, `=0` all BC.
 - **Name.** The window title, About, the log's first line and the visible messages say "Kizuna"
-  and "build N" (`Common::DisplayBuildName/Version`, from the CI release tag `kizuna-N`). Inside,
+  and "vX.Y" (`Common::DisplayBuildName/Version`, from the CI release tag `kizuna-N`). Inside,
   `g_build_name` stays "Fritchii", which selects the UI and settings defaults. The links and
   credits to Fritchii (its Discord menu entry, "Fritchii had it first") are left as they are.
 - **Crash reports.** A native crash writes `user\crash_dumps\kizuna-crash-<time>.txt` (exception
@@ -51,8 +51,12 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   whose pipeline it has not reached builds it from the kept SPIR-V on the workers.
   `EDEN_NX2_PRECOMPILE_QUICK=0` brings back the full preparation. A cache the full preparation
   already finished is left as it is.
+- **Versions.** Releases are `Kizuna vX.Y`, tagged `kizuna-vX.Y`: build 4 was v1.0 and each
+  release is one minor up. The workflow's Version step picks the next one from the releases and
+  renamed the earlier `kizuna-build-N` releases once (4 -> v1.0, 6 -> v1.1 ... 10 -> v1.5). New
+  releases are full releases marked Latest (GitHub lists releases by tag name as text).
 - **In-app updater.** Help > Check for Updates (and the check at startup) looks for newer
-  `kizuna-build-N` releases of luizIK/Kizuna only, verifies the zip's SHA-256 from GitHub and
+  `kizuna-vX.Y` releases of luizIK/Kizuna only, verifies the zip's SHA-256 from GitHub and
   installs it over the running folder (the `user` folder is never touched; Help > Roll Back brings
   the previous build back). Fritchii's releases are never offered.
 - **No Fritchii links.** The Discord and Donate entries (Help menu, home page) are gone; About

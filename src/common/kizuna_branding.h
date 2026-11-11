@@ -22,17 +22,18 @@ inline constexpr std::string_view TagPrefix{"kizuna-"};
 }
 } // namespace KizunaDetail
 
-/// "Kizuna" for the fork's CI builds (release tag "kizuna-N"), otherwise the upstream name.
+/// "Kizuna" for the fork's CI builds (release tag "kizuna-..."), otherwise the upstream name.
 [[nodiscard]] inline std::string DisplayBuildName() {
     return KizunaDetail::IsKizunaBuild() ? std::string{"Kizuna"} : std::string{g_build_name};
 }
 
-/// "build N" for the fork's CI builds, otherwise the upstream version.
+/// "v1.6" for the fork's CI builds (release tag "kizuna-v1.6"; "build N" for the first ones,
+/// tagged "kizuna-N"), otherwise the upstream version.
 [[nodiscard]] inline std::string DisplayBuildVersion() {
     if (KizunaDetail::IsKizunaBuild()) {
-        return "build " +
-               std::string{std::string_view{g_build_release_tag}.substr(
-                   KizunaDetail::TagPrefix.size())};
+        const std::string_view rest =
+            std::string_view{g_build_release_tag}.substr(KizunaDetail::TagPrefix.size());
+        return rest.starts_with('v') ? std::string{rest} : "build " + std::string{rest};
     }
     return std::string{g_build_version};
 }

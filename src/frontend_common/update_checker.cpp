@@ -68,7 +68,7 @@ bool ResolveSource(Source& source) {
     return true;
 }
 
-CheckResult CheckKizuna([[maybe_unused]] u32 current) {
+CheckResult CheckKizuna([[maybe_unused]] const KizunaVersion& current) {
 #ifndef _WIN32
     // Kizuna only publishes Windows packages.
     return {};
@@ -86,8 +86,8 @@ CheckResult CheckKizuna([[maybe_unused]] u32 current) {
         std::string_view{*response.body}, source.origin, std::string{KizunaRepo});
     auto update = SelectKizunaUpdate(releases, current, source);
     if (!update) {
-        LOG_INFO(Frontend, "Kizuna build {} is the newest ({} releases listed)", current,
-                 releases.size());
+        LOG_INFO(Frontend, "Kizuna v{}.{} is the newest ({} releases listed)", current.major,
+                 current.minor, releases.size());
         return {};
     }
     auto asset = SelectKizunaAsset(*update, source);
@@ -164,8 +164,10 @@ std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Re
 
 CheckResult Check() {
     // Kizuna first: its g_build_name is still "Fritchii", which RunningVersion reads.
-    if (const auto kizuna = RunningKizunaBuild()) {
-        return CheckKizuna(*kizuna);
+    if (IsKizunaBuild()) {
+        // Never Fritchii's releases, even for a Kizuna build without a version.
+        const auto kizuna = RunningKizunaVersion();
+        return kizuna ? CheckKizuna(*kizuna) : CheckResult{};
     }
     if (const auto running = RunningVersion()) {
         return CheckFritchii(*running);
@@ -345,23 +347,30 @@ std::optional<Common::Net::Asset> SelectFritchiiAsset(const Common::Net::Release
     return std::nullopt;
 }
 
-std::optional<u32> RunningKizunaBuild() {
-    constexpr std::string_view prefix = "kizuna-";
-    std::string_view tag{Common::g_build_release_tag};
-    if (!tag.starts_with(prefix)) {
-        return std::nullopt;
-    }
-    const auto number = ParseNumber(tag.substr(prefix.size()));
-    return number && *number != 0 ? number : std::nullopt;
+bool IsKizunaBuild() {
+    return std::string_view{Common::g_build_release_tag}.starts_with("kizuna-");
 }
 
-std::optional<u32> ParseKizunaTag(std::string_view tag) {
-    constexpr std::string_view prefix = "kizuna-build-";
+std::optional<KizunaVersion> ParseKizunaTag(std::string_view tag) {
+    constexpr std::string_view prefix = "kizuna-v";
     if (!tag.starts_with(prefix)) {
         return std::nullopt;
     }
-    const auto number = ParseNumber(tag.substr(prefix.size()));
-    return number && *number != 0 ? number : std::nullopt;
+    tag.remove_prefix(prefix.size());
+    const auto dot = tag.find('.');
+    if (dot == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto major = ParseNumber(tag.substr(0, dot));
+    const auto minor = ParseNumber(tag.substr(dot + 1));
+    if (!major || !minor || *major == 0) {
+        return std::nullopt;
+    }
+    return KizunaVersion{.major = *major, .minor = *minor};
+}
+
+std::optional<KizunaVersion> RunningKizunaVersion() {
+    return ParseKizunaTag(Common::g_build_release_tag);
 }
 
 Source KizunaSource() {
@@ -406,18 +415,19 @@ std::optional<Common::Net::Asset> SelectKizunaAsset(const Common::Net::Release& 
 }
 
 std::optional<Common::Net::Release> SelectKizunaUpdate(
-    std::span<const Common::Net::Release> releases, u32 current, const Source& source) {
+    std::span<const Common::Net::Release> releases, const KizunaVersion& current,
+    const Source& source) {
     const Common::Net::Release* selected = nullptr;
-    u32 newest = current;
+    KizunaVersion newest = current;
     for (const auto& release : releases) {
         if (HiddenFromUpdater(release)) {
             LOG_INFO(Frontend, "Update check skips {}: its notes hide it from the updater",
                      release.tag);
             continue;
         }
-        const auto number = ParseKizunaTag(release.tag);
-        if (number && *number > newest && SelectKizunaAsset(release, source)) {
-            newest = *number;
+        const auto version = ParseKizunaTag(release.tag);
+        if (version && *version > newest && SelectKizunaAsset(release, source)) {
+            newest = *version;
             selected = &release;
         }
     }
@@ -425,8 +435,8 @@ std::optional<Common::Net::Release> SelectKizunaUpdate(
 }
 
 std::string RunningVersionLabel() {
-    if (const auto kizuna = RunningKizunaBuild()) {
-        return fmt::format("build {}", *kizuna);
+    if (const auto kizuna = RunningKizunaVersion()) {
+        return fmt::format("v{}.{}", kizuna->major, kizuna->minor);
     }
     const auto version = RunningVersion();
     return version ? version->ToString() : std::string{};

@@ -102,17 +102,28 @@ std::optional<Common::Net::Release> SelectFritchiiUpdate(
     std::span<const Common::Net::Release> releases, const FritchiiVersion& current,
     const Source& source);
 
-// Kizuna: the fork's CI builds carry the release tag "kizuna-N" (LICHII_BUILD_TAG) and are
-// published as "kizuna-build-N" on github.com/luizIK/Kizuna, one Kizuna-windows-x86_64-pgo.zip
-// each. They update from there, never from Fritchii's releases.
+// Kizuna: the fork's CI builds carry the release tag "kizuna-vX.Y" (LICHII_BUILD_TAG) and are
+// published under that tag on github.com/luizIK/Kizuna, one Kizuna-windows-x86_64-pgo.zip each
+// (v1.0 was build 4). They update from there, never from Fritchii's releases.
 inline constexpr std::string_view KizunaRepo = "luizIK/Kizuna";
 inline constexpr std::string_view KizunaAssetName = "Kizuna-windows-x86_64-pgo.zip";
 
-// The running build's number (g_build_release_tag "kizuna-9": 9), or nullopt for other builds.
-std::optional<u32> RunningKizunaBuild();
+struct KizunaVersion {
+    u32 major{};
+    u32 minor{};
 
-// "kizuna-build-9": 9.
-std::optional<u32> ParseKizunaTag(std::string_view tag);
+    auto operator<=>(const KizunaVersion&) const = default;
+};
+
+// Whether the running build is one of Kizuna's (g_build_release_tag "kizuna-...").
+bool IsKizunaBuild();
+
+// The running build's version (g_build_release_tag "kizuna-v1.6"), or nullopt for other builds
+// and for Kizuna's first builds ("kizuna-9"), which had no updater of this kind.
+std::optional<KizunaVersion> RunningKizunaVersion();
+
+// "kizuna-v1.6": 1.6.
+std::optional<KizunaVersion> ParseKizunaTag(std::string_view tag);
 
 Source KizunaSource();
 
@@ -120,12 +131,13 @@ Source KizunaSource();
 std::optional<Common::Net::Asset> SelectKizunaAsset(const Common::Net::Release& release,
                                                     const Source& source);
 
-// The newest release with a higher build number than `current` that has its zip and isn't
-// hidden from the updater.
+// The newest release with a higher version than `current` that has its zip and isn't hidden
+// from the updater.
 std::optional<Common::Net::Release> SelectKizunaUpdate(
-    std::span<const Common::Net::Release> releases, u32 current, const Source& source);
+    std::span<const Common::Net::Release> releases, const KizunaVersion& current,
+    const Source& source);
 
-// "build 9" for a Kizuna build, the Fritchii version ("5.8.4") otherwise, empty if neither.
+// "v1.6" for a Kizuna build, the Fritchii version ("5.8.4") otherwise, empty if neither.
 std::string RunningVersionLabel();
 
 } // namespace UpdateChecker

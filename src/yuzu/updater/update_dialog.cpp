@@ -89,8 +89,8 @@ QString FritchiiName(const QString& version) {
     if (version.isEmpty()) {
         return QCoreApplication::translate("UpdateDialog", "the previous version");
     }
-    // Kizuna: "build 9" as stored by RunningVersionText; an older Fritchii version keeps its "v".
-    return version.startsWith(QStringLiteral("build"))
+    // Kizuna: "v1.6" as stored by RunningVersionText; a Fritchii version is a bare "5.8.4".
+    return version.startsWith(QLatin1Char('v')) || version.startsWith(QStringLiteral("build"))
                ? QStringLiteral("Kizuna %1").arg(version)
                : QStringLiteral("Fritchii v%1").arg(version);
 }

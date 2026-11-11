@@ -37,6 +37,53 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
+      # Versions: build 4 was v1.0, then each release one minor up (v1.1, v1.2...). The releases
+      # tagged kizuna-build-N before that are renamed once, in build order, to kizuna-vX.Y
+      # (new tag on the same commit, release moved to it, old tag deleted). The next version is the
+      # highest kizuna-vX.Y release plus one minor; a failed build takes no number.
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          versions() {
+            gh api "repos/$repo/releases?per_page=100" --jq \
+              '.[].tag_name | select(test("^kizuna-v[0-9]+[.][0-9]+$")) | ltrimstr("kizuna-v")'
+          }
+          if [ "$PUBLISH" = "true" ]; then
+            mapfile -t old < <(gh api "repos/$repo/releases?per_page=100" --jq \
+              '.[].tag_name | select(test("^kizuna-build-[0-9]+$"))' | sort -t- -k3,3n)
+            last="$(versions | sort -t. -k1,1n -k2,2n | tail -n 1)"
+            next_minor=0
+            if [ -n "$last" ]; then next_minor=$(( ${last#*.} + 1 )); fi
+            for tag in "${old[@]}"; do
+              new="kizuna-v1.${next_minor}"
+              sha="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
+              if ! gh api "repos/$repo/git/ref/tags/$new" > /dev/null 2>&1; then
+                gh api -X POST "repos/$repo/git/refs" -f ref="refs/tags/$new" -f sha="$sha" > /dev/null
+              fi
+              id="$(gh api "repos/$repo/releases/tags/$tag" --jq .id)"
+              gh api -X PATCH "repos/$repo/releases/$id" -f tag_name="$new" \
+                -f name="Kizuna v1.${next_minor}" > /dev/null
+              test "$(gh api "repos/$repo/releases/$id" --jq .tag_name)" = "$new"
+              gh api -X DELETE "repos/$repo/git/refs/tags/$tag"
+              echo "Renamed $tag to $new"
+              next_minor=$(( next_minor + 1 ))
+            done
+          fi
+          last="$(versions | sort -t. -k1,1n -k2,2n | tail -n 1)"
+          if [ -z "$last" ]; then
+            version="1.0"
+          else
+            version="${last%%.*}.$(( ${last#*.} + 1 ))"
+          fi
+          echo "Kizuna v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Check PGO profile
         shell: bash
         run: |
@@ -78,8 +125,8 @@ jobs:
           restore-keys: |
             kizuna-objects-mingw-
 
-      # The update checker is on: Kizuna builds (LICHII_BUILD_TAG kizuna-N) look for newer
-      # kizuna-build-N releases of luizIK/Kizuna only (frontend_common/update_checker.cpp), never
+      # The update checker is on: Kizuna builds (LICHII_BUILD_TAG kizuna-vX.Y) look for newer
+      # kizuna-vX.Y releases of luizIK/Kizuna only (frontend_common/update_checker.cpp), never
       # Fritchii's, and install them in place (Help > Check for Updates).
       - name: Configure
         shell: msys2 {0}
@@ -104,7 +151,7 @@ jobs:
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DENABLE_WERROR=OFF \
-            -DLICHII_BUILD_TAG=kizuna-${{ github.run_number }} \
+            -DLICHII_BUILD_TAG=kizuna-v${{ steps.version.outputs.version }} \
             -DLICHII_BUILD_PLATFORM=windows-x86_64-pgo \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
@@ -195,15 +242,18 @@ jobs:
           set -euo pipefail
           # A full release marked Latest: GitHub lists releases by tag name as text (build-10
           # after build-4), so the Latest badge and /releases/latest are what point at the newest.
-          tag="kizuna-build-${GITHUB_RUN_NUMBER}"
+          version="${{ steps.version.outputs.version }}"
+          tag="kizuna-v${version}"
           # The commit message is what the in-app updater shows as the release notes.
           notes="$(git log -1 --format=%B | grep -v -e '^Co-Authored-By:' -e '^Claude-Session:' || true)"
           notes="${notes}
+
+          Commit ${GITHUB_SHA::7}, workflow run ${GITHUB_RUN_NUMBER}.
 
           Extract the zip and run lichii.exe, or use Help > Check for Updates in Kizuna."
           gh release create "$tag" Kizuna-windows-x86_64-pgo.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --latest \
-            --title "Kizuna build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --title "Kizuna v${version}" \
             --notes "$notes"

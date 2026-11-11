@@ -13,6 +13,7 @@
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
 #include "ui_main.h"
+#include "frontend_common/play_time_manager.h"
 #include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/bootmanager.h"
 #include "yuzu/fritchii/game_controls.h"
@@ -130,6 +131,10 @@ void MainWindow::SetUpFritchiiUi() {
         .game_list_empty = [this] { return game_list->IsEmpty(); },
         .single_window = [this] { return ui->action_Single_Window_Mode->isChecked(); },
         .emulation_running = [this] { return emulation_running; },
+        .play_time =
+            [this](u64 program_id) -> u64 {
+                return play_time_manager ? play_time_manager->GetPlayTime(program_id) : 0;
+            },
         .model = game_list->GetModel(),
         .help_menu = ui->menu_Help,
         .classic_menus = {ui->menu_File, ui->menu_Emulation, ui->menu_View, ui->menu_Tools,

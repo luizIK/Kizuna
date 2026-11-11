@@ -69,6 +69,19 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   (`fritchii/kizuna_logo.png`, transparent) sits at the top of the rail, on the Preparing shaders
   screen and in About; the home page has the Kizuna name. The app icon is `dist/kizuna.ico`
   (the rounded square with transparent corners, 16 to 256 px).
+- **Home screen, console style** (`fritchii/home.cpp`): a top bar (logo, name, clock), a shelf
+  of game tiles with the selected one larger and ringed in cream, the selected game's name, play
+  time, Play and options, and a dock (Library, Saves, Screenshots, Settings, Help, Menu) with
+  keyboard hints. Left/Right choose, Enter plays, Esc opens the menus, the Menu key the game's
+  options; a click picks a tile, a click on the picked one opens it. Fritchii's left rail only
+  shows beside the full game list, as the way back home.
+- **Scene changes and VRAM.** ASTC transcodes reuse their RGBA8 decode images as soon as the GPU
+  is done with them and wait past 192 MiB pending (Ocarina's town to Hyrule Field crashed out of
+  memory before the field loaded); uneven-mip ASTC stays BC when its last even level is up to
+  64 texels.
+- **Crash reports** chain to MinGW's exception filter, so an uncaught C++ exception still reaches
+  std::terminate and the log names it; each release carries `Kizuna-symbols.zip` (the linker map)
+  to read the reports' `lichii.exe+offset`.
 
 ## Keeping the "Preparing shaders" cache valid
 

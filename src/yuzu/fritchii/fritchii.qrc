@@ -20,6 +20,9 @@
         <file>icons/fullscreen-exit.svg</file>
         <file>icons/community.svg</file>
         <file>icons/heart.svg</file>
+        <file>icons/dots.svg</file>
+        <file>icons/save.svg</file>
+        <file>icons/photo.svg</file>
         <file>kizuna_logo.png</file>
         <file>kizuna_icon.png</file>
     </qresource>

@@ -4,6 +4,8 @@
 
 #include <functional>
 #include <string>
+#include <vector>
+#include <QPixmap>
 #include <QWidget>
 #include "common/common_types.h"
 
@@ -19,6 +21,16 @@ class QToolButton;
 
 namespace FritchiiUi {
 
+class ShelfTile;
+
+/// A game on the home shelf.
+struct HomeGame {
+    QString title;
+    QString path;
+    u64 program_id = 0;
+    QPixmap icon;
+};
+
 /// What the home screen asks the main window to do.
 struct HomeHooks {
     std::function<void(const QString& path, u64 program_id)> play;
@@ -32,15 +44,19 @@ struct HomeHooks {
     std::function<bool()> game_list_empty;
     std::function<bool()> single_window;
     std::function<bool()> emulation_running;
+    /// Kizuna: seconds played (PlayTimeManager), 0 when never played.
+    std::function<u64(u64 program_id)> play_time;
     QStandardItemModel* model = nullptr;
     QMenu* help_menu = nullptr;
-    QList<QMenu*> classic_menus;  ///< File, Game, View, Tools, Help behind the rail's menu button
+    QList<QMenu*> classic_menus;  ///< File, Game, View, Tools, Help behind the Menu button
 };
 
-/// The Fritchii main screen: a left icon rail (Library, Settings, Help, and the classic menus
-/// behind a button) and a home page with one big card for Ocarina of Time (or the first game)
-/// and the other games in a small row. The classic game list stays one click away
-/// ("All games"); the main window keeps managing it as before.
+/// Kizuna's main screen, laid out like a console's home: a top bar (logo, name, clock), a shelf
+/// of game tiles with the selected one larger and ringed in cream, the selected game's name, play
+/// time and Play / options buttons, and a dock of round buttons (Library, Saves, Screenshots,
+/// Settings, Help, Menu) with keyboard hints. Left/Right choose, Enter plays, Esc opens the menu.
+/// The classic game list stays one click away (Library), with a slim rail to come back; the main
+/// window keeps managing it as before.
 class Home : public QObject {
     Q_OBJECT
 public:
@@ -58,10 +74,16 @@ private:
     void ShowList();
     void Restore();
     void Refresh();
+    void Select(int index);
+    void Activate(int index);
+    void ShowGameMenu(const QPoint& global_pos);
+    void ShowClassicMenu(const QPoint& global_pos);
+    void UpdateClock();
 
     QWidget* MakeRail();
     QWidget* MakePage();
     QToolButton* RailButton(const QString& icon, const QString& tip);
+    QToolButton* DockButton(const QString& icon, const QString& text);
 
     QMainWindow* window;
     QWidget* game_list;
@@ -70,13 +92,21 @@ private:
 
     QWidget* rail = nullptr;
     QWidget* page = nullptr;
-    QToolButton* library_button = nullptr;
-    QLabel* cover = nullptr;
+    QLabel* clock = nullptr;
     QLabel* title = nullptr;
+    QLabel* subtitle = nullptr;
     QPushButton* play = nullptr;
-    QHBoxLayout* row = nullptr;
-    QWidget* row_box = nullptr;
+    QPushButton* options = nullptr;
+    QHBoxLayout* shelf = nullptr;
+    QWidget* shelf_box = nullptr;
+    QToolButton* menu_button = nullptr;
     QTimer* refresh_timer = nullptr;
+    QTimer* clock_timer = nullptr;
+
+    /// The shelf: the games, then "All games" and "Add folder" (no program id, empty path).
+    std::vector<HomeGame> games;
+    std::vector<ShelfTile*> tiles;
+    int focus = 0;
 
     bool list_mode = false;
     QString hero_path;

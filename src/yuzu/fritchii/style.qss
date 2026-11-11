@@ -233,9 +233,29 @@ QToolButton#FritchiiTile {
 }
 QToolButton#FritchiiTile:hover { background: #232a36; color: #f0ebdf; }
 
-/* Kizuna brand marks (fritchii/home.cpp, precompile_gate.cpp) */
+/* Kizuna home, console style (fritchii/home.cpp) */
 QLabel#KizunaWordmark { font-size: 22px; font-weight: 500; color: #f0ebdf; }
-QLabel#KizunaTagline { font-size: 13px; color: #a9aeb8; }
+QLabel#KizunaClock { font-size: 20px; font-weight: 500; color: #f0ebdf; }
+QLabel#KizunaSubtitle { font-size: 14px; color: #a9aeb8; }
+QLabel#KizunaHints { font-size: 13px; color: #a9aeb8; }
 QLabel#FritchiiHeroTitle { letter-spacing: 0.3px; }
-QToolButton#FritchiiTile { border: 1px solid transparent; }
-QToolButton#FritchiiTile:hover { border: 1px solid #333c4b; }
+QPushButton#KizunaRound {
+    background: #262e3b;
+    border: none;
+    border-radius: 22px;
+    min-width: 44px;
+    max-width: 44px;
+    min-height: 44px;
+    max-height: 44px;
+    padding: 0;
+}
+QPushButton#KizunaRound:hover { background: #333c4b; }
+QToolButton#KizunaDock {
+    background: transparent;
+    border: none;
+    color: #a9aeb8;
+    font-size: 12px;
+    padding: 2px 8px;
+}
+QToolButton#KizunaDock:hover { color: #f0ebdf; }
+QFrame#KizunaDockLine { background: #2a3240; border: none; min-height: 1px; max-height: 1px; }

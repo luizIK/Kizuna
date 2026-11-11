@@ -36,6 +36,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/kizuna_branding.h"
 #include "common/host_memory.h"
 #include "common/memory_detect.h"
 #include "common/shutdown_progress.h"
@@ -654,14 +655,23 @@ std::filesystem::path SessionMarkerPath() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "pipeline_cache_open.flag";
 }
 
-/// EDEN_NX2_AMD_APP_CACHE=1 (boot, off): on AMD's own driver keep our VkPipelineCache file too,
+/// EDEN_NX2_AMD_APP_CACHE=1 (boot; off upstream, on in Kizuna builds, =0 turns it off): on AMD's
+/// own driver keep our VkPipelineCache file too,
 /// for what play builds (boot rebuilds of earlier sessions' pipelines included), not the
 /// preparation's ~120k. A player's driver cache kept ~44% of a preparation and nothing visible
 /// across a restart (fable52_answer_3, fix 2).
 bool AmdAppCache(const Device& device) {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_AMD_APP_CACHE");
-        return value != nullptr && value[0] == '1';
+        if (value != nullptr) {
+            return value[0] == '1';
+        }
+        // Kizuna: on by default. The driver's folder stayed at ~1 GiB (AMD's cap) after the
+        // preparation's ~120k pipelines, so pipelines built in play were gone by the next session
+        // and every session froze on the same "Building: N shader(s)" again (2026-11-11, RX 6600,
+        // driver 26.10.1: 161 builds of 0.3 to 5 s in 10 minutes). Kept in our file, each one
+        // freezes once.
+        return Common::KizunaDetail::IsKizunaBuild();
     }();
     return enabled && device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
 }

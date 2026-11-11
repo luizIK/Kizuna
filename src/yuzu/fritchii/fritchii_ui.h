@@ -31,8 +31,13 @@ namespace FritchiiUi {
 /// when the Fritchii UI is off.
 bool ApplyTheme();
 
-/// Settings the Fritchii settings pages leave out (frame generation and its dev options).
+/// Settings the Fritchii settings pages leave out (frame generation's dev options; Fritchii
+/// builds hide frame generation itself, Kizuna builds show it).
 [[nodiscard]] bool HidesSetting(const std::string& label);
+
+/// Kizuna: a short notice over the game (fullscreen too), centred near the top of `anchor`, gone
+/// after a moment. For hotkeys that change something while playing (Ctrl+U: 30 / 60 FPS).
+void ShowNotice(QWidget* anchor, const QString& text);
 
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.
 [[nodiscard]] QIcon Icon(const QString& name, int px = 22);
@@ -56,8 +61,12 @@ struct GraphicsHooks {
     std::function<bool()> renderer_locked;  ///< the renderer can't change while a game runs
     std::function<void()> open_settings;
     std::function<void()> open_effects;     ///< empty without ReShade-style effects
+    std::function<void()> save;             ///< Kizuna: writes the settings to disk
+    std::function<bool()> game_running;     ///< Kizuna: a game runs (upscaler: next start)
+    std::function<void(const QString&)> notice; ///< Kizuna: a line in the status bar / over the game
 };
-/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, effects.
+/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, the
+/// Ocarina upscaler (AMD FSR), frame generation (Kizuna), effects.
 [[nodiscard]] QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks);
 
 /// A settings page as the settings dialog shows it: inside a scroll area in Fritchii builds, so

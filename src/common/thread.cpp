@@ -858,6 +858,43 @@ void SetCurrentThreadToBackgroundWork() {
 #endif
 }
 
+RaisableThread OpenCurrentThreadForRaise() {
+    RaisableThread thread;
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                        THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, 0)) {
+        thread.handle = handle;
+        thread.priority = GetThreadPriority(GetCurrentThread());
+    }
+#endif
+    return thread;
+}
+
+void RaiseThread(const RaisableThread& thread) {
+#ifdef _WIN32
+    if (thread.handle != nullptr) {
+        SetThreadPriority(static_cast<HANDLE>(thread.handle), THREAD_PRIORITY_HIGHEST);
+    }
+#else
+    static_cast<void>(thread);
+#endif
+}
+
+void CloseRaisableThread(RaisableThread& thread, bool raised) {
+#ifdef _WIN32
+    if (thread.handle != nullptr) {
+        if (raised && thread.priority != THREAD_PRIORITY_ERROR_RETURN) {
+            SetThreadPriority(GetCurrentThread(), thread.priority);
+        }
+        CloseHandle(static_cast<HANDLE>(thread.handle));
+    }
+#else
+    static_cast<void>(raised);
+#endif
+    thread = {};
+}
+
 void SetCurrentThreadToAllCores() {
 #if defined(__ANDROID__)
     ADPF::RemoveCurrentThread();

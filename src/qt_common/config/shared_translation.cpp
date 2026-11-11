@@ -241,7 +241,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
 
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
+           tr("Shows generated frames between the game's own (the built-in optical flow "
+              "interpolation, after AMD FSR 3, by default): smoother motion, a little more "
+              "input lag. Best with Ocarina's 30 FPS "
+              "mode on a 60 Hz screen (2x), or 60 FPS on a 120 Hz or faster one. Turns V-Sync "
+              "on. Ctrl+G switches it while you play."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
@@ -330,12 +335,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "unlocked."));
     INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
            tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
-              "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
+              "once; Ctrl+U and the 60 FPS / 30 FPS button in the status bar switch it too."));
     INSERT(Settings, oot_high_refresh, QString(), QString());
     INSERT(Settings, oot_high_refresh_cap, tr("OoT: high refresh rate (experimental)"),
            tr("Lets Ocarina of Time run above 60 FPS, up to the chosen cap, at its normal speed. "
               "Untested in much of the game: timers, cutscenes or minigames may run off. Takes "
-              "effect at once; Ctrl+U switches it while you play. The 30 FPS mode overrides "
+              "effect at once; Ctrl+Shift+U switches it while you play. The 30 FPS mode overrides "
               "it."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "

@@ -131,4 +131,18 @@ void SetCurrentThreadToAllCores();
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
+/// Kizuna: a thread another one can raise while it waits for that thread's work (a pipeline
+/// build a draw is held for). Empty where not supported (only Windows raises).
+struct RaisableThread {
+    void* handle = nullptr; ///< a duplicated handle to the thread (Windows)
+    int priority = 0;       ///< its priority when opened, put back by CloseRaisableThread
+};
+/// The calling thread, for RaiseThread from another thread.
+[[nodiscard]] RaisableThread OpenCurrentThreadForRaise();
+/// Runs the thread ahead of the guest cores (THREAD_PRIORITY_HIGHEST) until it is closed.
+void RaiseThread(const RaisableThread& thread);
+/// Called by the thread itself: its priority back as it was opened if `raised`, then the
+/// handle closed.
+void CloseRaisableThread(RaisableThread& thread, bool raised);
+
 } // namespace Common

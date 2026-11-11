@@ -82,6 +82,19 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 - **Crash reports** chain to MinGW's exception filter, so an uncaught C++ exception still reaches
   std::terminate and the log names it; each release carries `Kizuna-symbols.zip` (the linker map)
   to read the reports' `lichii.exe+offset`.
+- **Shader-compile freezes ("Building: N shader(s)").** A draw into a target the game keeps
+  (shadow maps, probes) waits for its pipeline; the builders run below the guest cores, so that
+  build shared a core with up to ten others (0.3 to 5 s on a Ryzen 5 5600). `PipelineBuild::Wait`
+  now raises the thread building it (`Common::RaiseThread`, THREAD_PRIORITY_HIGHEST) until it is
+  done. AMD's own cache stays at ~1 GiB after the preparation, so pipelines built in play were
+  gone by the next session: our VkPipelineCache file is on for them on AMD
+  (`EDEN_NX2_AMD_APP_CACHE`, default on in Kizuna builds, `=0` turns it off; up to 512 MiB).
+- **Hotkeys.** Ctrl+U switches Ocarina between 30 and 60 FPS at once (with a notice over the
+  game); its high refresh mode moved to Ctrl+Shift+U; Ctrl+G turns frame generation on and off.
+- **AMD FSR and frame generation.** The Graphics button has "Ocarina Upscaler (FSR)" (Game, No
+  sharpening, AMD FSR 3.1, AMD FSR 4; read when the game starts) and "Frame Generation" (off, 2x,
+  3x, 4x; live). Fritchii turned frame generation off for its builds (`Settings::FrameGenActive`)
+  and hid its settings; Kizuna builds offer it, off by default, with the settings in Graphics.
 
 ## Keeping the "Preparing shaders" cache valid
 

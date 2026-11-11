@@ -1506,12 +1506,22 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
 
     connect_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
-        // Ocarina of Time: its high refresh rate mode instead (unlocked, its logic ran fast).
-        if (!ToggleOotHighRefresh()) {
+        // Kizuna: Ocarina of Time switches between 30 and 60 FPS, at once (the owner, 2026-11-11);
+        // its high refresh rate mode moved to Ctrl+Shift+U. Unlocking it ran its logic fast.
+        if (IsOotRunning()) {
+            OnToggleOotFrameRate();
+            const bool fps30 = Settings::values.oot_30fps.GetValue();
+            ShowGameNotice(fps30 ? tr("30 FPS")
+                           : Settings::OotHighRefreshPatched() ? tr("60 FPS (high refresh on)")
+                                                               : tr("60 FPS"));
+        } else {
             Settings::ToggleStandardMode();
         }
         SetFPSSuffix();
     });
+    connect_shortcut(QStringLiteral("Toggle High Refresh"), [this] { ToggleOotHighRefresh(); });
+    connect_shortcut(QStringLiteral("Toggle Frame Generation"),
+                     [this] { ToggleFrameGeneration(); });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
         Settings::ToggleTurboMode();
@@ -5398,6 +5408,21 @@ void MainWindow::OnToggleOotFrameRate() {
     config->SaveAllValues();
 }
 
+void MainWindow::ShowGameNotice(const QString& text) {
+    statusBar()->showMessage(text, 4000);
+    if (FritchiiUi::Enabled() && emulation_running && render_window != nullptr) {
+        FritchiiUi::ShowNotice(render_window, text);
+    }
+}
+
+void MainWindow::ToggleFrameGeneration() {
+    const bool on = !Settings::values.frame_gen.GetValue();
+    Settings::values.frame_gen.SetValue(on);
+    config->SaveAllValues();
+    ShowGameNotice(on ? tr("Frame generation: %1x").arg(Settings::FrameGenMultiplier())
+                      : tr("Frame generation: off"));
+}
+
 bool MainWindow::IsOotRunning() const {
     constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
     // Not while "Closing software...": the kernel is being torn down (fable52_answer_10 2.6).
@@ -5464,7 +5489,7 @@ void MainWindow::SetOotHighRefresh(bool on) {
         text = tr("High refresh: can't switch in this game version");
         break;
     }
-    statusBar()->showMessage(text, 4000);
+    ShowGameNotice(text);
     SetFPSSuffix();
 }
 

@@ -111,6 +111,9 @@ void MainWindow::SetUpFritchiiUi() {
 #ifdef HAS_RESHADE
         .open_effects = [this] { OnPostProcessingShaders(); },
 #endif
+        .save = [this] { config->SaveAllValues(); },
+        .game_running = [this] { return emulation_running; },
+        .notice = [this](const QString& text) { ShowGameNotice(text); },
     };
     statusBar()->insertPermanentWidget(0, FritchiiUi::MakeGraphicsButton(this, graphics));
 

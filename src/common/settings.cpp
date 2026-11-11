@@ -22,6 +22,7 @@
 #include <fmt/core.h>
 
 #include "common/scm_rev.h"
+#include "common/kizuna_branding.h"
 #include "common/settings_enums.h"
 #include "common/assert.h"
 #include "common/fs/fs_util.h"
@@ -426,7 +427,10 @@ u32 FrameGenMultiplier() {
 }
 
 bool FrameGenActive() {
-    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii";
+    // Fritchii shows real frames only; Kizuna offers frame generation again (Graphics > Frame
+    // Generation, Ctrl+G), off unless the player turns it on.
+    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii" &&
+                                 !Common::KizunaDetail::IsKizunaBuild();
     return values.frame_gen.GetValue() && !fritchii;
 }
 

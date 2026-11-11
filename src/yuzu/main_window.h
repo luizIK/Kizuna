@@ -488,9 +488,13 @@ private:
     void UpdateDockedButton();
     void UpdateOotFpsButton();
     bool IsOotRunning() const;
-    /// Ocarina of Time running: switches its high refresh rate mode live (Ctrl+U) and returns
-    /// true; otherwise false.
+    /// Ocarina of Time running: switches its high refresh rate mode live (Ctrl+Shift+U) and
+    /// returns true; otherwise false.
     bool ToggleOotHighRefresh();
+    /// Kizuna: `text` in the status bar and, while a game runs, over it (fullscreen too).
+    void ShowGameNotice(const QString& text);
+    /// Kizuna (Ctrl+G): frame generation on (at its multiplier) or off, live.
+    void ToggleFrameGeneration();
     /// Switches Ocarina of Time's high refresh rate mode while it runs, saves the setting when it
     /// worked, and says how it went in the status bar.
     void SetOotHighRefresh(bool on);

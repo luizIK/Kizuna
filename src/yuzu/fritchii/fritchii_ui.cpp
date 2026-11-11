@@ -20,6 +20,7 @@
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
+#include <QLabel>
 #include <QLocale>
 #include <QMainWindow>
 #include <QMenu>
@@ -28,13 +29,16 @@
 #include <QProcess>
 #include <QPalette>
 #include <QPixmap>
+#include <QPointer>
 #include <QProxyStyle>
 #include <QPushButton>
+#include <QTimer>
 #include <QUrl>
 #include <QScrollArea>
 #include <QStyleFactory>
 
 #include "common/fs/fs_paths.h"
+#include "common/kizuna_branding.h"
 #include "common/fs/path_util.h"
 #include "frontend_common/profile_import.h"
 #include "yuzu/fritchii/saves_window.h"
@@ -162,8 +166,49 @@ bool ApplyTheme() {
 }
 
 bool HidesSetting(const std::string& label) {
+    if (!Enabled()) {
+        return false;
+    }
+    // Kizuna: frame generation is offered (the owner asked for it, 2026-11-11); its flow dump
+    // stays a dev tool.
+    if (Common::KizunaDetail::IsKizunaBuild()) {
+        return label == "frame_gen_dump_flow";
+    }
     // No frame generation in Fritchii (real frames only), and its options are dev tools.
-    return Enabled() && label.starts_with("frame_gen");
+    return label.starts_with("frame_gen");
+}
+
+void ShowNotice(QWidget* anchor, const QString& text) {
+    static QPointer<QLabel> label;
+    static QPointer<QTimer> timer;
+    if (!label) {
+        label = new QLabel(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+                                        Qt::WindowDoesNotAcceptFocus |
+                                        Qt::WindowTransparentForInput |
+                                        Qt::NoDropShadowWindowHint);
+        label->setAttribute(Qt::WA_TranslucentBackground);
+        label->setAttribute(Qt::WA_ShowWithoutActivating);
+        label->setAlignment(Qt::AlignCenter);
+        label->setStyleSheet(QStringLiteral(
+            "QLabel { background-color: rgba(26, 31, 40, 230); color: #f0ebdf; "
+            "border: 1px solid rgba(240, 235, 223, 70); border-radius: 14px; "
+            "padding: 10px 26px; font-size: 20px; font-weight: 600; }"));
+        timer = new QTimer(label.data());
+        timer->setSingleShot(true);
+        QObject::connect(timer.data(), &QTimer::timeout, label.data(), &QWidget::hide);
+    }
+    label->setText(text);
+    label->adjustSize();
+    QWidget* const area = anchor != nullptr ? anchor->window() : nullptr;
+    if (anchor != nullptr && anchor->isVisible()) {
+        const QPoint origin = anchor->mapToGlobal(QPoint(0, 0));
+        label->move(origin.x() + (anchor->width() - label->width()) / 2, origin.y() + 48);
+    } else if (area != nullptr) {
+        label->move(area->x() + (area->width() - label->width()) / 2, area->y() + 48);
+    }
+    label->show();
+    label->raise();
+    timer->start(1800);
 }
 
 QIcon Icon(const QString& name, int px) {
@@ -344,7 +389,8 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
     QObject::connect(button, &QPushButton::clicked, button, [button, hooks] {
         QMenu menu(button);
         const auto add_choices = [&menu, &hooks](const QString& title, const auto& texts,
-                                                 auto current, auto apply, bool enabled) {
+                                                 auto current, auto apply,
+                                                 bool enabled) -> QMenu* {
             QMenu* sub = menu.addMenu(title);
             sub->setEnabled(enabled);
             auto* group = new QActionGroup(sub);
@@ -358,6 +404,7 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
                     hooks.refresh();
                 });
             }
+            return sub;
         };
 
         std::map<Settings::RendererBackend, QString> renderers;
@@ -390,6 +437,67 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
             Settings::values.anti_aliasing.GetValue(),
             [](Settings::AntiAliasing mode) { Settings::values.anti_aliasing.SetValue(mode); },
             true);
+        if (Common::KizunaDetail::IsKizunaBuild()) {
+            // Kizuna: AMD FSR in place of Ocarina's own upscale pass (the "Ocarina of Time
+            // anti-aliasing" setting), read when the game starts.
+            const std::map<Settings::OotAntiAliasing, QString> upscalers{
+                {Settings::OotAntiAliasing::Game, QObject::tr("Game (its own anti-aliasing)")},
+                {Settings::OotAntiAliasing::NoSharpening, QObject::tr("No sharpening")},
+                {Settings::OotAntiAliasing::Fsr3, QObject::tr("AMD FSR 3.1")},
+                {Settings::OotAntiAliasing::Fsr4,
+                 QObject::tr("AMD FSR 4 (FSR 3.1 without AMD's files)")},
+            };
+            QMenu* upscaler = add_choices(
+                QObject::tr("Ocarina &Upscaler (FSR)"), upscalers,
+                Settings::values.oot_anti_aliasing.GetValue(),
+                [hooks](Settings::OotAntiAliasing mode) {
+                    Settings::values.oot_anti_aliasing.SetValue(mode);
+                    if (hooks.save) {
+                        hooks.save();
+                    }
+                    if (hooks.notice && hooks.game_running && hooks.game_running()) {
+                        hooks.notice(QObject::tr(
+                            "Upscaler: takes effect the next time the game starts"));
+                    }
+                },
+                true);
+            upscaler->addSeparator();
+            upscaler->addAction(QObject::tr("FSR sharpness: More Settings > Graphics"))
+                ->setEnabled(false);
+
+            // Frame generation (the built-in optical flow interpolation after AMD FSR 3, by
+            // default; Lossless Scaling's in More Settings): live, no restart.
+            const std::map<u32, QString> multipliers{
+                {0, QObject::tr("Off")},
+                {2, QObject::tr("On, 2x")},
+                {3, QObject::tr("On, 3x")},
+                {4, QObject::tr("On, 4x")},
+            };
+            const u32 current = Settings::values.frame_gen.GetValue()
+                                    ? Settings::FrameGenMultiplier()
+                                    : 0;
+            QMenu* frame_gen = add_choices(
+                QObject::tr("Frame &Generation"), multipliers, current,
+                [hooks](u32 multiplier) {
+                    Settings::values.frame_gen.SetValue(multiplier != 0);
+                    if (multiplier != 0) {
+                        Settings::values.frame_gen_multiplier.SetValue(multiplier);
+                    }
+                    if (hooks.save) {
+                        hooks.save();
+                    }
+                    if (hooks.notice) {
+                        hooks.notice(multiplier != 0
+                                         ? QObject::tr("Frame generation: %1x").arg(multiplier)
+                                         : QObject::tr("Frame generation: off"));
+                    }
+                },
+                true);
+            frame_gen->addSeparator();
+            frame_gen->addAction(QObject::tr("Best with 30 FPS (Ctrl+U) on a 60 Hz screen"))
+                ->setEnabled(false);
+            frame_gen->addAction(QObject::tr("Ctrl+G turns it on and off"))->setEnabled(false);
+        }
 #ifdef HAS_RESHADE
         QMenu* effects = menu.addMenu(QObject::tr("&Effects"));
         auto* effects_group = new QActionGroup(effects);

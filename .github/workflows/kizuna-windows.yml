@@ -78,14 +78,18 @@ jobs:
           restore-keys: |
             kizuna-objects-mingw-
 
-      # The update checker is off: the upstream one compares release tags with build-N and would
-      # offer Fritchii/Lichii builds over this one.
+      # The update checker is on: Kizuna builds (LICHII_BUILD_TAG kizuna-N) look for newer
+      # kizuna-build-N releases of luizIK/Kizuna only (frontend_common/update_checker.cpp), never
+      # Fritchii's, and install them in place (Help > Check for Updates).
       - name: Configure
         shell: msys2 {0}
         run: |
           set -euo pipefail
           profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin \
             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          # Kizuna is built for one PC (Ryzen 5 5600, Zen 3): AVX2/FMA/BMI2 everywhere
+          # (x86-64-v3, which the build runners have too) and scheduling for Zen 3.
+          cpu="-march=x86-64-v3 -mtune=znver3"
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
@@ -98,7 +102,7 @@ jobs:
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_UPDATE_CHECKER=ON \
             -DENABLE_WERROR=OFF \
             -DLICHII_BUILD_TAG=kizuna-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=windows-x86_64-pgo \
@@ -107,8 +111,8 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
-            "-DCMAKE_C_FLAGS=$profile" \
-            "-DCMAKE_CXX_FLAGS=$profile"
+            "-DCMAKE_C_FLAGS=$profile $cpu" \
+            "-DCMAKE_CXX_FLAGS=$profile $cpu"
 
       - name: Save CPM downloads
         if: steps.cpm-cache.outputs.cache-hit != 'true'
@@ -190,9 +194,14 @@ jobs:
         run: |
           set -euo pipefail
           tag="kizuna-build-${GITHUB_RUN_NUMBER}"
+          # The commit message is what the in-app updater shows as the release notes.
+          notes="$(git log -1 --format=%B | grep -v -e '^Co-Authored-By:' -e '^Claude-Session:' || true)"
+          notes="${notes}
+
+          Extract the zip and run lichii.exe, or use Help > Check for Updates in Kizuna."
           gh release create "$tag" Kizuna-windows-x86_64-pgo.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --prerelease \
             --title "Kizuna build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes "Kizuna: Fritchii v5.8.4 with out-of-memory recovery for render targets. Extract the zip and run lichii.exe (create a folder named user beside it for portable mode)."
+            --notes "$notes"

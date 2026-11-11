@@ -1402,6 +1402,21 @@ void PlacePrecompileThread(bool full) {
     }
 }
 
+// Kizuna: quick preparation (EDEN_NX2_PRECOMPILE_QUICK, on unless =0; needs the kept infos and
+// SPIR-V of EDEN_NX2_PRECOMPILED_FAST). The screen only translates the records and keeps their
+// SPIR-V (a translation is ~35 ms, a driver compile on an RX 6600 ~400 ms: Ocarina's 120,124
+// records took 7151 s on a Ryzen 5 5600); the driver then compiles them beside the game on idle
+// threads (precompiled_driver.fork-vN.txt, resumed at every boot), and a draw whose pipeline is
+// not compiled yet builds it from the kept SPIR-V on the workers (EDEN_NX2_ASYNC_DISCARD skips
+// it meanwhile where that is safe).
+bool PrecompileQuickMode() {
+    static const bool quick = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_QUICK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return quick;
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -4099,22 +4114,49 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     auto kept_part = kept_path;
     kept_part += ".part";
     const std::string kept_stamp = keep ? KeptStamp(stamp) : std::string{};
+    // Kizuna: quick preparation (PrecompileQuickMode). Where the driver's compiles beside the
+    // game have got to: the prepared stamp, then the next record. No file: nothing left.
+    const bool quick = keep && PrecompileQuickMode();
+    const auto driver_path =
+        base_dir / fmt::format("precompiled_driver.fork-v{}.txt", CACHE_VERSION);
+    const auto read_driver_next = [&]() -> std::optional<size_t> {
+        std::ifstream driver_file(driver_path, std::ios::binary);
+        std::string line;
+        size_t next{};
+        if (std::getline(driver_file, line) && line + '\n' == stamp && (driver_file >> next)) {
+            return next;
+        }
+        return std::nullopt;
+    };
+    std::optional<size_t> driver_only_from;
     if (!force && !VideoCommon::Nx2Precompile::Forced()) {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
         if (previous == stamp) {
             if (!keep || LoadKept(kept_path, kept_part, path, kept_stamp, true)) {
-                LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
-                return;
+                driver_only_from = keep ? read_driver_next() : std::nullopt;
+                if (!driver_only_from) {
+                    LOG_INFO(Render_Vulkan,
+                             "Precompiled pipelines already prepared for this driver");
+                    return;
+                }
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines already translated; the driver compiles them "
+                         "beside the game from record {}",
+                         *driver_only_from);
+                // Nothing for the game to wait for.
+                shader_notify.SetPrecompilePending(false);
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines were prepared without keeping their infos and "
+                         "SPIR-V for this release and its settings, or this build translates them "
+                         "otherwise (EDEN_NX2_PRECOMPILED_FAST): preparing them again");
             }
-            LOG_INFO(Render_Vulkan,
-                     "Precompiled pipelines were prepared without keeping their infos and SPIR-V "
-                     "for this release and its settings, or this build translates them otherwise "
-                     "(EDEN_NX2_PRECOMPILED_FAST): preparing them again");
         }
     }
-    // Published again once this preparation has written its file.
-    {
+    // Published again once this preparation has written its file (not when only the driver's
+    // compiles are left: LoadKept above published it).
+    if (!driver_only_from) {
         std::scoped_lock lock{kept_mutex};
         kept_index.reset();
         kept_available = false;
@@ -4186,6 +4228,196 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto progress_path =
         base_dir / fmt::format("precompiled_progress.fork-v{}.txt", CACHE_VERSION);
     const size_t threads = VideoCommon::Nx2Precompile::Threads();
+
+    // Kizuna: the driver's compiles of a quick preparation, beside the game on `threads` idle
+    // threads from record `from`; every pipeline is translated again and built, then dropped (the
+    // driver keeps the compiled code). Records in the disk cache are left to the boot's builds,
+    // those made for another device are skipped, as in the preparation.
+    const auto write_driver_next = [&](size_t next) {
+        std::ofstream driver_file(driver_path, std::ios::binary | std::ios::trunc);
+        driver_file << stamp << next << '\n';
+    };
+    const auto warm_driver = [&](size_t from) {
+        // The game is let go now (the screen closes): what is left only fills the driver's cache.
+        shader_notify.SetPrecompilePending(false);
+        std::error_code remove_error;
+        if (from >= total) {
+            std::filesystem::remove(driver_path, remove_error);
+            return;
+        }
+        struct DriverState {
+            std::mutex mutex;
+            std::atomic<size_t> next{};
+            std::atomic<size_t> finished{};
+            std::atomic<size_t> built{};
+            std::atomic<size_t> fast{};
+            std::atomic<size_t> failed{};
+            std::atomic<size_t> skipped{};
+            size_t low_water{};
+            size_t checkpoint{};
+            std::vector<u8> done;
+        } driver;
+        driver.done.assign(total, 0);
+        driver.next = from;
+        driver.finished = from;
+        driver.low_water = driver.checkpoint = from;
+        const auto driver_disk_keys = precompile_disk_keys;
+        const auto driver_begin = std::chrono::steady_clock::now();
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled pipelines: the driver compiles records {} to {} beside the game on "
+                 "{} idle threads",
+                 from, total, threads);
+        const auto driver_work = [&](std::stop_token stop) {
+            t_precompile_build = true;
+            Common::SetCurrentThreadName("VkDriverWarm");
+            GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
+            PlacePrecompileThread(false);
+            std::ifstream in(path, std::ios::binary);
+            in.exceptions(std::ifstream::failbit);
+            while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
+                const size_t index = driver.next.fetch_add(1);
+                if (index >= total) {
+                    break;
+                }
+                bool ok = false;
+                bool skipped = false;
+                const auto build_begin = std::chrono::steady_clock::now();
+                try {
+                    in.clear();
+                    in.seekg(static_cast<std::streamoff>(record_offsets[index]));
+                    u8 kind{}, count{};
+                    u16 pad{};
+                    std::array<u32, Maxwell::MaxShaderProgram> ids{};
+                    in.read(reinterpret_cast<char*>(&kind), 1)
+                        .read(reinterpret_cast<char*>(&count), 1)
+                        .read(reinterpret_cast<char*>(&pad), 2)
+                        .read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
+                    const bool compute = kind == 1;
+                    ComputePipelineCacheKey compute_key{};
+                    GraphicsPipelineCacheKey record_key{};
+                    if (compute) {
+                        in.read(reinterpret_cast<char*>(&compute_key), sizeof(compute_key));
+                    } else {
+                        in.read(reinterpret_cast<char*>(&record_key), sizeof(record_key));
+                        RecordedKeyForThisDevice(record_key);
+                        const auto& key_state = record_key.state;
+                        skipped =
+                            (key_state.extended_dynamic_state != 0) !=
+                                dynamic_features.has_extended_dynamic_state ||
+                            (key_state.extended_dynamic_state_2 != 0) !=
+                                dynamic_features.has_extended_dynamic_state_2 ||
+                            (key_state.extended_dynamic_state_2_logic_op != 0) !=
+                                dynamic_features.has_extended_dynamic_state_2_logic_op ||
+                            (key_state.extended_dynamic_state_3_blend != 0) !=
+                                dynamic_features.has_extended_dynamic_state_3_blend ||
+                            (key_state.extended_dynamic_state_3_enables != 0) !=
+                                dynamic_features.has_extended_dynamic_state_3_enables ||
+                            (key_state.color_write_enable_dynamic != 0) !=
+                                dynamic_features.has_color_write_enable ||
+                            (key_state.dynamic_vertex_input != 0) !=
+                                dynamic_features.has_dynamic_vertex_input ||
+                            (key_state.provoking_vertex_last != 0 &&
+                             !dynamic_features.has_provoking_vertex_last_mode) ||
+                            (driver_disk_keys && driver_disk_keys->contains(record_key.Hash()));
+                    }
+                    if (!skipped) {
+                        std::vector<FileEnvironment> envs(count);
+                        for (size_t i = 0; i < count; ++i) {
+                            const auto [offset, size] = env_index[ids[i]];
+                            in.clear();
+                            in.seekg(static_cast<std::streamoff>(offset));
+                            if (!FileEnvironment::RecordFits(in, size)) {
+                                throw std::ios_base::failure("environment larger than its entry");
+                            }
+                            envs[i].Deserialize(in);
+                        }
+                        ShaderPools pools;
+                        if (compute) {
+                            ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
+                                                       false, true, nullptr)
+                                     .pipeline != nullptr;
+                        } else {
+                            boost::container::static_vector<Shader::Environment*,
+                                                            Maxwell::MaxShaderProgram>
+                                env_ptrs;
+                            for (auto& env : envs) {
+                                env_ptrs.push_back(&env);
+                            }
+                            const auto pipeline{CreateGraphicsPipeline(
+                                pools, record_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
+                                nullptr, false, nullptr)};
+                            ok = pipeline && !pipeline->Failed();
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "Driver compile of precompiled pipeline {} failed: {}",
+                              index, e.what());
+                }
+                if (skipped) {
+                    ++driver.skipped;
+                } else {
+                    ++(ok ? driver.built : driver.failed);
+                    if (ok && std::chrono::steady_clock::now() - build_begin <
+                                  std::chrono::milliseconds{20}) {
+                        ++driver.fast;
+                    }
+                }
+                const size_t finished = driver.finished.fetch_add(1) + 1;
+                {
+                    std::scoped_lock lock{driver.mutex};
+                    driver.done[index] = 1;
+                    while (driver.low_water < total && driver.done[driver.low_water]) {
+                        ++driver.low_water;
+                    }
+                    if (driver.low_water >= driver.checkpoint + 512) {
+                        driver.checkpoint = driver.low_water;
+                        write_driver_next(driver.low_water);
+                    }
+                }
+                if (finished % 5000 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Precompiled pipelines, driver compiles beside the game: {} of {} "
+                             "done, {} built ({} fast), {} failed, {} skipped, {:.0f} s",
+                             finished, total, driver.built.load(), driver.fast.load(),
+                             driver.failed.load(), driver.skipped.load(),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           driver_begin)
+                                 .count());
+                }
+            }
+        };
+        {
+            std::vector<std::jthread> pool;
+            for (size_t i = 0; i < (std::max<size_t>)(threads, 1); ++i) {
+                pool.emplace_back(driver_work);
+            }
+            for (auto& thread : pool) {
+                thread.join();
+            }
+        }
+        const bool driver_finished = !stop_loading.stop_requested() && !warm_cancel &&
+                                     driver.low_water >= total;
+        if (driver_finished) {
+            std::filesystem::remove(driver_path, remove_error);
+            LogDriverCacheFolder(device, "after the driver's compiles");
+        } else {
+            write_driver_next(driver.low_water);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled pipelines, driver compiles beside the game: {} built ({} fast), {} "
+                 "failed, {} skipped, {} in {:.1f} s",
+                 driver.built.load(), driver.fast.load(), driver.failed.load(),
+                 driver.skipped.load(),
+                 driver_finished ? "all done"
+                                 : fmt::format("stopped at record {}", driver.low_water),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_begin)
+                     .count());
+    };
+    if (driver_only_from) {
+        warm_driver(*driver_only_from);
+        return;
+    }
+
     size_t start_index = 0;
     u32 restarts = 0;
     if (!force) {
@@ -4268,6 +4500,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         progress_file << stamp << next << ' ' << count << '\n';
     };
     write_progress(start_index, restarts);
+    // Kizuna: a quick preparation translates and keeps; the driver compiles later (warm_driver).
+    const bool translate_pass = quick && keeping;
 
     struct State {
         std::mutex mutex;
@@ -4334,9 +4568,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             // (fable52_answer_3).
             const bool full = shader_notify.PrecompileFullSpeed();
             LOG_INFO(Render_Vulkan,
-                     "Precompiled pipelines: {} of {} done, {} built ({} fast), {} failed, {:.0f} s "
+                     "Precompiled pipelines: {} of {} done, {} {} ({} fast), {} failed, {:.0f} s "
                      "({}, {} threads)",
-                     finished, total, state.built.load(), state.fast.load(), state.failed.load(),
+                     finished, total, state.built.load(),
+                     translate_pass ? "translated" : "built", state.fast.load(),
+                     state.failed.load(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
                          .count(),
                      full ? "full speed" : "beside the game", full ? full_threads : threads);
@@ -4460,9 +4696,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     const std::span<const u32> env_ids{ids.data(), count};
                     if (compute) {
                         ComputeKeep kept;
-                        ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
-                                                   false, true, keeping ? &kept : nullptr)
-                                 .pipeline != nullptr;
+                        kept.translate_only = translate_pass;
+                        const auto entry =
+                            CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
+                                                  false, true, keeping ? &kept : nullptr);
+                        ok = translate_pass ? !kept.spirv.empty() : entry.pipeline != nullptr;
                         if (ok && keeping && !kept.spirv.empty()) {
                             std::array<std::vector<u8>, 5> infos;
                             std::array<std::vector<u32>, 5> spirv;
@@ -4489,10 +4727,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         // module (EmitSPIRV changes the IR it emits), its info serialized then.
                         TranslationRecord kept;
                         kept.keep_infos = true;
+                        kept.translate_only = translate_pass;
                         const auto pipeline{CreateGraphicsPipeline(
                             pools, record_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
                             nullptr, false, keeping ? &kept : nullptr)};
-                        ok = pipeline && !pipeline->Failed();
+                        ok = translate_pass ? kept.complete : pipeline && !pipeline->Failed();
                         // A pipeline drawn through the task/mesh compute fallback is not kept:
                         // it needs the fallback's setup besides its SPIR-V, so the normal path
                         // builds it (CreatePrecompiledGraphicsPipeline declines task/mesh
@@ -4606,6 +4845,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         if (keeping) {
             // Written by this build: its translation, nothing to check.
             LoadKept(kept_path, kept_part, path, kept_stamp, false);
+        }
+        if (translate_pass) {
+            // Kizuna: translated and kept; the driver's compiles follow beside the game, and
+            // resume at the next boots until they are done.
+            write_driver_next(0);
+            warm_driver(0);
+        } else {
+            std::filesystem::remove(driver_path, error);
         }
     }
 }

@@ -30,12 +30,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   the video memory goes. `EDEN_NX2_MEM_TRACE=0` turns it off, any other value makes it every 2 s.
 - **A last word before dying.** An exception nobody catches is written to the log
   (`Fatal: uncaught ...`) before the process aborts, so a crash leaves its cause behind.
-- **ASTC with uneven mips is no longer kept as RGBA8.** On AMD, ASTC textures whose mip chain
-  has uneven block counts (768x768, 1536x1536, 683x683...) were kept as RGBA8 (4x the memory of
-  BC3, 8x BC1). Build 8's log: 4975 MiB of device memory against 1717 MiB counted for the cache's
-  images (it counts the ASTC size), and a card out of memory at every Ocarina scene change. They
-  take the BC1/BC3 path now; `EDEN_NX2_ASTC_UNEVEN_RGBA8=1` brings the old behaviour back (it was
-  added against dark lines on distant terrain in another title, which may show again).
+- **ASTC with uneven mips: BC, with the broken levels never sampled.** On AMD the BC1/BC3 copy
+  of an ASTC texture whose mip chain has uneven block counts samples wrong from its first uneven
+  level on (dark grid lines on distant tiled terrain, Hyrule Field). Fritchii kept all of them as
+  RGBA8 (4-8x the memory: out of memory at Ocarina's scene changes); build 9 kept them as BC and
+  showed the lines. Now they stay BC and their views stop before the first uneven level (768x768:
+  levels 0-6, down to 12x12), so far away they are sampled a little sharper than asked and never
+  from a broken level. Those whose last even level would still be over 32 texels (683x683, uneven
+  from level 1) stay RGBA8. `EDEN_NX2_ASTC_UNEVEN_RGBA8=1` keeps all of them RGBA8, `=0` all BC.
 - **Name.** The window title, About, the log's first line and the visible messages say "Kizuna"
   and "build N" (`Common::DisplayBuildName/Version`, from the CI release tag `kizuna-N`). Inside,
   `g_build_name` stays "Fritchii", which selects the UI and settings defaults. The links and
@@ -43,7 +45,20 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 - **Crash reports.** A native crash writes `user\crash_dumps\kizuna-crash-<time>.txt` (exception
   code and address, the module and offset, a short stack, system commit left) and a `.dmp`
   minidump (`src/yuzu/kizuna_crash_report.cpp`).
-- The update checker is off in the Windows build, so it never offers upstream builds over this one.
+- **Quick shader preparation.** "Preparing shaders" only translates the 120,124 records and keeps
+  their SPIR-V (all threads, minutes instead of ~2 hours); the AMD driver then compiles them beside
+  the game on idle threads, resuming at every boot (`precompiled_driver.fork-v54.txt`), and a draw
+  whose pipeline it has not reached builds it from the kept SPIR-V on the workers.
+  `EDEN_NX2_PRECOMPILE_QUICK=0` brings back the full preparation. A cache the full preparation
+  already finished is left as it is.
+- **In-app updater.** Help > Check for Updates (and the check at startup) looks for newer
+  `kizuna-build-N` releases of luizIK/Kizuna only, verifies the zip's SHA-256 from GitHub and
+  installs it over the running folder (the `user` folder is never touched; Help > Roll Back brings
+  the previous build back). Fritchii's releases are never offered.
+- **No Fritchii links.** The Discord and Donate entries (Help menu, home page) are gone; About
+  names Kizuna, credits Fritchii, Lichii, Eden and yuzu, and links to this repository and the
+  license. lichii.exe's file description is "Kizuna" (Task Manager).
+- **Built for Zen 3.** `-march=x86-64-v3 -mtune=znver3` on top of PGO.
 
 ## Keeping the "Preparing shaders" cache valid
 

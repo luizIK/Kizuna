@@ -228,7 +228,7 @@ QWidget* Home::MakeRail() {
             QPoint(menu_button->width() + 8, menu_button->height() - size.height())));
     });
 
-    // Discord and Donate are on the home page itself (MakePage), with their names.
+    // Kizuna: no Discord or Donate links (those were Fritchii's community and owner).
     layout->addWidget(library_button);
     layout->addWidget(settings);
     layout->addWidget(help);
@@ -265,20 +265,11 @@ QWidget* Home::MakePage() {
     layout->setContentsMargins(56, 24, 56, 36);
     layout->setSpacing(0);
 
-    // Discord and Donate in plain sight at the top right, with their names (2026-11-10: the
-    // rail's bare icons were easy to miss).
+    // The Saves button at the top right. Kizuna: Fritchii's Discord and Donate links are gone
+    // (they point at Fritchii's community and its owner, not at this fork).
     auto* links = new QHBoxLayout;
     links->setSpacing(10);
     links->addStretch(1);
-    const auto link = [this](const QString& icon, const QString& text, void (*open)()) {
-        auto* button = new QPushButton(Icon(icon, 18), text, page);
-        button->setObjectName(QStringLiteral("FritchiiLink"));
-        button->setIconSize(QSize(18, 18));
-        button->setCursor(Qt::PointingHandCursor);
-        button->setFocusPolicy(Qt::NoFocus);
-        connect(button, &QPushButton::clicked, this, [open] { open(); });
-        return button;
-    };
     // v5.8.3: the Saves window (export, import, copy between Fritchii, Eden and Lichii).
     auto* saves = new QPushButton(Icon(QStringLiteral("list"), 18), tr("Saves"), page);
     saves->setObjectName(QStringLiteral("FritchiiLink"));
@@ -289,8 +280,6 @@ QWidget* Home::MakePage() {
         ShowSavesWindow(window, hooks.emulation_running);
     });
     links->addWidget(saves);
-    links->addWidget(link(QStringLiteral("community"), tr("Discord"), &OpenDiscord));
-    links->addWidget(link(QStringLiteral("heart"), tr("Donate"), &OpenDonate));
     layout->addLayout(links);
     layout->addSpacing(28);
 

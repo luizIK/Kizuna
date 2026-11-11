@@ -86,13 +86,17 @@ std::string PathText(const fs::path& path) {
 }
 
 QString FritchiiName(const QString& version) {
-    return version.isEmpty() ? QCoreApplication::translate("UpdateDialog", "the previous version")
-                             : QStringLiteral("Kizuna v%1").arg(version);
+    if (version.isEmpty()) {
+        return QCoreApplication::translate("UpdateDialog", "the previous version");
+    }
+    // Kizuna: "build 9" as stored by RunningVersionText; an older Fritchii version keeps its "v".
+    return version.startsWith(QStringLiteral("build"))
+               ? QStringLiteral("Kizuna %1").arg(version)
+               : QStringLiteral("Fritchii v%1").arg(version);
 }
 
 std::string RunningVersionText() {
-    const auto version = UpdateChecker::RunningVersion();
-    return version ? version->ToString() : std::string{};
+    return UpdateChecker::RunningVersionLabel();
 }
 
 QString ErrorText(const std::error_code& ec) {
@@ -144,7 +148,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
         ui->version->setText(
             FritchiiUi::Enabled()
                 ? tr("%1 is ready").arg(QString::fromStdString(release.title))
-                : tr("%1 is available. You have Kizuna v%2.")
+                : tr("%1 is available. You have Kizuna %2.")
                       .arg(QString::fromStdString(release.title),
                            QString::fromStdString(RunningVersionText())));
         auto* install = ui->buttonBox->button(QDialogButtonBox::Yes);

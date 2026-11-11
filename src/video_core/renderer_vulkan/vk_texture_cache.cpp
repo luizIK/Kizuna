@@ -196,7 +196,9 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // level 0 block count shifted down (341 texels: 86 blocks at level 0, 85 texels = 22 blocks at
 // level 2, not 86 >> 2 = 21). On AMD (RX 6600 XT, Windows driver) the BC1/BC3 copies of such
 // images show dark lines along the seams of distant terrain in title 1; RGBA8 copies don't.
-[[nodiscard]] bool HasUnevenBlockMips(const ImageInfo& info) {
+// Kizuna: the first such level, or the level count when there is none (768x768: level 7, 6x6
+// texels = 2 blocks where 192 >> 7 = 1; 683x683: level 1).
+[[nodiscard]] s32 FirstUnevenBlockLevel(const ImageInfo& info) {
     const u32 blocks_x = Common::DivCeil(info.size.width, 4U);
     const u32 blocks_y = Common::DivCeil(info.size.height, 4U);
     for (s32 level = 1; level < info.resources.levels; ++level) {
@@ -204,28 +206,44 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         const u32 level_y = Common::DivCeil((std::max)(info.size.height >> level, 1U), 4U);
         if (level_x != (std::max)(blocks_x >> level, 1U) ||
             level_y != (std::max)(blocks_y >> level, 1U)) {
-            return true;
+            return level;
         }
     }
-    return false;
+    return info.resources.levels;
 }
 
-// ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
-// an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
-// arrays.
-[[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
-    // Kizuna: off unless EDEN_NX2_ASTC_UNEVEN_RGBA8=1. RGBA8 is 4x the memory of BC3 and 8x that
-    // of BC1, and Ocarina's scene changes make hundreds of such textures (768x768, 1536x1536,
-    // 683x683) in seconds: the log of build 8 had 4975 MiB of device memory against 1717 MiB
-    // counted for the cache's images (it counts the ASTC size) and the card ran out. The cost is
-    // the dark lines on distant terrain this was added against on AMD; if they show, set it.
-    static const bool keep_rgba8 = [] {
+[[nodiscard]] bool HasUnevenBlockMips(const ImageInfo& info) {
+    return FirstUnevenBlockLevel(info) < info.resources.levels;
+}
+
+// Kizuna: how ASTC images with uneven block mips are handled on AMD (EDEN_NX2_ASTC_UNEVEN_RGBA8):
+// '1' keeps them all as RGBA8 (Fritchii: 4-8x the memory, out of memory at Ocarina's scene
+// changes), '0' keeps them all as BC with their views cut at the first uneven level, unset does
+// that only when the levels kept go down to MaxUnevenTailTexels and RGBA8 otherwise.
+enum class UnevenAstcMode {
+    Auto,
+    AllRgba8,
+    AllBc,
+};
+
+[[nodiscard]] UnevenAstcMode GetUnevenAstcMode() {
+    static const UnevenAstcMode mode = [] {
         const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_RGBA8");
-        return value != nullptr && value[0] == '1';
+        if (value == nullptr || value[0] == '\0') {
+            return UnevenAstcMode::Auto;
+        }
+        return value[0] == '1' ? UnevenAstcMode::AllRgba8 : UnevenAstcMode::AllBc;
     }();
-    if (!keep_rgba8) {
-        return false;
-    }
+    return mode;
+}
+
+// Past this size the last level a cut view keeps would shimmer far away: such images stay RGBA8.
+constexpr u32 MaxUnevenTailTexels = 32;
+
+// ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
+// an AMD driver, which samples the BC copy wrong from the first uneven level on: dark lines along
+// the seams of distant tiled terrain (title 1 in Fritchii, Ocarina's Hyrule Field in Kizuna).
+[[nodiscard]] bool IsUnevenBcCandidate(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
@@ -238,6 +256,34 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         return false;
     }
     return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+}
+
+// Kizuna: the levels the views of such an image keep when it stays BC (the even ones before the
+// first uneven level: 7 of 768x768's 10, down to 12x12), or 0 when it is kept as RGBA8 instead.
+// Sampling then stops at the last even level, a few texels coarser far away than the game asked:
+// no dark lines, and BC's memory (768x768 BC1: 0.4 MiB, RGBA8: 3 MiB).
+[[nodiscard]] s32 UnevenBcSampledLevels(const Device& device, const ImageInfo& info) {
+    if (!IsUnevenBcCandidate(device, info)) {
+        return 0;
+    }
+    const UnevenAstcMode mode = GetUnevenAstcMode();
+    if (mode == UnevenAstcMode::AllRgba8) {
+        return 0;
+    }
+    const s32 levels = FirstUnevenBlockLevel(info);
+    const u32 last = static_cast<u32>(levels - 1);
+    const u32 tail = (std::max)((std::max)(info.size.width >> last, 1U),
+                                (std::max)(info.size.height >> last, 1U));
+    if (mode == UnevenAstcMode::Auto && tail > MaxUnevenTailTexels) {
+        return 0;
+    }
+    return levels;
+}
+
+// Kept as the GPU decoder's RGBA8 instead of BC, like huge arrays: the uneven-mip images that
+// UnevenBcSampledLevels does not keep as BC.
+[[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
+    return IsUnevenBcCandidate(device, info) && UnevenBcSampledLevels(device, info) == 0;
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -869,6 +915,11 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
 
 // A guest view's levels on a host image that keeps only levels >= host_level_offset.
 [[nodiscard]] SubresourceRange HostRange(const Image& image, SubresourceRange range) {
+    // Kizuna: views of a BC copy with uneven block mips stop before its first uneven level.
+    if (const s32 limit = image.sampled_level_limit;
+        limit > 0 && range.base.level < limit) {
+        range.extent.levels = (std::min)(range.extent.levels, limit - range.base.level);
+    }
     const s32 skip = static_cast<s32>(image.host_level_offset);
     if (skip == 0) {
         return range;
@@ -3120,6 +3171,18 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
                 WillUseGpuBcnTranscode(runtime->device, info)) {
                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
+            }
+            if (const s32 sampled = UnevenBcSampledLevels(runtime->device, info); sampled > 0) {
+                sampled_level_limit = sampled;
+                static std::atomic<u32> uneven_bc_images{0};
+                const u32 count = ++uneven_bc_images;
+                if (count <= 4 || (count & (count - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "ASTC {}x{}x{} with {} levels kept as BC, sampled down to level {} "
+                             "(uneven BC block mips from level {}), {} images so far",
+                             info.size.width, info.size.height, info.resources.layers,
+                             info.resources.levels, sampled - 1, sampled, count);
+                }
             }
             if (IsUnevenMipRgba8Astc(runtime->device, info)) {
                 static std::atomic<u32> uneven_images{0};

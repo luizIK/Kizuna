@@ -37,6 +37,19 @@ AboutDialog::AboutDialog(QWidget* parent)
         const QString name = QString::fromStdString(Common::DisplayBuildName());
         setWindowTitle(tr("About %1").arg(name));
         ui->labelYuzu->setText(QStringLiteral("<span style='font-size:30px'>%1</span>").arg(name));
+        if (name == QStringLiteral("Kizuna")) {
+            // Kizuna: what it is, the projects it comes from (GPLv3 keeps their notices), and
+            // where its source is.
+            ui->labelAbout->setText(
+                tr("<p style='font-size:12pt'>Kizuna is a personal fork of Fritchii, which builds "
+                   "on Lichii, Eden and yuzu. It is free software under the GNU General Public "
+                   "License v3.0 or later.</p>"));
+            ui->labelLinks->setText(
+                tr("<a href=\"https://github.com/luizIK/Kizuna\">Source Code</a> | "
+                   "<a href=\"https://github.com/luizIK/Kizuna/issues\">Report an Issue</a> | "
+                   "<a href=\"https://github.com/luizIK/Kizuna/blob/kizuna/LICENSE.txt\">"
+                   "License</a>"));
+        }
     }
 }
 

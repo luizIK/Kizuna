@@ -50,6 +50,52 @@ std::optional<u32> ParseNumber(std::string_view text) {
     return number;
 }
 
+// EDEN_UPDATE_URL (tests) or the default source. False when the override is unusable.
+bool ResolveSource(Source& source) {
+    if (const char* override_url = std::getenv("EDEN_UPDATE_URL");
+        override_url != nullptr && *override_url != '\0') {
+        const auto parsed = ParseSourceOverride(override_url);
+        if (!parsed) {
+            LOG_ERROR(Frontend,
+                      "Ignoring EDEN_UPDATE_URL {}: it must be https, or http on a loopback host",
+                      override_url);
+            return false;
+        }
+        LOG_WARNING(Frontend, "Checking for updates at {} (EDEN_UPDATE_URL, for testing only)",
+                    override_url);
+        source = *parsed;
+    }
+    return true;
+}
+
+CheckResult CheckKizuna([[maybe_unused]] u32 current) {
+#ifndef _WIN32
+    // Kizuna only publishes Windows packages.
+    return {};
+#else
+    auto source = KizunaSource();
+    if (!ResolveSource(source)) {
+        return {.failure = Failure::Network};
+    }
+    const auto response = Common::Net::Fetch(source.origin, source.api_path);
+    if (!response.body) {
+        LOG_WARNING(Frontend, "Update check failed with status {}", response.status);
+        return {.failure = ClassifyFailure(response.status), .status = response.status};
+    }
+    const auto releases = Common::Net::Release::ListFromJson(
+        std::string_view{*response.body}, source.origin, std::string{KizunaRepo});
+    auto update = SelectKizunaUpdate(releases, current, source);
+    if (!update) {
+        LOG_INFO(Frontend, "Kizuna build {} is the newest ({} releases listed)", current,
+                 releases.size());
+        return {};
+    }
+    auto asset = SelectKizunaAsset(*update, source);
+    LOG_INFO(Frontend, "Received update {} ({})", update->title, update->tag);
+    return {.update = std::move(update), .asset = std::move(asset)};
+#endif
+}
+
 CheckResult CheckFritchii([[maybe_unused]] const FritchiiVersion& current) {
 #ifndef _WIN32
     // Fritchii only publishes Windows packages.
@@ -117,6 +163,10 @@ std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Re
 }
 
 CheckResult Check() {
+    // Kizuna first: its g_build_name is still "Fritchii", which RunningVersion reads.
+    if (const auto kizuna = RunningKizunaBuild()) {
+        return CheckKizuna(*kizuna);
+    }
     if (const auto running = RunningVersion()) {
         return CheckFritchii(*running);
     }
@@ -293,6 +343,91 @@ std::optional<Common::Net::Asset> SelectFritchiiAsset(const Common::Net::Release
         return asset;
     }
     return std::nullopt;
+}
+
+std::optional<u32> RunningKizunaBuild() {
+    constexpr std::string_view prefix = "kizuna-";
+    std::string_view tag{Common::g_build_release_tag};
+    if (!tag.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    const auto number = ParseNumber(tag.substr(prefix.size()));
+    return number && *number != 0 ? number : std::nullopt;
+}
+
+std::optional<u32> ParseKizunaTag(std::string_view tag) {
+    constexpr std::string_view prefix = "kizuna-build-";
+    if (!tag.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    const auto number = ParseNumber(tag.substr(prefix.size()));
+    return number && *number != 0 ? number : std::nullopt;
+}
+
+Source KizunaSource() {
+    return {.origin = "https://api.github.com",
+            .api_path = fmt::format("/repos/{}/releases?per_page=30", KizunaRepo)};
+}
+
+std::optional<Common::Net::Asset> SelectKizunaAsset(const Common::Net::Release& release,
+                                                    const Source& source) {
+    if (!ParseKizunaTag(release.tag)) {
+        return std::nullopt;
+    }
+    const std::string filename{KizunaAssetName};
+    for (const auto& url : release.assets) {
+        std::string origin;
+        if (source.test) {
+            if (url.starts_with(source.origin + "/") && url.ends_with("/" + filename) &&
+                url.find("..") == std::string::npos &&
+                url.find_first_of("?#\\") == std::string::npos) {
+                origin = source.origin;
+            }
+        } else if (url == fmt::format("https://github.com/{}/releases/download/{}/{}",
+                                      KizunaRepo, release.tag, filename)) {
+            origin = "https://github.com";
+        }
+        if (origin.empty()) {
+            continue;
+        }
+        Common::Net::Asset asset{.name = "Kizuna",
+                                 .url = origin,
+                                 .path = url.substr(origin.size()),
+                                 .filename = filename};
+        if (const auto info = release.asset_info.find(url); info != release.asset_info.end()) {
+            asset.sha256 = info->second.sha256;
+            asset.size = info->second.size;
+        }
+        return asset;
+    }
+    return std::nullopt;
+}
+
+std::optional<Common::Net::Release> SelectKizunaUpdate(
+    std::span<const Common::Net::Release> releases, u32 current, const Source& source) {
+    const Common::Net::Release* selected = nullptr;
+    u32 newest = current;
+    for (const auto& release : releases) {
+        if (HiddenFromUpdater(release)) {
+            LOG_INFO(Frontend, "Update check skips {}: its notes hide it from the updater",
+                     release.tag);
+            continue;
+        }
+        const auto number = ParseKizunaTag(release.tag);
+        if (number && *number > newest && SelectKizunaAsset(release, source)) {
+            newest = *number;
+            selected = &release;
+        }
+    }
+    return selected ? std::make_optional(*selected) : std::nullopt;
+}
+
+std::string RunningVersionLabel() {
+    if (const auto kizuna = RunningKizunaBuild()) {
+        return fmt::format("build {}", *kizuna);
+    }
+    const auto version = RunningVersion();
+    return version ? version->ToString() : std::string{};
 }
 
 bool HiddenFromUpdater(const Common::Net::Release& release) {

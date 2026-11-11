@@ -271,12 +271,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     ui.menu_Help->insertAction(first_help, delete_cache);
     ui.menu_Help->insertSeparator(first_help);
     ui.menu_Help->insertAction(first_help, whats_new);
-    auto* discord = new QAction(Icon(QStringLiteral("community"), 16), tr("Fritchii &Discord"), &window);
-    QObject::connect(discord, &QAction::triggered, &window, [] { OpenDiscord(); });
-    auto* donate = new QAction(Icon(QStringLiteral("heart"), 16), tr("D&onate"), &window);
-    QObject::connect(donate, &QAction::triggered, &window, [] { OpenDonate(); });
-    ui.menu_Help->insertAction(first_help, discord);
-    ui.menu_Help->insertAction(first_help, donate);
+    // Kizuna: no Fritchii Discord or Donate entries.
     // v5.8.1: copy a profile again after the first launch's automatic import (a player whose
     // newest saves were in Lichii 150+'s folder got the older eden copy).
     auto* copy_data = new QAction(tr("&Copy Data from Eden or Lichii..."), &window);

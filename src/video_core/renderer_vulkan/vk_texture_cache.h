@@ -664,6 +664,11 @@ public:
 
     u64 allocation_tick;
 
+    /// Kizuna: views of this image stop before this guest level (0: no limit). Set for the BC
+    /// copies of ASTC images with uneven block mips on AMD, whose levels from the first uneven one
+    /// on sample wrong (dark lines along distant tiled terrain); see UnevenBcSampledLevels.
+    s32 sampled_level_limit = 0;
+
     friend class BlockLinearUnswizzle3DPass;
 
 private:

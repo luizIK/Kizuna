@@ -41,6 +41,7 @@
 #include "common/memory_detect.h"
 #include "common/shutdown_progress.h"
 #include "common/thread.h"
+#include "common/thread_cpu_clock.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -5333,6 +5334,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         return nullptr;
     }
     const auto begin = std::chrono::steady_clock::now();
+    // Kizuna: where a slow one spends its time (2026-11-11: up to 1.3 s each on the GPU thread,
+    // 4.3 s for 20 entering a new area, with little read from the files), logged below.
+    const std::optional<u64> cpu_begin = Common::CurrentThreadCpuTimeNs();
+    const u64 faults_begin = Common::GetProcessPageFaults();
+    const u64 read_begin = PrecompiledKept::BytesRead().load(std::memory_order_relaxed);
+    size_t records_checked = 0;
     // A vertex A program is merged into vertex B: never one of these.
     if (graphics_key.unique_hashes[0] != 0) {
         NotePrecompiledMiss("vertex A");
@@ -5341,6 +5348,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
     KeepPointers(environments.envs, graphics_key, keep_pointers);
+    const auto envs_done = std::chrono::steady_clock::now();
     const auto live = environments.Span();
     const auto stages_match = [&](const PrecompiledKept::Record& record) {
         size_t programs = 0;
@@ -5363,6 +5371,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             reason = "stages";
             continue;
         }
+        ++records_checked;
         info_ptrs = {};
         bool readable = true;
         for (size_t stage = 0; stage < Maxwell::MaxShaderStage && readable; ++stage) {
@@ -5479,9 +5488,32 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     precompiled_pending.push_back(graphics_key);
     ++precompiled_stats.graphics;
     // The GPU thread's own time: the check and the creation, not the audit.
-    const auto elapsed = (checked - begin) + (std::chrono::steady_clock::now() - audit_end);
+    const auto created = std::chrono::steady_clock::now();
+    const auto elapsed = (checked - begin) + (created - audit_end);
     precompiled_stats.gpu_time += elapsed;
     precompiled_stats.gpu_worst = (std::max)(precompiled_stats.gpu_worst, elapsed);
+    if (elapsed > std::chrono::milliseconds{50}) {
+        static u32 slow_logged{};
+        if (slow_logged++ < 64) {
+            const auto ms = [](auto d) {
+                return std::chrono::duration<double, std::milli>(d).count();
+            };
+            const std::optional<u64> cpu_end = Common::CurrentThreadCpuTimeNs();
+            const double cpu_ms = cpu_begin && cpu_end
+                                      ? static_cast<double>(*cpu_end - *cpu_begin) / 1e6
+                                      : -1.0;
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipeline {:016x} took {:.1f} ms on the GPU thread: "
+                     "environments {:.1f} ms, {} of {} records checked in {:.1f} ms, creation "
+                     "{:.1f} ms; the thread's CPU {:.0f} ms of it; {} page faults in the process "
+                     "meanwhile; {} KB read",
+                     hash, ms(elapsed), ms(envs_done - begin), records_checked, records.size(),
+                     ms(checked - envs_done), ms(created - audit_end), cpu_ms,
+                     Common::GetProcessPageFaults() - faults_begin,
+                     (PrecompiledKept::BytesRead().load(std::memory_order_relaxed) - read_begin) /
+                         1024);
+        }
+    }
     // The live environments answered every recorded question (AnswersHoldFor), as a
     // translation of them would have: stored like a translated pipeline's.
     if (!pipeline_cache_filename.empty()) {

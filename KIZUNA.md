@@ -86,9 +86,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   (shadow maps, probes) waits for its pipeline; the builders run below the guest cores, so that
   build shared a core with up to ten others (0.3 to 5 s on a Ryzen 5 5600). `PipelineBuild::Wait`
   now raises the thread building it (`Common::RaiseThread`, THREAD_PRIORITY_HIGHEST) until it is
-  done. AMD's own cache stays at ~1 GiB after the preparation, so pipelines built in play were
-  gone by the next session: our VkPipelineCache file is on for them on AMD
-  (`EDEN_NX2_AMD_APP_CACHE`, default on in Kizuna builds, `=0` turns it off; up to 512 MiB).
+  done. v1.8 to v1.13 also kept our VkPipelineCache file on AMD (`EDEN_NX2_AMD_APP_CACHE`); AMD's
+  driver puts only keys in it (~5 KiB a pipeline), nothing got faster, and it is off again.
+- **Kept files read ahead.** A new pipeline's kept infos and recorded state are read on the GPU
+  thread; from a cold cache on a busy, nearly full disk a few small reads took up to 1.3 s with
+  the thread idle. After the kept index loads, `KeptPrefetch` reads the kept and precompiled files
+  once at low I/O priority into the system's file cache (`EDEN_NX2_KEPT_PREFETCH=0` skips it).
+- **No driver compiles beside the game on AMD** (`DriverWarmWanted`, `EDEN_NX2_DRIVER_WARM`): the
+  driver's ~1 GiB cache cannot hold the preparation's 120k pipelines.
 - **Hotkeys.** Ctrl+U switches Ocarina between 30 and 60 FPS at once (with a notice over the
   game); its high refresh mode moved to Ctrl+Shift+U; Ctrl+G turns frame generation on and off.
 - **AMD FSR and frame generation.** The Graphics button has "Ocarina Upscaler (FSR)" (Game, No

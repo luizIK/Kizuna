@@ -706,6 +706,11 @@ private:
         std::chrono::steady_clock::duration ready_max{};
         std::chrono::steady_clock::time_point window{};
     } translate_stats;
+
+    /// Kizuna: reads the kept and precompiled files once in the background at low I/O priority,
+    /// so the GPU thread's reads of them come from the system's file cache (KeptPrefetch). Last,
+    /// so it stops and is joined before the members above go.
+    std::jthread kept_prefetch;
 };
 
 } // namespace Vulkan

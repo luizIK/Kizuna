@@ -656,8 +656,7 @@ std::filesystem::path SessionMarkerPath() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "pipeline_cache_open.flag";
 }
 
-/// EDEN_NX2_AMD_APP_CACHE=1 (boot; off upstream, on in Kizuna builds, =0 turns it off): on AMD's
-/// own driver keep our VkPipelineCache file too,
+/// EDEN_NX2_AMD_APP_CACHE=1 (boot, off): on AMD's own driver keep our VkPipelineCache file too,
 /// for what play builds (boot rebuilds of earlier sessions' pipelines included), not the
 /// preparation's ~120k. A player's driver cache kept ~44% of a preparation and nothing visible
 /// across a restart (fable52_answer_3, fix 2).
@@ -667,12 +666,11 @@ bool AmdAppCache(const Device& device) {
         if (value != nullptr) {
             return value[0] == '1';
         }
-        // Kizuna: on by default. The driver's folder stayed at ~1 GiB (AMD's cap) after the
-        // preparation's ~120k pipelines, so pipelines built in play were gone by the next session
-        // and every session froze on the same "Building: N shader(s)" again (2026-11-11, RX 6600,
-        // driver 26.10.1: 161 builds of 0.3 to 5 s in 10 minutes). Kept in our file, each one
-        // freezes once.
-        return Common::KizunaDetail::IsKizunaBuild();
+        // Kizuna v1.8 to v1.13 had it on by default, to keep pipelines built in play across
+        // sessions. It did not: AMD's driver puts ~5 KiB per pipeline in it (17 MiB for ~3,000,
+        // keys rather than code), the boot's rebuilds took as long (253 s) and play built the same
+        // pipelines again, while the file was written every ~30 s. Off again.
+        return false;
     }();
     return enabled && device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
 }
@@ -4946,6 +4944,68 @@ std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
     return kept_index;
 }
 
+namespace {
+/// Kizuna (EDEN_NX2_KEPT_PREFETCH=0 turns it off): a new pipeline's kept infos and recorded game
+/// state are read on the GPU thread, a few reads of 4 to 150 KB at scattered offsets of the kept
+/// file (755 MiB) and the precompiled file (1.5 GiB). From a cold cache on a busy disk one of
+/// them took up to 1.3 s with the thread's CPU at 0 (2026-11-11, Ryzen 5 5600 and RX 6600, the
+/// disk 91% full): the game froze entering a new area. Read once from start to end at low I/O
+/// priority, the files sit in the system's file cache (standby memory, which commits nothing and
+/// goes first when programs need RAM), and those reads come from RAM.
+bool KeptPrefetchWanted() {
+    static const bool wanted = [] {
+        const char* value = std::getenv("EDEN_NX2_KEPT_PREFETCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return wanted;
+}
+
+void KeptPrefetch(std::stop_token stop, const std::vector<std::filesystem::path>& files) {
+    Common::SetCurrentThreadName("VkKeptPrefetch");
+    const auto begin = std::chrono::steady_clock::now();
+    u64 total = 0;
+    std::vector<char> buffer(size_t{4} << 20);
+    for (const std::filesystem::path& path : files) {
+#ifdef _WIN32
+        const HANDLE handle =
+            CreateFileW(path.c_str(), GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        // Low I/O priority on this handle only: the game's reads go first.
+        FILE_IO_PRIORITY_HINT_INFO hint{};
+        hint.PriorityHint = IoPriorityHintLow;
+        SetFileInformationByHandle(handle, FileIoPriorityHintInfo, &hint, sizeof(hint));
+        DWORD read = 0;
+        while (!stop.stop_requested() &&
+               ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &read,
+                        nullptr) &&
+               read != 0) {
+            total += read;
+        }
+        CloseHandle(handle);
+#else
+        std::ifstream in(path, std::ios::binary);
+        while (!stop.stop_requested() &&
+               (in.read(buffer.data(), static_cast<std::streamsize>(buffer.size())),
+                in.gcount() > 0)) {
+            total += static_cast<u64>(in.gcount());
+        }
+#endif
+        if (stop.stop_requested()) {
+            return;
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "Precompiled fast path: kept and precompiled files read into the system's file "
+             "cache ({} MiB in {:.1f} s, low I/O priority; EDEN_NX2_KEPT_PREFETCH=0 skips it)",
+             total >> 20,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+}
+} // Anonymous namespace
+
 bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
                              const std::filesystem::path& precompiled, const std::string& stamp,
                              bool check) {
@@ -4990,6 +5050,10 @@ bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::files
         std::scoped_lock lock{kept_mutex};
         kept_index = std::move(index);
         kept_available = true;
+    }
+    if (KeptPrefetchWanted() && !kept_prefetch.joinable()) {
+        kept_prefetch = std::jthread([files = std::vector<std::filesystem::path>{used, precompiled}](
+                                         std::stop_token stop) { KeptPrefetch(stop, files); });
     }
     return true;
 }

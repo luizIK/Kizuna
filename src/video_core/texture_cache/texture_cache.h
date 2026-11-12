@@ -5891,9 +5891,14 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
     const u64 render_frame = RenderFrame();
     DrawTargets result{};
     bool any_target{};
-    // EDEN_NX2_SKIP_REDRAWN_DEPTH=0: depth targets the game redraws every frame stay Persistent.
+    // EDEN_NX2_SKIP_REDRAWN_DEPTH=0 / EDEN_NX2_SKIP_REDRAWN_COLOR=0: depth / colour targets the
+    // game redraws every frame keep their class (Persistent or FirstTime) and their draws wait.
     static const bool skip_redrawn_depth = [] {
         const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_DEPTH");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool skip_redrawn_color = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_COLOR");
         return value == nullptr || value[0] != '0';
     }();
     const auto take = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr,
@@ -5913,7 +5918,16 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             image ? ClassifyClearedTarget(image->last_clear_frame, image->previous_clear_frame,
                                           render_frame)
                   : DrawTargetClass::FirstTime;
-        if (kind == DrawTargetClass::Persistent && depth && skip_redrawn_depth && image &&
+        // Kizuna: a target the game writes frame after frame is a per-frame target whatever its
+        // clears look like (none, partial, or its clear history reset by a relocation): a
+        // skipped draw shows again once its pipeline is built. v1.10 did this for depth only; the
+        // colour targets left waiting (128x128 and 512x512 HDR probes, the 1920x1080 HDR scene
+        // without a full clear) still froze Castle Town on the way to the Temple of Time for
+        // seconds (2026-11-11). A layer the game renders once (a chat bubble's text, a probe
+        // captured once) is not written in consecutive frames and still waits; full-screen passes
+        // are never skipped (CanDiscardPendingDraw).
+        if (kind != DrawTargetClass::Recurring && image &&
+            (depth ? skip_redrawn_depth : skip_redrawn_color) &&
             RedrawnEveryFrame(image->last_write_frame, image->previous_write_frame,
                               render_frame)) {
             kind = DrawTargetClass::Recurring;

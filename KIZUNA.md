@@ -102,8 +102,10 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   new pipeline: seconds of freeze entering a new area. A depth target written in two render
   frames in a row (`RedrawnEveryFrame`, `ImageBase::previous_write_frame`) now counts as
   Recurring: a new caster's shadow is missing for a few frames instead.
-  `EDEN_NX2_SKIP_REDRAWN_DEPTH=0` restores the wait. Colour targets (text layers, probes) still
-  wait.
+  `EDEN_NX2_SKIP_REDRAWN_DEPTH=0` restores the wait. Since v1.11 the same holds for colour targets
+  (HDR probes, the HDR scene without a full clear) and for targets whose clear history was reset
+  (FirstTime); `EDEN_NX2_SKIP_REDRAWN_COLOR=0` restores the wait for colour. Layers rendered once
+  (text, probes captured once) are not written in consecutive frames and still wait.
 - **Windows out of memory (commit).** Windows refuses memory past its commit limit (RAM plus
   virtual memory) whatever the card has free, and device memory counts against it too. Under
   3 GiB left a notice over the game says so (`MainWindow::WarnLowSystemMemory`). The log lists

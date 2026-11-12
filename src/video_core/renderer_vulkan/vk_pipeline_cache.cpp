@@ -6400,9 +6400,9 @@ void PipelineCache::NoteDiscardDecision(bool skip, const VideoCommon::DrawTarget
     if (skip && targets.redrawn_depth != 0 && listed_redrawn_depth.size() < MaxListedTargets &&
         listed_redrawn_depth.insert(targets.redrawn_depth).second) {
         LOG_INFO(Render_Vulkan,
-                 "Async discard: depth target {:#x} is redrawn every frame without a full clear: "
-                 "its draws skip unbuilt pipelines (pipeline {:016x}) instead of waiting "
-                 "(EDEN_NX2_SKIP_REDRAWN_DEPTH=0 waits; each target listed once)",
+                 "Async discard: target {:#x} is redrawn every frame without a full clear each "
+                 "time: its draws skip unbuilt pipelines (pipeline {:016x}) instead of waiting "
+                 "(EDEN_NX2_SKIP_REDRAWN_DEPTH=0 / _COLOR=0 wait; each target listed once)",
                  targets.redrawn_depth, graphics_key.Hash());
     }
     if (targets.kind != VideoCommon::DrawTargetClass::Persistent || targets.gpu_addr == 0 ||

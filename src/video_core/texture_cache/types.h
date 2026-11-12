@@ -93,8 +93,8 @@ constexpr u64 RECURRING_CLEAR_WINDOW = 4;
 }
 
 /// Kizuna: whether a target was written in two render frames in a row, the last of them this
-/// one or the one before (from its last two distinct write frames, ~0 = none). A depth target the
-/// game redraws every frame without a full clear (shadow cascades, a half-resolution depth;
+/// one or the one before (from its last two distinct write frames, ~0 = none). A target the game
+/// redraws every frame without a full clear (shadow cascades, a half-resolution depth, HDR probes;
 /// cleared by a draw or a partial clear) classifies as Persistent, so its draws waited for every
 /// new pipeline: the game froze for the driver's whole compile (2026-11-11, up to 5 s on an
 /// RX 6600 entering a new area). Such a draw skipped is missing for a frame, as for a Recurring

@@ -5139,6 +5139,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags &= ~ImageFlagBits::GpuModified;
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
+    image.previous_write_frame = ~u64{0};
     image.relocation_guard_noted = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
     // cleared at this address in two render frames (ClassifyDrawTargets).
@@ -5267,7 +5268,10 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
-    image.last_write_frame = RenderFrame();
+    if (const u64 frame = RenderFrame(); image.last_write_frame != frame) {
+        image.previous_write_frame = image.last_write_frame;
+        image.last_write_frame = frame;
+    }
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
     }
@@ -5887,8 +5891,13 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
     const u64 render_frame = RenderFrame();
     DrawTargets result{};
     bool any_target{};
+    // EDEN_NX2_SKIP_REDRAWN_DEPTH=0: depth targets the game redraws every frame stay Persistent.
+    static const bool skip_redrawn_depth = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_DEPTH");
+        return value == nullptr || value[0] != '0';
+    }();
     const auto take = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr,
-                          VideoCore::Surface::PixelFormat format) {
+                          VideoCore::Surface::PixelFormat format, bool depth) {
         any_target = true;
         const ImageBase* image{};
         if (bound_current) {
@@ -5900,10 +5909,16 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             image = &slot_images[image_id];
         }
         // Not registered yet: the draw is the first use of the target.
-        const DrawTargetClass kind =
+        DrawTargetClass kind =
             image ? ClassifyClearedTarget(image->last_clear_frame, image->previous_clear_frame,
                                           render_frame)
                   : DrawTargetClass::FirstTime;
+        if (kind == DrawTargetClass::Persistent && depth && skip_redrawn_depth && image &&
+            RedrawnEveryFrame(image->last_write_frame, image->previous_write_frame,
+                              render_frame)) {
+            kind = DrawTargetClass::Recurring;
+            result.redrawn_depth = gpu_addr;
+        }
         if (kind > result.kind) {
             result = DrawTargets{
                 .kind = kind,
@@ -5923,11 +5938,11 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             continue;
         }
         const ImageInfo info(rt, regs.anti_alias_samples_mode);
-        take(render_targets.color_buffer_ids[index], info, gpu_addr, info.format);
+        take(render_targets.color_buffer_ids[index], info, gpu_addr, info.format, false);
     }
     if (regs.zeta_enable && regs.zeta.Address() != 0) {
         const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-        take(render_targets.depth_buffer_id, info, regs.zeta.Address(), info.format);
+        take(render_targets.depth_buffer_id, info, regs.zeta.Address(), info.format, true);
     }
     if (!any_target) {
         // No colour or depth target: what the draw does stays in storage it writes.

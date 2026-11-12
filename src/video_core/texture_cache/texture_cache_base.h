@@ -91,6 +91,9 @@ struct DrawTargets {
     u32 width{};
     u32 height{};
     VideoCore::Surface::PixelFormat format{};
+    /// Kizuna: the depth target, Persistent by its clears, counted as Recurring because the game
+    /// writes it every frame (RedrawnEveryFrame); its address, for the log.
+    GPUVAddr redrawn_depth{};
 };
 
 class TextureCacheChannelInfo : public ChannelInfo {

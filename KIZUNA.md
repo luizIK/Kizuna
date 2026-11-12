@@ -96,6 +96,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   3x, 4x; live). Fritchii turned frame generation off for its builds (`Settings::FrameGenActive`)
   and hid its settings; Kizuna builds offer it, off by default, with the settings in Graphics.
 
+- **Depth targets redrawn every frame skip new pipelines.** Shadow cascades (1024x1000 D16) and a
+  half-resolution depth (960x540 D32) are redrawn every frame without a full clear, so the skip
+  rule (`EDEN_NX2_ASYNC_DISCARD=2`) counted them as Persistent and their draws waited for every
+  new pipeline: seconds of freeze entering a new area. A depth target written in two render
+  frames in a row (`RedrawnEveryFrame`, `ImageBase::previous_write_frame`) now counts as
+  Recurring: a new caster's shadow is missing for a few frames instead.
+  `EDEN_NX2_SKIP_REDRAWN_DEPTH=0` restores the wait. Colour targets (text layers, probes) still
+  wait.
 - **Windows out of memory (commit).** Windows refuses memory past its commit limit (RAM plus
   virtual memory) whatever the card has free, and device memory counts against it too. Under
   3 GiB left a notice over the game says so (`MainWindow::WarnLowSystemMemory`). The log lists

@@ -89,6 +89,7 @@
 #include "video_core/shader_warm/warm_records.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_pipeline_binaries.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #ifdef _WIN32
@@ -2810,8 +2811,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                                 "(EDEN_NX2_AMD_APP_CACHE, up to 512 MiB)"
                                               : "on");
         LOG_INFO(Render_Vulkan, "VK_KHR_pipeline_binary: {}",
-                 device.GetAvailableExtensions().contains("VK_KHR_pipeline_binary")
-                     ? "offered by the driver"
+                 Vulkan::PipelineBinaryCache::Get(*device.GetLogical())
+                     ? "compiled pipelines kept in kizuna_pipeline_binaries.bin"
+                 : device.GetAvailableExtensions().contains("VK_KHR_pipeline_binary")
+                     ? "offered by the driver, not used (EDEN_NX2_PIPELINE_BINARIES)"
                      : "not offered");
     }
     if (!pipeline_cache_filename.empty()) {
@@ -4307,6 +4310,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         const auto driver_work = [&](std::stop_token stop) {
             t_precompile_build = true;
             Common::SetCurrentThreadName("VkDriverWarm");
+            Vulkan::PipelineBinaryCache::SetCaptureOnThisThread(false);
             GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
             PlacePrecompileThread(false);
             std::ifstream in(path, std::ios::binary);
@@ -4618,6 +4622,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto work = [&](std::stop_token stop, size_t worker) {
         t_precompile_build = true;
         Common::SetCurrentThreadName("VkPrecompile");
+        Vulkan::PipelineBinaryCache::SetCaptureOnThisThread(false);
         std::optional<bool> placed_full;
         // Shader libraries built here go to the driver's cache only, like the graphics warm-up.
         GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
@@ -6520,7 +6525,7 @@ void PipelineCache::NoteDiscardDecision(bool skip, const VideoCommon::DrawTarget
     stats.last_key = graphics_key;
     const size_t index = static_cast<size_t>(targets.kind);
     ++(skip ? stats.skipped : stats.waited)[index];
-    constexpr size_t MaxListedTargets = 32;
+    constexpr size_t MaxListedTargets = 64;
     if (skip && targets.redrawn_depth != 0 && listed_redrawn_depth.size() < MaxListedTargets &&
         listed_redrawn_depth.insert(targets.redrawn_depth).second) {
         LOG_INFO(Render_Vulkan,
@@ -6529,14 +6534,25 @@ void PipelineCache::NoteDiscardDecision(bool skip, const VideoCommon::DrawTarget
                  "(EDEN_NX2_SKIP_REDRAWN_DEPTH=0 / _COLOR=0 wait; each target listed once)",
                  targets.redrawn_depth, graphics_key.Hash());
     }
-    if (targets.kind != VideoCommon::DrawTargetClass::Persistent || targets.gpu_addr == 0 ||
+    if (skip && targets.shape_prior != 0 && listed_shape_prior.size() < MaxListedTargets &&
+        listed_shape_prior.insert(targets.shape_prior).second) {
+        LOG_INFO(Render_Vulkan,
+                 "Async discard: new target {:#x} has the shape of a per-frame target: its draws "
+                 "skip unbuilt pipelines (pipeline {:016x}) instead of waiting "
+                 "(EDEN_NX2_SHAPE_PRIOR=0 waits; each target listed once)",
+                 targets.shape_prior, graphics_key.Hash());
+    }
+    // First-time targets too (Kizuna): which of them still hold the game.
+    if (targets.kind == VideoCommon::DrawTargetClass::Recurring || targets.gpu_addr == 0 ||
         listed_persistent_targets.size() >= MaxListedTargets ||
         !listed_persistent_targets.insert(targets.gpu_addr).second) {
         return;
     }
     LOG_INFO(Render_Vulkan,
-             "Async discard: draw into persistent target {:#x} {}x{} {} {} for its pipeline "
+             "Async discard: draw into {} target {:#x} {}x{} {} {} for its pipeline "
              "{:016x} (EDEN_NX2_ASYNC_DISCARD={}; each target listed once, {} of {})",
+             targets.kind == VideoCommon::DrawTargetClass::FirstTime ? "first-time"
+                                                                      : "persistent",
              targets.gpu_addr, targets.width, targets.height, targets.format,
              skip ? "skipped" : "waits", graphics_key.Hash(), AsyncDiscardMode(),
              listed_persistent_targets.size(), MaxListedTargets);

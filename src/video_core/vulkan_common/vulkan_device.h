@@ -80,6 +80,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PipelineBinary, PIPELINE_BINARY, pipeline_binary)                                 \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, PresentId, PRESENT_ID, present_id)                                                \
@@ -218,6 +219,7 @@ VK_DEFINE_HANDLE(VmaPool)
 namespace Vulkan {
 
 class NsightAftermathTracker;
+class PipelineBinaryCache;
 
 /// Format usage descriptor.
 enum class FormatType { Linear, Optimal, Buffer };
@@ -1317,6 +1319,8 @@ private:
     vk::Queue present_queue;     ///< Main present queue.
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
+    /// Kizuna: compiled pipelines kept across sessions (VK_KHR_pipeline_binary); after logical.
+    std::unique_ptr<PipelineBinaryCache> pipeline_binaries;
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.

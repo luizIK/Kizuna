@@ -94,6 +94,8 @@ struct DrawTargets {
     /// Kizuna: a target (depth or colour) not Recurring by its clears, counted as Recurring
     /// because the game writes it every frame (RedrawnEveryFrame); its address, for the log.
     GPUVAddr redrawn_depth{};
+    /// Kizuna: a new target counted as Recurring for its shape (per_frame_shapes), for the log.
+    GPUVAddr shape_prior{};
 };
 
 class TextureCacheChannelInfo : public ChannelInfo {
@@ -816,6 +818,14 @@ private:
     /// colour target it names, the depth target when depth is cleared), for ClassifyDrawTargets.
     void NoteFullClears();
 
+    /// Kizuna: formats of scene targets (depth, float, 10-bit), which the skip rule's redraw
+    /// window and shape prior cover; 8-bit layers (text, UI) are left to their clears.
+    [[nodiscard]] static bool IsSceneTargetFormat(PixelFormat format) noexcept;
+    [[nodiscard]] static u64 TargetShape(PixelFormat format, u32 width, u32 height) noexcept {
+        return (static_cast<u64>(format) << 48) | (static_cast<u64>(width & 0xFFFFFF) << 24) |
+               (height & 0xFFFFFF);
+    }
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -1014,6 +1024,10 @@ private:
     boost::container::small_vector<ImageId, 4> join_left_aliased_ids;
     boost::container::small_vector<ImageId, 4> join_right_aliased_ids;
     ::Common::unordered_set<ImageId> join_ignore_textures;
+
+    /// Kizuna: shapes (format, width, height) of scene-format targets seen per frame (cleared
+    /// in two render frames close together, or redrawn every frame), for ClassifyDrawTargets.
+    ::Common::unordered_set<u64> per_frame_shapes;
     boost::container::small_vector<ImageId, 4> join_bad_overlap_ids;
     struct JoinCopy {
         bool is_alias;

@@ -306,6 +306,7 @@ private:
     mutable std::unordered_set<GPUVAddr> listed_persistent_targets;
     /// Kizuna: depth targets logged once as redrawn every frame (their draws skip, not wait).
     mutable std::unordered_set<GPUVAddr> listed_redrawn_depth;
+    mutable std::unordered_set<GPUVAddr> listed_shape_prior;
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now (from zortos293/Lichii#1143).

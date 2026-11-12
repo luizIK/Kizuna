@@ -111,6 +111,26 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   (HDR probes, the HDR scene without a full clear) and for targets whose clear history was reset
   (FirstTime); `EDEN_NX2_SKIP_REDRAWN_COLOR=0` restores the wait for colour. Layers rendered once
   (text, probes captured once) are not written in consecutive frames and still wait.
+- **Fewer first-time waits (v1.15).** Scene-format targets (depth, float, 10-bit;
+  `IsSceneTargetFormat`) written twice within 8 render frames count as Recurring
+  (`RedrawnPeriodically`: the reflection probes draw their 128x128 faces in turns;
+  `EDEN_NX2_SKIP_PERIODIC=0` waits). A new scene-format target of at least 256x256 whose
+  (format, width, height) was seen per frame before counts as Recurring from its first frame
+  (`per_frame_shapes`; entering an area re-creates the scene's targets, and 21 first-time waits
+  held the game 4.3 s at the Kakariko church; `EDEN_NX2_SHAPE_PRIOR=0` waits). 8-bit layers
+  (text, UI) and small targets still wait. The log lists first-time targets that wait, as it did
+  persistent ones.
+- **Compiled pipelines kept by the emulator (v1.15, `VK_KHR_pipeline_binary`).** AMD's driver
+  keeps ~1 GiB of compiled pipelines, so every boot compiled again all the pipelines earlier
+  sessions used (4,858 in 449 s, more each session) and play compiled pipelines it had compiled
+  before. Pipelines created through `vk::Device` are now captured
+  (`VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR`) and appended to
+  `shader/kizuna_pipeline_binaries.bin` under the driver's key for their create info; the next
+  creation with that key builds from the binaries (`Vulkan::PipelineBinaryCache`). The file starts
+  with the driver's global key and starts over for another driver; a record cut short ends it;
+  at most 2 GiB. The preparation's threads look up but do not capture. On by default for AMD's
+  Windows driver; `EDEN_NX2_PIPELINE_BINARIES=0` turns it off, `=1` on for any driver. Deleting
+  the file resets it. The first session after updating captures, the next ones load.
 - **No driver compiles beside the game on AMD.** A quick preparation used to have the driver
   compile all 120,124 pipelines beside the game on three threads (hours of it). AMD's cache keeps
   ~1 GiB, so each of those pushed out a pipeline the player had used, and the threads competed

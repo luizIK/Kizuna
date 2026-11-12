@@ -109,6 +109,25 @@ constexpr u64 RECURRING_CLEAR_WINDOW = 4;
     return render_frame - last_write_frame <= 1 && last_write_frame - previous_write_frame == 1;
 }
 
+/// Kizuna: render frames apart two writes may be for a scene-format target (depth, float, 10-bit;
+/// TextureCache::IsSceneTargetFormat) to count as a per-frame target.
+constexpr u64 PERIODIC_REDRAW_WINDOW = 8;
+
+/// Kizuna: RedrawnEveryFrame for targets the game updates in turns: the reflection probes'
+/// 128x128 B10G11R11 faces are each drawn every few frames, never in two frames in a row, so
+/// their draws waited for every new pipeline (366 ms held at once, 2026-11-12). A skipped draw is
+/// missing until the face's next turn, a few frames later.
+[[nodiscard]] constexpr bool RedrawnPeriodically(u64 last_write_frame, u64 previous_write_frame,
+                                                 u64 render_frame) noexcept {
+    constexpr u64 Never = ~u64{0};
+    if (last_write_frame == Never || previous_write_frame == Never ||
+        last_write_frame > render_frame || previous_write_frame >= last_write_frame) {
+        return false;
+    }
+    return render_frame - last_write_frame <= PERIODIC_REDRAW_WINDOW &&
+           last_write_frame - previous_write_frame <= PERIODIC_REDRAW_WINDOW;
+}
+
 enum class RelaxedOptions : u32 {
     Size = 1 << 0,
     Format = 1 << 1,

@@ -33,6 +33,7 @@
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_pipeline_binaries.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -893,6 +894,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
+
+    if (extensions.pipeline_binary && owns_static_pipeline_cache) {
+        const auto filename = StaticPipelineCacheFilename();
+        if (!filename.empty()) {
+            pipeline_binaries = PipelineBinaryCache::Create(
+                *logical, dld, filename.parent_path() / "kizuna_pipeline_binaries.bin");
+        }
+    }
 
     // Initialize GPU logging if enabled
     InitializeGPULogging();
@@ -1927,6 +1936,15 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // VK_KHR_pipeline_binary (Kizuna): compiled pipelines kept by the emulator, past the AMD
+    // driver's own ~1 GiB cache (vulkan_pipeline_binaries.h).
+    if (extensions.pipeline_binary &&
+        (!features.pipeline_binary.pipelineBinaries || !extensions.maintenance5 ||
+         !PipelineBinaryCache::Wanted(properties.driver.driverID))) {
+        RemoveExtensionFeature(extensions.pipeline_binary, features.pipeline_binary,
+                               VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    }
 
     // VK_EXT_shader_float8, only for AMD FSR 4: its RDNA 4 network runs in FP8 and drew a black
     // picture without the feature on the device (found by CheezerWheezer).

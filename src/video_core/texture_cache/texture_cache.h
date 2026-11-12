@@ -5846,6 +5846,27 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 }
 
 template <class P>
+bool TextureCache<P>::IsSceneTargetFormat(PixelFormat format) noexcept {
+    if (GetFormatType(format) != SurfaceType::ColorTexture) {
+        return true;
+    }
+    switch (format) {
+    case PixelFormat::R16G16B16A16_FLOAT:
+    case PixelFormat::R16G16B16X16_FLOAT:
+    case PixelFormat::B10G11R11_FLOAT:
+    case PixelFormat::R32G32B32A32_FLOAT:
+    case PixelFormat::R32G32_FLOAT:
+    case PixelFormat::R16G16_FLOAT:
+    case PixelFormat::R32_FLOAT:
+    case PixelFormat::R16_FLOAT:
+    case PixelFormat::A2B10G10R10_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <class P>
 void TextureCache<P>::NoteFullClears() {
     // Not PrepareImage's invalidate path itself: UpdateRenderTargets(true) invalidates every bound
     // target, also those the clear leaves alone (the other colour targets, the depth target of a
@@ -5869,6 +5890,12 @@ void TextureCache<P>::NoteFullClears() {
                 image.previous_clear_frame = image.last_clear_frame;
             }
             image.last_clear_frame = render_frame;
+            if (ClassifyClearedTarget(image.last_clear_frame, image.previous_clear_frame,
+                                      render_frame) == DrawTargetClass::Recurring &&
+                IsSceneTargetFormat(image.info.format)) {
+                per_frame_shapes.insert(TargetShape(image.info.format, image.info.size.width,
+                                                    image.info.size.height));
+            }
         }
         image.drawn_since_clear = false;
     };
@@ -5901,6 +5928,16 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
         const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_COLOR");
         return value == nullptr || value[0] != '0';
     }();
+    // EDEN_NX2_SKIP_PERIODIC=0: scene-format targets redrawn every few frames (RedrawnPeriodically)
+    // wait. EDEN_NX2_SHAPE_PRIOR=0: new scene-format targets shaped like per-frame ones wait.
+    static const bool skip_periodic = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_PERIODIC");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool shape_prior = [] {
+        const char* value = std::getenv("EDEN_NX2_SHAPE_PRIOR");
+        return value == nullptr || value[0] != '0';
+    }();
     const auto take = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr,
                           VideoCore::Surface::PixelFormat format, bool depth) {
         any_target = true;
@@ -5926,12 +5963,40 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
         // seconds (2026-11-11). A layer the game renders once (a chat bubble's text, a probe
         // captured once) is not written in consecutive frames and still waits; full-screen passes
         // are never skipped (CanDiscardPendingDraw).
+        const PixelFormat target_format = image ? image->info.format : format;
+        const bool scene_format = IsSceneTargetFormat(target_format);
         if (kind != DrawTargetClass::Recurring && image &&
             (depth ? skip_redrawn_depth : skip_redrawn_color) &&
-            RedrawnEveryFrame(image->last_write_frame, image->previous_write_frame,
-                              render_frame)) {
+            (RedrawnEveryFrame(image->last_write_frame, image->previous_write_frame,
+                               render_frame) ||
+             (scene_format && skip_periodic &&
+              RedrawnPeriodically(image->last_write_frame, image->previous_write_frame,
+                                  render_frame)))) {
             kind = DrawTargetClass::Recurring;
             result.redrawn_depth = gpu_addr;
+            if (scene_format) {
+                per_frame_shapes.insert(TargetShape(target_format, image->info.size.width,
+                                                    image->info.size.height));
+            }
+        }
+        // Kizuna: a new scene-format target shaped like one the game drew every frame before
+        // (moving to a new area re-creates or moves the scene's depth, HDR and shadow targets) is
+        // a per-frame target too. A first-time target waited for each new pipeline until it had
+        // been cleared in two frames: 21 such waits held the game 4.3 s on entering the Kakariko
+        // church (2026-11-12). Not for small targets (probes, LUTs), which a game may draw once;
+        // nor for 8-bit layers (text, UI).
+        if (kind != DrawTargetClass::Recurring && shape_prior && scene_format) {
+            const u32 width = image ? image->info.size.width : info.size.width;
+            const u32 height = image ? image->info.size.height : info.size.height;
+            const bool fresh =
+                kind == DrawTargetClass::FirstTime ||
+                (image && image->previous_write_frame == ~u64{0} &&
+                 (image->last_write_frame == ~u64{0} || image->last_write_frame == render_frame));
+            if (fresh && width >= 256 && height >= 256 &&
+                per_frame_shapes.contains(TargetShape(target_format, width, height))) {
+                kind = DrawTargetClass::Recurring;
+                result.shape_prior = gpu_addr;
+            }
         }
         if (kind > result.kind) {
             result = DrawTargets{

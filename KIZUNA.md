@@ -106,6 +106,11 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   (HDR probes, the HDR scene without a full clear) and for targets whose clear history was reset
   (FirstTime); `EDEN_NX2_SKIP_REDRAWN_COLOR=0` restores the wait for colour. Layers rendered once
   (text, probes captured once) are not written in consecutive frames and still wait.
+- **No driver compiles beside the game on AMD.** A quick preparation used to have the driver
+  compile all 120,124 pipelines beside the game on three threads (hours of it). AMD's cache keeps
+  ~1 GiB, so each of those pushed out a pipeline the player had used, and the threads competed
+  with the game's own builds. Off on AMD's own driver (`DriverWarmWanted`;
+  `EDEN_NX2_DRIVER_WARM=1` turns it back on): a pipeline compiles when a draw first needs it.
 - **Windows out of memory (commit).** Windows refuses memory past its commit limit (RAM plus
   virtual memory) whatever the card has free, and device memory counts against it too. Under
   3 GiB left a notice over the game says so (`MainWindow::WarnLowSystemMemory`). The log lists

@@ -1427,6 +1427,24 @@ bool PrecompileQuickMode() {
     return quick;
 }
 
+// Kizuna: whether a quick preparation's driver compiles run beside the game (warm_driver).
+// EDEN_NX2_DRIVER_WARM=1 / =0 forces them on / off. Off by default on AMD's own driver in Kizuna
+// builds: its cache keeps ~1 GiB (the folder stayed at 1002 MiB), far less than 120,124 compiled
+// pipelines, so each compile beside the game pushed out one the player had used, and three
+// threads compiled for hours (4.4 a second on a Ryzen 5 5600 and RX 6600, 2026-11-11) beside the
+// game's own builds. A pipeline is compiled when a draw first needs it instead.
+bool DriverWarmWanted(const Device& device) {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_DRIVER_WARM");
+        return value == nullptr ? -1 : value[0] == '0' ? 0 : 1;
+    }();
+    if (forced >= 0) {
+        return forced == 1;
+    }
+    return !(Common::KizunaDetail::IsKizunaBuild() &&
+             device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY);
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -4252,6 +4270,16 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         shader_notify.SetPrecompilePending(false);
         std::error_code remove_error;
         if (from >= total) {
+            std::filesystem::remove(driver_path, remove_error);
+            return;
+        }
+        if (!DriverWarmWanted(device)) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipelines: no driver compiles beside the game on this driver "
+                     "(AMD's cache keeps ~1 GiB, less than {} pipelines; each is compiled when a "
+                     "draw first needs it, from its kept SPIR-V; EDEN_NX2_DRIVER_WARM=1 compiles "
+                     "them beside the game)",
+                     total);
             std::filesystem::remove(driver_path, remove_error);
             return;
         }

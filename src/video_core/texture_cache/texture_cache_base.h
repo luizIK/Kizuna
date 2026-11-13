@@ -162,6 +162,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
+    /// Kizuna: frame of the last allocation the device refused (~0: none), for the collector.
+    u64 last_memory_failure_frame{~0ULL};
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};

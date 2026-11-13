@@ -24,6 +24,11 @@ layout (push_constant) uniform PushConstants {
     uint height;
     uint bc3;
     uint out_offset; // in 8-byte units
+    // Kizuna: the size of the source level. It differs from width and height when the BC copy is
+    // kept a few texels larger than the image (vk_texture_cache.cpp, PaddedBcShape): each texel
+    // is then a bilinear sample of the source at its centre.
+    uint src_width;
+    uint src_height;
 };
 
 uint Pack565(vec3 color) {
@@ -156,6 +161,24 @@ uvec2 EncodeAlpha(in vec4 texels[16]) {
     return uvec2(bits_lo, bits_hi);
 }
 
+vec4 LoadTexel(ivec2 coord, int layer) {
+    if (src_width == width && src_height == height) {
+        return imageLoad(source, ivec3(coord, layer));
+    }
+    const vec2 scale = vec2(src_width, src_height) / vec2(width, height);
+    const vec2 pos = (vec2(coord) + 0.5) * scale - 0.5;
+    const ivec2 src_last = ivec2(src_width, src_height) - 1;
+    // The first and last texels take the source's: tiled textures keep their seams.
+    const ivec2 p0 = clamp(ivec2(floor(pos)), ivec2(0), src_last);
+    const ivec2 p1 = min(p0 + 1, src_last);
+    const vec2 f = clamp(pos - vec2(p0), 0.0, 1.0);
+    const vec4 top = mix(imageLoad(source, ivec3(p0.x, p0.y, layer)),
+                         imageLoad(source, ivec3(p1.x, p0.y, layer)), f.x);
+    const vec4 bottom = mix(imageLoad(source, ivec3(p0.x, p1.y, layer)),
+                            imageLoad(source, ivec3(p1.x, p1.y, layer)), f.x);
+    return mix(top, bottom, f.y);
+}
+
 void main() {
     const uvec3 id = gl_GlobalInvocationID;
     if (id.x >= blocks_x || id.y >= blocks_y) {
@@ -169,7 +192,7 @@ void main() {
         for (int x = 0; x < 4; ++x) {
             // Edge blocks repeat the last row/column so padding doesn't widen the endpoints.
             const ivec2 coord = min(base + ivec2(x, y), last);
-            texels[y * 4 + x] = imageLoad(source, ivec3(coord, int(id.z)));
+            texels[y * 4 + x] = LoadTexel(coord, int(id.z));
             any_transparent = any_transparent || texels[y * 4 + x].a < 0.5;
         }
     }

@@ -259,6 +259,74 @@ constexpr u32 MaxUnevenTailTexels = 64;
     return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
 }
 
+// Kizuna: an image of IsUnevenBcCandidate whose even levels stop too early to cut its views there
+// (683x683: level 0 only) is kept as BC all the same, a few texels larger: at the size, up to 1/8
+// more, with the most even levels (683 -> 768: 7 levels down to 12x12, like a 768x768 image;
+// 1365 -> 1536: 8). The BC encoder resamples every level to it (bc_encoder.comp) and sampling is
+// by normalized coordinates, so the image covers what it did, a little softer.
+//
+// These were RGBA8: 4x the memory of BC3 and 8x that of BC1. Ocarina's handheld textures are 2/3
+// of their docked size (1365, 683, 341, 171), so that was most of them; its two 1365x1365x90
+// terrain arrays alone held 1.8 GiB of the 5 GiB an RX 6600 had to give next to a browser. The
+// device stayed 1 GiB over the collector's critical threshold all session and Hyrule Field ran at
+// 19-25 FPS re-decoding 60-150 evicted textures a second (2026-11-13).
+// EDEN_NX2_ASTC_UNEVEN_PAD=0 keeps them RGBA8.
+struct PaddedBcShape {
+    u32 width;
+    u32 height;
+    s32 levels; ///< The even levels its views keep
+};
+
+[[nodiscard]] std::optional<PaddedBcShape> GetPaddedBcShape(const Device& device,
+                                                            const ImageInfo& info) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_PAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || GetUnevenAstcMode() != UnevenAstcMode::Auto ||
+        !IsUnevenBcCandidate(device, info)) {
+        return std::nullopt;
+    }
+    {
+        // The image as it is keeps enough even levels: its views are cut, nothing is resampled.
+        const u32 last = static_cast<u32>(FirstUnevenBlockLevel(info) - 1);
+        if ((std::max)((std::max)(info.size.width >> last, 1U),
+                       (std::max)(info.size.height >> last, 1U)) <= MaxUnevenTailTexels) {
+            return std::nullopt;
+        }
+    }
+    constexpr u32 max_size = 16384; // every desktop driver's maxImageDimension2D or less
+    for (s32 levels = info.resources.levels; levels >= 1; --levels) {
+        // Level 0 a multiple of 4 << (levels - 1) texels: every level before `levels` is whole
+        // blocks, half the level before it.
+        const u32 align = 4U << (levels - 1);
+        const u32 width = Common::AlignUp(info.size.width, align);
+        const u32 height = Common::AlignUp(info.size.height, align);
+        // 1/8 and a block: 1365 -> 1536 and 341 -> 384 are 12.5% and a texel.
+        if (width > info.size.width + info.size.width / 8 + 4 ||
+            height > info.size.height + info.size.height / 8 + 4 || width > max_size ||
+            height > max_size) {
+            continue;
+        }
+        ImageInfo padded = info;
+        padded.size.width = width;
+        padded.size.height = height;
+        const s32 even_levels = FirstUnevenBlockLevel(padded);
+        // No larger size has more even levels: when even this one cuts the views too early, the
+        // image stays RGBA8.
+        if (even_levels < info.resources.levels &&
+            (std::max)(width, height) >> (even_levels - 1) > MaxUnevenTailTexels) {
+            return std::nullopt;
+        }
+        return PaddedBcShape{
+            .width = width,
+            .height = height,
+            .levels = even_levels,
+        };
+    }
+    return std::nullopt;
+}
+
 // Kizuna: the levels the views of such an image keep when it stays BC (the even ones before the
 // first uneven level: 7 of 768x768's 10, down to 12x12), or 0 when it is kept as RGBA8 instead.
 // Sampling then stops at the last even level, a few texels coarser far away than the game asked:
@@ -276,7 +344,8 @@ constexpr u32 MaxUnevenTailTexels = 64;
     const u32 tail = (std::max)((std::max)(info.size.width >> last, 1U),
                                 (std::max)(info.size.height >> last, 1U));
     if (mode == UnevenAstcMode::Auto && tail > MaxUnevenTailTexels) {
-        return 0;
+        const auto padded = GetPaddedBcShape(device, info);
+        return padded ? padded->levels : 0;
     }
     return levels;
 }
@@ -474,6 +543,13 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
+    if (const auto padded = GetPaddedBcShape(device, info)) {
+        // Kizuna: a BC copy a few texels larger than the image (GetPaddedBcShape).
+        ImageInfo host = info;
+        host.size.width = padded->width;
+        host.size.height = padded->height;
+        return host;
+    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -3195,7 +3271,22 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                 WillUseGpuBcnTranscode(runtime->device, info)) {
                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
             }
-            if (const s32 sampled = UnevenBcSampledLevels(runtime->device, info); sampled > 0) {
+            if (const auto padded = GetPaddedBcShape(runtime->device, info)) {
+                sampled_level_limit = padded->levels;
+                flags |= VideoCommon::ImageFlagBits::HostResized;
+                static std::atomic<u32> padded_images{0};
+                const u32 count = ++padded_images;
+                if (count <= 4 || (count & (count - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "ASTC {}x{}x{} with {} levels kept as BC at {}x{}, sampled down to "
+                             "level {} (uneven BC block mips; EDEN_NX2_ASTC_UNEVEN_PAD=0 keeps "
+                             "RGBA8), {} images so far",
+                             info.size.width, info.size.height, info.resources.layers,
+                             info.resources.levels, padded->width, padded->height,
+                             padded->levels - 1, count);
+                }
+            } else if (const s32 sampled = UnevenBcSampledLevels(runtime->device, info);
+                       sampled > 0) {
                 sampled_level_limit = sampled;
                 static std::atomic<u32> uneven_bc_images{0};
                 const u32 count = ++uneven_bc_images;
@@ -5394,9 +5485,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
+    // Kizuna: the BC copy's own size, a few texels more than the image's for GetPaddedBcShape.
+    u32 host_offset{};
+    const ImageInfo host_info = TrimmedHostInfo(device, info, host_offset);
     for (u32 level = 0; level < levels; ++level) {
-        const u32 level_width = (std::max)(width >> level, 1U);
-        const u32 level_height = (std::max)(height >> level, 1U);
+        const u32 level_width = (std::max)(host_info.size.width >> level, 1U);
+        const u32 level_height = (std::max)(host_info.size.height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
@@ -5418,7 +5512,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
         bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
+                                copies[level].image_extent.height, (std::max)(width >> level, 1U),
+                                (std::max)(height >> level, 1U), layers, bc3, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {

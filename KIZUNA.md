@@ -131,6 +131,20 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   at most 2 GiB. The preparation's threads look up but do not capture. On by default for AMD's
   Windows driver; `EDEN_NX2_PIPELINE_BINARIES=0` turns it off, `=1` on for any driver. Deleting
   the file resets it. The first session after updating captures, the next ones load.
+- **Uneven ASTC kept as BC (v1.16).** On AMD an ASTC image with uneven block mips whose even
+  levels stop too early was RGBA8 (4x BC3, 8x BC1). It is now BC at the size, up to 1/8 larger,
+  with the most even levels (683 -> 768, 1365 -> 1536), resampled by the BC encoder
+  (`GetPaddedBcShape`, `bc_encoder.comp`; flag `HostResized`: never copied to or from, uploaded
+  whole). Ocarina's handheld textures are 2/3 of the docked sizes, so that was most of them: two
+  1365x1365x90 terrain arrays held 1.8 GiB of a 5 GiB budget, the device sat over the
+  collector's critical threshold and waits of 3.5 s for the host GPU froze the game.
+  `EDEN_NX2_ASTC_UNEVEN_PAD=0` keeps RGBA8.
+- **Calmer collector (v1.16).** Past the critical threshold the collector took images idle for
+  10 frames (11,765 ASTC decodes in 450 s of Hyrule Field). With no allocation refused in the
+  last 600 frames it now takes those idle for 120 (`EDEN_NX2_TC_AGGRESSIVE_AGE`).
+- **From Lichii (v1.16).** #1452: mesh emulation's staging buffers are held until the submission
+  that writes them (AMD draws task/mesh shaders through it). #1451: a zero-page trim pass that
+  runs out of memory is skipped instead of ending the emulator.
 - **No driver compiles beside the game on AMD.** A quick preparation used to have the driver
   compile all 120,124 pipelines beside the game on three threads (hours of it). AMD's cache keeps
   ~1 GiB, so each of those pushed out a pipeline the player had used, and the threads competed

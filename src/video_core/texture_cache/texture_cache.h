@@ -157,7 +157,23 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
             allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
-        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        // Kizuna: past the critical threshold, but with no allocation refused for 600 frames, an
+        // image used in the last 120 frames is one the game is drawing with. Device memory can
+        // sit over the threshold for reasons the cache cannot free (other programs' share of the
+        // budget, Windows near its commit limit): for a whole session on an 8 GB card the
+        // 10-frame rule deleted textures a third of a second after their last use and decoded
+        // them again when the camera turned back, 60-150 ASTC decodes a second in Hyrule Field
+        // at 19-25 FPS (11,765 decodes in 450 s, 2026-11-13). EDEN_NX2_TC_AGGRESSIVE_AGE=<frames>
+        // sets the age (10: as before).
+        static const u64 calm_aggressive_age = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_AGGRESSIVE_AGE");
+            return value != nullptr ? (std::max)(std::strtoull(value, nullptr, 10), 10ULL)
+                                    : 120ULL;
+        }();
+        const bool refused_lately = out_of_memory || (last_memory_failure_frame != ~0ULL &&
+                                                      frame_tick - last_memory_failure_frame < 600);
+        const u64 aggressive_age = refused_lately ? 10ULL : calm_aggressive_age;
+        ticks_to_destroy = aggressive_mode ? aggressive_age : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
@@ -235,6 +251,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
     const auto Collect = [&] {
+        // Nothing is that old yet (the unsigned difference would wrap and take every image).
+        if (frame_tick <= ticks_to_destroy) {
+            return;
+        }
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
@@ -577,6 +597,7 @@ void TextureCache<P>::TickFrame() {
                     const u32 events = runtime.MemoryPressureEvents();
                     if (events != seen_pressure_events) {
                         seen_pressure_events = events;
+                        last_memory_failure_frame = frame_tick;
                         pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
                         pressure_quiet_frames = 0;
                         budget_check_frames = 0; // thresholds are recomputed below
@@ -891,6 +912,9 @@ void TextureCache<P>::TickFrame() {
         const u32 failed = runtime.FailedImages();
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
+        if (out_of_memory) {
+            last_memory_failure_frame = frame_tick;
+        }
     }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
@@ -3041,7 +3065,7 @@ bool TextureCache<P>::UploadsByLayer(const ImageBase& image) const noexcept {
                image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
                image.guest_size_bytes >= LayerUploadMinSize &&
                False(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
-                                    ImageFlagBits::Remapped));
+                                    ImageFlagBits::Remapped | ImageFlagBits::HostResized));
     } else {
         return false;
     }
@@ -4316,7 +4340,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
-        if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+        if (True(overlap.flags & ImageFlagBits::GpuModified) &&
+            False((overlap.flags | new_image.flags) & ImageFlagBits::HostResized)) {
             new_image.flags |= ImageFlagBits::GpuModified;
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
@@ -5686,6 +5711,10 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
+        return;
+    }
+    if (True((dst.flags | src.flags) & ImageFlagBits::HostResized)) {
+        // Kizuna: the host image is not the guest's size; it is uploaded from guest memory.
         return;
     }
     if (dst.info.astc_opaque != src.info.astc_opaque) {

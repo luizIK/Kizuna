@@ -60,6 +60,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// Kizuna: the host image is a few texels larger than the guest's (a BC copy of ASTC with
+    /// uneven block mips, resampled): nothing is copied to or from it, guest memory holds its data.
+    HostResized = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

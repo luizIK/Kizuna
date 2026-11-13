@@ -442,6 +442,14 @@ public:
         {
             std::scoped_lock lk(flush_guard);
             pending_flush_sets.emplace_back(std::move(pending_flush_queries));
+            // From zortos293/Lichii#1516: a list the fencing thread is done with, with its
+            // capacity; a fence made with reports pending grew a new one from nothing.
+            if (!spare_flush_queries.empty()) {
+                pending_flush_queries = std::move(spare_flush_queries.back());
+                spare_flush_queries.pop_back();
+            } else {
+                pending_flush_queries = {};
+            }
         }
     }
 
@@ -474,6 +482,11 @@ public:
                          trace, query->guest_address, GetId(), q, query->value,
                          static_cast<u32>(query->flags));
             }
+        }
+        current_flush_queries.clear();
+        std::scoped_lock lk(flush_guard);
+        if (spare_flush_queries.size() < MaxSpareFlushQueries) {
+            spare_flush_queries.push_back(std::move(current_flush_queries));
         }
     }
 
@@ -666,6 +679,8 @@ private:
     // flush levels
     std::vector<size_t> pending_flush_queries;
     std::deque<std::vector<size_t>> pending_flush_sets;
+    static constexpr size_t MaxSpareFlushQueries = 16;
+    std::vector<std::vector<size_t>> spare_flush_queries; ///< Guarded by flush_guard
 
     // State Machine
     size_t current_bank_slot;

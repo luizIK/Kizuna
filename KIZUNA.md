@@ -145,6 +145,10 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 - **From Lichii (v1.16).** #1452: mesh emulation's staging buffers are held until the submission
   that writes them (AMD draws task/mesh shaders through it). #1451: a zero-page trim pass that
   runs out of memory is skipped instead of ending the emulator.
+- **v1.17.** The last piece of Lichii #1516 the base lacked: the occlusion query lists flushed at a
+  fence are reused instead of allocated at each one. The rest of #1516 was already in the base
+  (fencing thread wake, operation lists, master semaphore cache lines, query pool reset on the
+  worker, report operation size).
 - **No driver compiles beside the game on AMD.** A quick preparation used to have the driver
   compile all 120,124 pipelines beside the game on three threads (hours of it). AMD's cache keeps
   ~1 GiB, so each of those pushed out a pipeline the player had used, and the threads competed

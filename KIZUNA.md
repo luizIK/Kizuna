@@ -149,6 +149,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   fence are reused instead of allocated at each one. The rest of #1516 was already in the base
   (fencing thread wake, operation lists, master semaphore cache lines, query pool reset on the
   worker, report operation size).
+- **v1.19.** AMD's driver may overflow device memory into system memory
+  (`VK_AMD_memory_overallocation_behavior`, port of zortos293/Lichii#1335). Without it the driver
+  fails device-local allocations once the heap is full, and the fallbacks of `AllocateImage`
+  fail with it: on an RX 6600 with Discord in a call, Windows cut the budget from 7379 to
+  ~4260 MiB, 15 images got `failed: -2` and the session ended, while Lichii build 177 kept
+  running in the same call. The log line `VK_AMD_memory_overallocation_behavior enabled` shows
+  it is on. Memory that overflows is slower, not free: the texture cache thresholds are
+  unchanged (Lichii#1686 answers such spills and is not ported).
 - **v1.18.** `clean_words` (an optimization the base ships switched off) is on: a buffer upload
   walks only the dirty words of the memory tracker (`SynchronizeBuffer`,
   `ForEachDirtyUploadRange`). Measured on a Ryzen 5 5600 in Hyrule Field with

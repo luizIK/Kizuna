@@ -203,6 +203,11 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // has its own recompiler). Owner's call for v5.7 after the 2026-11-10 playtests: Kakariko
     // felt much better; repeat compiles after reloads 294 -> 8 ms in the night tests.
     {"EDEN_NX2_JIT_WARM", "1"},
+    // Kizuna v1.18: buffer uploads walk only the dirty words of the memory tracker. A third of the
+    // back's storage buffer binds went to walking clean ones (bind stage buffers 3.74 -> 1.83 us
+    // a draw on a Ryzen 5 5600 in Hyrule Field, 2026-11-13); no wrong geometry in Kokiri Forest.
+    // EDEN_NX2_PERF_OFF=clean_words turns it off.
+    {"EDEN_NX2_PERF_ON", "clean_words"},
 };
 
 static void LoadNx2Switches(const char* argv0) {

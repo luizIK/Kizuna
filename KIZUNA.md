@@ -149,6 +149,29 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   fence are reused instead of allocated at each one. The rest of #1516 was already in the base
   (fencing thread wake, operation lists, master semaphore cache lines, query pool reset on the
   worker, report operation size).
+- **v1.18.** `clean_words` (an optimization the base ships switched off) is on: a buffer upload
+  walks only the dirty words of the memory tracker (`SynchronizeBuffer`,
+  `ForEachDirtyUploadRange`). Measured on a Ryzen 5 5600 in Hyrule Field with
+  `EDEN_NX2_GPU_PROFILE=1`: "bind stage buffers" 3.74 -> 1.83 us a draw, "compute synchronize"
+  0.93 -> 0.37, the back thread's idle time 131 -> 209 ms/s, no wrong geometry in Kokiri Forest
+  (where the family of changes it belongs to, Lichii #161, once broke). Built in as
+  `EDEN_NX2_PERF_ON=clean_words`; `EDEN_NX2_PERF_OFF=clean_words` in `nx2_switches.txt` turns it
+  off. What was tried on the way and gave nothing on this PC, so it stays off:
+  - Lichii #1486 (list-fed grid macro calls taken without their words) was not ported. It removes
+    the front's wait for GPU-written command lists (~100 ms/s here, "list GPU wait"), not the
+    waits that dominate ("fence release", "macro dma read"), and Lichii reverted it in #1651 for
+    white flashing in Ocarina.
+  - `EDEN_NX2_EXP53=1` (the back evaluates the conditional render macro): the macro is found
+    (0xe2c) but is not what waits; "macro dma read" stayed at 250-350 ms/s.
+  - `EDEN_NX2_EXP12=1` (acquires wait for their writers only): "fence release" 250 -> 55 ms/s,
+    but "fence writers" took the 200: the acquires need the back's results.
+  - `EDEN_NX2_EXP17=1` with `EDEN_NX2_EXP18=7` (uniform reuse, binding memos): no change.
+  - `EDEN_NX2_SAMPLE_PROFILE` found the `clean_words` cost, but a session crashed 5 s after the
+    sampler started under load. Read its file with the linker map from `Kizuna-symbols.zip`
+    (`tools/nx2/sample_report.py` expects a PDB).
+  Still open: the front thread stays saturated waiting for the back (~540 ms/s); Lichii's "fast
+  draws" (#1441, #1519, #1521, #1586) cut the back's cost per draw but #1519 edits files of the
+  shader stamp.
 - **No driver compiles beside the game on AMD.** A quick preparation used to have the driver
   compile all 120,124 pipelines beside the game on three threads (hours of it). AMD's cache keeps
   ~1 GiB, so each of those pushed out a pipeline the player had used, and the threads competed

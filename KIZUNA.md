@@ -149,6 +149,15 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
   fence are reused instead of allocated at each one. The rest of #1516 was already in the base
   (fencing thread wake, operation lists, master semaphore cache lines, query pool reset on the
   worker, report operation size).
+- **v1.20.** Two fixes for stale memory after an area change, ported from Lichii:
+  zortos293/Lichii#1458 (releasing a span frees every device range inside it, not only the one
+  keyed by the span's own address and size) and #1459 (a deleted buffer is cleared from every
+  channel's bindings). Found with `EDEN_NX2_TABLE_POINTER_TRACE=1`: after Castle Town -> Hyrule
+  Castle a compute dispatch read its table pointers (storage slots 24-27, through constant buffer
+  4 at 0xc0 and 0xd0) from the holders of the previous area, whose memory then held other data
+  (`entry=0x7b52824d02000000 bound=0x0 size=0x0`), and the ground lost its textures until the
+  next area. The same holders gave `Read64 of unmapped GPU address` in Hyrule Field in other
+  sessions. Not yet confirmed to cure it.
 - **v1.19.** AMD's driver may overflow device memory into system memory
   (`VK_AMD_memory_overallocation_behavior`, port of zortos293/Lichii#1335). Without it the driver
   fails device-local allocations once the heap is full, and the fallbacks of `AllocateImage`

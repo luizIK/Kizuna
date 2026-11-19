@@ -157,9 +157,13 @@ else()
     if (NOT MSVC)
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
-            # Disable RTTI (C++ only)
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>)
+        # Disable RTTI (C++ only). Kizuna keeps it on MinGW: v6.2's GPU split
+        # (gpu_split.cpp, fritchii_e_split.cpp, memstage_shadow.cpp) uses dynamic_cast, which
+        # clang refuses without RTTI (Fritchii's Windows releases are built with MSVC).
+        if (NOT MINGW)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+        endif()
     endif()
 
     if (ENABLE_WERROR)

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
 
+#include "common/lowend_sim.h"
 #include "video_core/textures/workers.h"
 
 namespace Tegra::Texture {
@@ -19,7 +19,7 @@ Common::ThreadWorker& GetThreadWorkers() {
         if (const char* text = std::getenv("EDEN_NX2_TRANSCODE_THREADS")) {
             return (std::max)(static_cast<u32>(std::strtoul(text, nullptr, 10)), 1U);
         }
-        return (std::max)(std::thread::hardware_concurrency() / 4, 2U);
+        return (std::max)(Common::LowEndSim::LogicalProcessors() / 4, 2U);
     }(), "ImageTranscode"};
     return workers;
 }

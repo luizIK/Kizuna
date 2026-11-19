@@ -1,7 +1,7 @@
 # Settings
 
 > [!WARNING]
-> This guide is intended for developers ONLY. If you're looking for configuring the emulator itself, read **[the user handbook](./user/README.md)**.
+> This guide is intended for developers ONLY. Players configure the emulator from its Settings window.
 
 Settings on the emulator are very important, toggles and such can be used to guard and/or add branches to paths where some games may crash while others won't, and viceversa.
 
@@ -24,17 +24,12 @@ However, this process can be tedious for those unfamiliar; this document serves 
 * [Adding Boolean Settings Toggles](#adding-boolean-settings-toggles)
   * [Step 1 - Common Setting](#step-1-common-setting)
   * [Step 2 - Qt Toggle](#step-2-qt-toggle)
-  * [Step 3 - Kotlin (Android)](#step-3-kotlin-android)
-    * [Step 3.1 - BooleanSetting.kt](#step-3-1-booleansetting-kt)
-    * [Step 3.2 - SettingsItem.kt](#step-3-2-settingsitem-kt)
-    * [Step 3.3 - SettingsFragmentPresenter.kt](#step-3-3-settingsfragmentpresenter-kt)
-    * [Step 3.4 - Localization](#step-3-4-localization)
-  * [Step 4 - Use Your Toggle](#step-4-use-your-toggle)
+  * [Step 3 - Use Your Toggle](#step-3-use-your-toggle)
   * [Best Practices](#best-practices)
 
 ## Adding Boolean Settings Toggles
 
-This guide will walk you through adding a new boolean toggle setting to Eden's configuration across both Qt's (PC) and Kotlin's (Android) UIs.
+This guide will walk you through adding a new boolean toggle setting to the emulator's configuration and the Qt UI.
 
 ---
 
@@ -86,71 +81,7 @@ INSERT(Settings,
 
 ---
 
-### Step 3 - Kotlin (Android)
-
-#### Step 3.1 - BooleanSetting.kt
-
-Add where it should be in the settings.
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt`
-
-```kts
-RENDERER_YOUR_SETTING_NAME("your_setting_name"),
-```
-
-#### Make sure to:
-
-* Ensure the prefix naming matches the intended category.
-
----
-
-#### Step 3.2 - SettingsItem.kt
-
-Add the toggle to the Kotlin (Android) UI
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt`
-
-```kts
-put(
-    SwitchSetting(
-        BooleanSetting.RENDERER_YOUR_SETTING_NAME,
-        titleId = R.string.your_setting_name,
-        descriptionId = R.string.your_setting_name_description
-    )
-)
-```
-
----
-
-#### Step 3.3 - SettingsFragmentPresenter.kt
-
-Add your setting within the right category.
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt`
-
-```kts
-add(BooleanSetting.RENDERER_YOUR_SETTING_NAME.key)
-```
-
-> [!WARNING]
-> Remember, placing matters! Settings appear in the order of where you add them.
-
----
-
-#### Step 3.4 - Localization
-
-Add your setting and description in the appropriate place.
-
-Example: `src/android/app/src/main/res/values/strings.xml`
-
-```xml
-<string name="your_setting_name">Your Setting Display Name</string>
-<string name="your_setting_name_description">Detailed description of what this setting does. Explain any caveats, requirements, or warnings here.</string>
-```
-
----
-
-### Step 4 - Use Your Toggle!
+### Step 3 - Use Your Toggle!
 
 Now the UI part is done find a place in the code for the toggle,
 And use it to your heart's desire!
@@ -177,13 +108,13 @@ Use `if (!your_value) {` instead of `if (your_value) {`.
 * Documentation - Write clear descriptions explaining when and why to use the setting.
 * Categories - Put settings in the appropriate category.
 * Order - Place related settings near each other.
-* Testing - Always test on both PC and Android before committing when possible.
+* Testing - Test the setting in the game it is meant for before committing.
 
 Thank you for reading, I hope this guide helped you making your toggle!
 
 ## Adding Debug Knobs
 
-Debug Knobs is a 16-bit integer setting (`debug_knobs`) in the Eden Emulator that serves as a bitmask for gating various testing and debugging features. This allows developers and advanced users to enable or disable specific debug behaviors without requiring deploying of complete but temporary toggles.
+Debug Knobs is a 16-bit integer setting (`debug_knobs`) in Fritchii that serves as a bitmask for gating various testing and debugging features. This allows developers and advanced users to enable or disable specific debug behaviors without requiring deploying of complete but temporary toggles.
 
 The setting ranges from 0 to 65535 (0x0000 to 0xFFFF), where each bit represents a different debug feature flag.
 
@@ -239,8 +170,7 @@ Developers must inform which knobs are tied to each functionality to be tested.
 The debug knobs value can be set through:
 
 1. **Desktop UI**: In the Debug configuration tab, there's a spinbox for "Debug knobs" (0-65535)
-2. **Android UI**: Available as an integer setting in the Debug section
-3. **Configuration Files**: Set the `debug_knobs` value in the emulator's configuration
+2. **Configuration Files**: Set the `debug_knobs` value in the emulator's configuration
 
 #### Bit Manipulation Examples
 

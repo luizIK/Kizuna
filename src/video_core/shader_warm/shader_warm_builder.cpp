@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -419,7 +420,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     } else {
         // The play history the guesses come from: this fork's cache (vulkan-frizti), else the
         // shared name of this version, else the newest cache of a version with the same record
-        // layout (zortos293/Lichii builds).
+        // layout (related builds).
         std::vector<fs::path> candidates{
             VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan-frizti",
                                                     VideoCommon::VulkanPipelineCacheVersion),
@@ -523,7 +524,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     const size_t threads =
         options.threads != 0
             ? options.threads
-            : std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 2, 6);
+            : std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 4, 2, 6);
     auto converter = std::make_unique<Converter>(threads, stop);
 
     // Consumes finished conversions in submission order (first program wins on equal keys).

@@ -22,8 +22,14 @@
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
 
-/// EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
-/// debug server's `switch` method, so one session can A/B it.
+/// Bumped by every store a live switch or experiment can take (the debug server's `switch`,
+/// LoadExperiments, a switch's first read in SwitchValue). Hot paths keep what they derive from
+/// the switches and look again only when this moved (Maxwell3D::FrontRunMacro's feature byte).
+inline std::atomic<u32> g_switch_generation{0};
+inline void BumpSwitchGeneration() {
+    g_switch_generation.fetch_add(1, std::memory_order_release);
+}
+
 [[nodiscard]] inline int EnvSwitch(const char* name) {
     const char* value = std::getenv(name);
     return value == nullptr ? 0 : std::atoi(value); // whole number: EDEN_NX2_DMA_SNAPSHOT=10
@@ -36,39 +42,26 @@ namespace VideoCore::Nx2Debug {
     if (current < 0) [[unlikely]] {
         int unset = -1;
         const int initial = std::getenv(name) != nullptr ? EnvSwitch(name) : fallback;
-        value.compare_exchange_strong(unset, initial, std::memory_order_relaxed);
+        if (value.compare_exchange_strong(unset, initial, std::memory_order_relaxed)) {
+            BumpSwitchGeneration();
+        }
         current = value.load(std::memory_order_relaxed);
     }
     return current;
 }
+/// EDEN_NX2_DMA_WAIT_WRITERS: docs/fritchii/switches.md.
 inline std::atomic<int> g_dma_wait_writers{-1};
-/// EXPERIMENT, off by default: Ocarina of Time flickers white on the bottom half of Link's house
-/// ladder with it (confirmed toggling it live, 2026-11-06), for +1.4 fps. EDEN_NX2_SEM_FAST=1,
-/// semaphore acquires without draining the back
-/// when the value is already met and no queued write overlaps it (puller.cpp).
+/// EDEN_NX2_SEM_FAST: docs/fritchii/switches.md.
 inline std::atomic<int> g_sem_fast{-1};
-/// TEST: EDEN_NX2_LIST_VERIFY=1 (live), each command list the split's front reads on GPU-written
-/// pages is read again as before EXP40 and compared (video_core/nx2_list_verify.h; "list
-/// verify" every 10 s). Changes timing: the front waits for every writer again for each list.
+/// EDEN_NX2_LIST_VERIFY: docs/fritchii/switches.md.
 inline std::atomic<int> g_list_verify{-1};
-/// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1, the split's front does not send the instance
-/// loop writes the back would ignore (draw.end in an instance loop, unchanged vertex and index
-/// buffer firsts and counts) (maxwell_3d.cpp).
+/// EDEN_NX2_LOOP_SKIP: docs/fritchii/switches.md.
 inline std::atomic<int> g_loop_skip{-1};
 
-/// EDEN_NX2_DMA_SNAPSHOT (from EvilOOT's dma-snapshot fix): macro DMA reads of pages a drained
-/// read flushed whole skip the drain while nothing sent since may write them (Maxwell3D::
-/// FrontDmaRead). 9 = on (default: Lake Hylia 46.5 -> 52.3 fps; verify 0 differences in 235k
-/// reads), 10 = on and verify every skipped read against the drained path, 0 = off.
+/// EDEN_NX2_DMA_SNAPSHOT: docs/fritchii/switches.md.
 inline std::atomic<int> g_dma_snapshot{-1};
 
-/// EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in
-/// Fast mode, the split GPU thread kept, to find which one stops a flicker that Accurate mode
-/// stops. Not live: switching the counter query mode mid-game crashed (queries opened in one
-/// mode were closed in the other).
-/// 1 = counter reports written once their host query completes (synced), 2 = precise occlusion
-/// queries, 4 = CPU reads of GPU-written images download them, 8 = CPU writes flush GPU data
-/// before invalidating it, 16 = fences wait for the GPU work before them.
+/// EDEN_NX2_ACCURATE_PARTS: docs/fritchii/switches.md.
 /// Whether GPU accuracy High is on, or the EDEN_NX2_ACCURATE_PARTS bit `part` asks for it.
 [[nodiscard]] inline bool AccuratePart(int part) {
     static const int parts = EnvSwitch("EDEN_NX2_ACCURATE_PARTS");
@@ -83,416 +76,647 @@ inline std::atomic<int> g_dma_snapshot{-1};
                : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
 }
 
-/// EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
-/// measure how long each frame was shown.
+/// EDEN_NX2_HOST_PACE: docs/fritchii/switches.md.
 inline std::atomic<int> g_host_pace{-1};
 
-/// EDEN_NX2_ARB_SPIN (zortos293/Lichii#641; off by default here, #641 uses 8): microseconds a
-/// guest thread about to sleep in WaitForAddress first watches the word (KAddressArbiter), 0 =
-/// off. Live: read on every wait, so profile_toggle.py can A/B it in one session.
+/// EDEN_NX2_ARB_SPIN: docs/fritchii/switches.md.
 inline std::atomic<int> g_arb_spin{-1};
-/// EDEN_NX2_IDLE_PAUSE=1 (zortos293/Lichii#641; off by default here, on in #641): the guest
-/// core's idle poll (PhysicalCore::Idle, EDEN_NX2_IDLE_SPIN_US) runs PAUSE and reads the clock
-/// every 16 pauses, instead of a SwitchToThread and a clock read per iteration. Live: read on
-/// every Idle.
+/// EDEN_NX2_IDLE_PAUSE: docs/fritchii/switches.md.
 inline std::atomic<int> g_idle_pause{-1};
-
-/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
-/// slots for batches of fixes built together and A/B-tested in one session
-/// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
-/// EXP8 (texture upload hitches), bits: 1 = keep idle upload staging buffers up to 32 MiB
-/// (StagingBufferPool::ReleaseLevel), 2 = no guest upload for a new image that GPU copies
-/// overwrite whole (TextureCache::JoinImages), 4 = large 2D levels untiled on the transcode
-/// workers too (UnswizzleImage), 8 = guest memory of uploaded textures not hinted cold
-/// (TextureCache::TickFrame).
-/// EXP10 = 1: macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT) skip the drain for compute and
-/// copies sent since whose write ranges miss the pages read (Maxwell3D::FrontDmaRead): copies,
-/// inline uploads and releases as the front notes them, native dispatches as the back records
-/// them once it ran them (the read waits for that much); 2 = the same, but a dispatch still
-/// queued drains as before. +4 (5, 6): compute report semaphores noted as before, 16 bytes or
-/// anything when unmapped (GpuSplit::NoteReleaseWriter).
-/// EXP12 (EDEN_NX2_SEM_FAST acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
-/// 1 = their fence release waits only for the queued writers the read can't account for, full
-/// drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only.
-/// EXP17 = 1: a small streamed uniform buffer binds again any stage or slot's copy of the same
-/// guest range made in the current command buffer, when the bytes still match
-/// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
-/// EXP18 (buffer binding memos, #641), bits: 1 = a constant buffer bind of the slot's current
-/// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
-/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
-/// (default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
-/// unchanged (BufferCache::binding_epoch).
-/// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
-/// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
-/// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
-/// EXP50 (live; with EXP19 / EDEN_NX2_PIPELINE_CLEAN on; after the-cashman's fix in
-/// zortos293/Lichii#717): 1 = the blend registers leave the clean lookup's word compare and
-/// Dirty::Blending is not looked at; when they moved since the key was made, the attachments
-/// RefreshBlending would build from them (FixedPipelineState::BlendingMatches) and the
-/// dual-source bit are compared with the key's: equal keeps the pipeline without a Refresh,
-/// different patches only the blend part of the key. Reads the registers, so #679's writes
-/// without the flag are still caught. Logs "saved by the blend value check" and why the other
-/// lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
-/// EXP22 (split ring traffic, zortos293/Lichii#641; gpu_split.h DeltaWrite and DrawBatch), bits:
-/// 1 = 3D state writes that went as Direct macro writes or (EDEN_NX2_RING_PAIRS) as pairs go in
-/// StateDelta blocks, applied in one loop (FRONT_STATE, without its per-register merge),
-/// 2 = repeated instance-loop groups go as one DrawBatch entry that counts the repeats
-/// (DRAW_BATCH), 4 = same-value index_buffer.first writes stay on the front
-/// (SKIP_SAME_DRAWREG, as EXP2), 8 = the back checks each delta and batch against the single
-/// writes and keeps theirs (logs "EXP22 check"). 7 = all three. #641's FRONT_CB_ENCODE is not
-/// ported (it holds constant buffer writes off the ring).
-/// EXP23 = 1: trim unused pipeline libraries every 600 frames past 4096 (#579 stage B;
-/// PipelineCache::TickFrame, GraphicsPipelineLibraryCache::TrimUnused). Off by default, not
-/// measured yet.
-/// EXP24 = 1: Ocarina of Time's present poll (`while (nvnEventGetValue(e) != 1) SleepThread(1 ms)`,
-/// from Hookshot) sleeps until the GPU's next write of a 1 instead, at most 1 ms
-/// (core/hle/kernel/svc/svc_nx2_oot_present.cpp; the site per build id is in its PresentSites
-/// table, or EDEN_NX2_OOT_PRESENT_SITE=<ret>[:<blr>] in hex main offsets). Logs "OoT present
-/// poll (EXP24)" counts every 10 s. EXP24 = 2: locate only, sleeps unchanged: short sleeps
-/// (<= 2 ms) are counted by call chain and the top 8 logged every 10 s ("OoT present poll
-/// locate"). EXP24 = 3: no GPU wake, the poll's 1 ms sleep is EDEN_NX2_OOT_PRESENT_SLEEP_US
-/// instead (default 250 us, at most the time asked for). Off by default, not measured yet.
-/// EXP25 (Ocarina of Time resource poll backoff, zortos293/Lichii#641; needs the built-in patch
-/// placed at launch by EDEN_NX2_OOT_POLL_BACKOFF=1, core/hle/kernel/svc/svc_nx2_oot_poll.cpp):
-/// the resource request thread sleeps before rescanning requests that are not ready.
-/// 0 = no sleep (as without the patch, plus one SVC per rescan), 1 = 500 us (#641's default),
-/// above 1 = that many us, at most 16000. Off by default, not measured yet.
-/// EXP26 (native uniform bank check trims, zortos293/Lichii#717; BufferCache::
-/// BindHostGraphicsUniformBuffer and CheckNativeBankPagesTracked), bits: 1 = a bind that streams
-/// the buffer (at most 4 KiB, not GPU-modified) skips the check, the stream copies guest memory
-/// itself (BUFCACHE_BANK), 2 = pages compared with an inline SSE2 loop instead of memcmp
-/// (PAGE_CMP), 4 = changed pages copied to the host buffer from their snapshots instead of being
-/// marked CPU-modified (two VirtualProtect calls each), for pages whole in the bound buffer with
-/// no GPU-written data (UploadNativeBank's upload, without its once-a-frame bank shadows: the
-/// check stays per bind, d79572d28a). Off by default; measure 1 and 2 first, then 4. Verify
-/// with EXP9=2 ("missed" stays 0) and the flash watch.
-/// EXP35 (guest writes of never-GPU-written cached pages, Core::Memory::HandleRasterizerWrite):
-/// 1 = collected for the split's back (applied at its next FlushCaching) instead of OnCPUWrite
-/// under both caches' mutexes. On by default (2026-11-08): Castle Town guest-core lock spinning
-/// 11.6% -> 7.6% of busy (writes 6.1% -> 0.7%), standing 43.0 -> 45.3 fps, route 45.0 fps with
-/// 175 flash reports (camera-motion noise ~270 either way).
-/// EXP36 (live): 1 = guest reads of cached memory always take GetFlushArea's locked path (turns
-/// off its lock-free answer for image-free, never-GPU-written pages). For the washed-out hunt.
-/// EXP37 (live): 1 = nx2:gsv answers the driver's armed syncpoint waits right after each guest
-/// syncpoint increment (SyncpointManager guest increment hook), not only at its 500 us poll.
-/// EXP35=2 (live): every guest write of cached memory is collected for the back, not only writes to
-/// never-GPU-written pages. EXP60 (live): 1 = a guest read whose cache mutexes stay taken after a
-/// short spin is answered with a flush request served by the back (GetFlushArea).
-/// EXP49 (live; async read-back, the core of zortos293/Lichii#1028 0b83798bf6): 1 = a guest read
-/// of GPU-written buffer memory (GPU::OnCPURead) has the GPU thread record and submit the
-/// downloads without waiting for the host GPU (RasterizerVulkan::FlushRegionForRead). The reading
-/// thread waits for them and writes them to guest memory (BufferCache::FinishReadDownloads); a
-/// read whose bytes are already on their way only waits. Until they land the bytes stay
-/// GPU-modified; guest CPU writes keep their bytes (ClearReplacedDownload, pending writes at
-/// landing); writes from the GPU's side (MemoryManager, query results, DMA clears and copies) land
-/// them first. 0 = the synchronous flush (Scheduler::Finish on the GPU thread under the buffer
-/// cache's lock). Both log "Read-back (EXP49) per second" every 10 s (reads, GPU thread time in
-/// read flushes, reader waits). Not ported: #1028's early downloads and EDEN_NX2_READ_CHECK.
-/// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
-/// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
-/// GpuSplit::PublishBeforeWait), 2 = retired (was PUBLISH_IDLE, each entry published at once
-/// while the back found the ring empty; EXP39 & 1 replaces it), 4 = the back prefetches the ring 128 words
-/// ahead (RING_PREFETCH), 8 = command list copies after a dispatch are submitted when the front
-/// waits for them, when the back goes idle or with the next submission, instead of at once
-/// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
-/// only when work becomes visible, 8 changes submission timing (the #161 family: flash watch).
-/// EXP28 (fewer fences, zortos293/Lichii#717; FenceManager::SignalFence), bits: 1 = a fence whose
-/// only work is syncing payload releases into host buffers is skipped like an empty one (the
-/// guest word was written at once; the copy goes with the next fence made or wait for idle,
-/// values kept per release since the query slot may be reused: GuestStreamer::
-/// SyncDeferredWrites) (FENCE_TRIM), 2 = a made fence with nothing to wait for on the host GPU
-/// joins the newest queued fence, or with none queued and the fencing thread idle runs its work
-/// on the split's back at once (FENCE_FOLD, FoldStubbedFence). Off by default; timing family
-/// (#161, boulder flashes): flash watch after each. "Fence decisions/s" (GPU profile) counts
-/// both.
-/// EXP29 (zortos293/Lichii#717's micro bundle), bits: 1 = Device::GetDeviceMemoryUsage reuses an
-/// answer younger than 50 ms (MEMSTAT_MS; the buffer and texture caches ask twice per frame on
-/// the back; zone "memory query" times the driver query), 2 = GPU::TickWork checks an atomic
-/// before taking the sync request mutex (OPT_TICKWORK), 4 = native compute engines no longer
-/// record inline upload execs for the old launch method they never run (DROP_NATIVE_UPLOADS).
-/// Default 6: 2 and 4 are exact (2 only allows interleavings the mutex already allowed, 4 drops
-/// a list nothing in native mode reads); 1 is off, since the caches' GC then sees usage up to
-/// 50 ms old. EDEN_NX2_EXP29=0 is the behaviour before.
-/// EXP30 = 1 (zortos293/Lichii#559, no env var of its own): a macro DMA read of report memory
-/// with pending query results (#215's white flash fix, RasterizerVulkan::FlushQueryResults) waits
-/// only until the counter reports in its range are written (Tegra::Nx2WaitAsyncReportsSettled,
-/// slots from 12 bytes before the read), not for an operation queued behind every fence, which
-/// also waited for all GPU work sent after those reports (8-15% of the back while walking in
-/// Ocarina, ~11 waits/s of ~3.7 ms, and the front's FrontDmaRead drain with it). Vulkan only
-/// (OpenGL keeps its FlushRegion). 0 = the operation wait as before. Off by default, not measured
-/// yet: compare the back's "query DMA wait" profile zone (ms and waits per second) and the white
-/// flash watch.
-/// EXP31 (render target memo, RT_FAST from zortos293/Lichii#717; TextureCache::
-/// UpdateRenderTargets), bits: 1 = a draw whose render targets are clean (no Dirty::RenderTargets)
-/// skips preparing them again while the same views were prepared for a draw in the same frame,
-/// no image was marked modified, created, deleted, rescaled or CPU written since (modification
-/// tick and bindings_epoch unchanged), and every target image is GPU-modified with no CPU
-/// modification, alias or sparse state, 2 = with 1: such draws run the loop anyway and check it
-/// changed nothing but the targets' own modification ticks (flags, bindings_epoch; logs "RT_FAST
-/// (EXP31) mismatch" and drops the memo on a difference). Logs skips, verified and mismatches
-/// every 600 frames while on. Off by default; measure the back's "render targets" zone (3 = verify
-/// first, then 1).
-/// EXP32 (texture binding memo, the core of zortos293/Lichii#717's BINDMEMO for "the same textures
-/// as the pipeline's previous draw"; Vulkan GraphicsPipeline::TextureMemo, graphics pipelines whose
-/// image bindings are all sampled textures), bits: 1 = a draw that reads the same TIC and TSC
-/// handles as its pipeline's previous draw, with the same pools, channel, GPU mappings and texture
-/// cache epoch (no view removed: image deleted, joined or rescaled), the same guest TIC/TSC
-/// entries and images without CPU writes to upload or aliases, takes that draw's view and sampler
-/// ids and descriptor entries instead of GetSamplerId, FillImageViews and PushImageDescriptors
-/// (handles are still read every draw: the EXP21 storage pointer rule and the per-bind uniform bank
-/// check of d79572d28a are untouched), 2 = verify: every hit for 120 frames after the switch
-/// changes, then one hit in 64, runs the full path instead and compares view ids, sampler ids,
-/// descriptor entries and rescaling bits ("Texture memo mismatch (EXP32)" log, first 32), 4 = a
-/// mismatch turns the memo off until the switch changes. "Texture memo (EXP32=n)" logs hits, misses
-/// by cause, records and verify mismatches every 10 s while set. Off by default; 7 = memo, verify
-/// and auto-off. Measure the back's "read handles", "fill image views" and "push descriptors"
-/// zones (the sampler lookups move from the first to the second with the memo on).
-/// EXP33 = 1 (zortos293/Lichii#337 by Inc0rporate; QueryCacheBase::CounterReport and
-/// FenceManager::SignalFence): at fence behaviour Default without GPU accuracy High (or
-/// EDEN_NX2_ACCURATE_PARTS bit 1), a fence-flagged query report is no longer treated as
-/// synchronized: the query stays registered until its fence runs, and that fence is made even
-/// when empty and runs the report's operation once the host GPU passed the work before it
-/// (VideoCore::g_signaling_query_report_fence), as with delayed fences. Other fences are skipped
-/// as before. Read once per report, live. #337's fix for Ocarina's white flashes on leaves and
-/// walls at low accuracy; ours already has #215's FlushQueryResults wait (EXP30 trims it), so
-/// off by default, not measured yet: white flash watch, and the front's semaphore waits (the
-/// reports land later than with the fence skipped).
-/// EXP34 (EDEN_NX2_ACQUIRE_PRECHECK=2's reset hole, fable_answer_6 6i (b); puller.cpp
-/// PrecheckAudit): where level 2 would answer a GEQ acquire met from guest memory alone,
-/// 1 = it takes the normal path instead when the front knows a write to the word is still queued
-/// for the back: a plain release (puller, SEM_EXECUTE, 3D or compute 0x6c3) with any payload, a
-/// noted write over the word (puller semaphores, 3D reports, compute 0x6c3 releases and
-/// reductions, copies, uploads) or, with EXP13 on, a QMD prediction record, and when
-/// SemaphoreReadableNow read the word current but below the value (the Castle Town route's only
-/// cases, 5-13 per 5 s; most likely work it doesn't track ran between that read and level 2's,
-/// the log's first 8 say); 2 = only when that
-/// queued plain release writes less than the word read (a reset); 0 = count only. The counts
-/// are logged either way ("Acquire precheck (level 2)", every 5 s). Default 1: it only turns met
-/// answers into the path level 2 takes for a word below the value, never the other way, so it is
-/// a strict tightening; its cost is the drains it puts back (compare 0, 1 and 2 with
-/// profile_toggle and the AcquiresFast count).
-/// EXP39 (live; keep the split's back fed, zortos293/Lichii#805 62db242b34), bits: 1 = the back
-/// stores its position when it runs out of work (GpuSplit::back_idle_at) and, while that is the
-/// position last published, the front publishes at its next Commit once it holds 8 words, not
-/// after 256 (outside open Pairs and StateDelta blocks; replaces EXP27 & 2), 2 = when an acquire
-/// resumes, the snapshot refresh (DmaPusher::RefreshSnapshot) skips the current list's entries
-/// that ran already and the entry the acquire suspended inside, which reads memory anyway
-/// (CanUseSubmittedCommands); the lists behind it are copied as before. Default 3: both only
-/// change when the back sees work or which words nobody parses again are copied. Measure with
-/// profile_toggle (EXP39 0 vs 3): back "split wait", front "resume pending".
-/// EXP40 (live; command lists on GPU-written pages, zortos293/Lichii#805 34656e8225), bits:
-/// 1 = each command list page keeps the 4-byte words GPU work wrote that guest memory lacks
-/// (BufferCache::Nx2ListPage::gpu_words: set by every GPU write noted to the page, the whole range
-/// a dispatch or copy may write, cleared for words the host writes whole and for all of them when
-/// the front flushes the page); once the page was flushed, a list on none of those words reads
-/// guest memory and waits for no copy, and a list on some reads those from the copy and the rest
-/// from guest memory (the "list GPU wait" zone falls; a storage write mark that
-/// EDEN_NX2_WRITTEN_SSBO_MARK_KIB capped counts as written to the end of its last page, since
-/// the shader may write past the cap); 2 = a list on GPU-written pages waits
-/// only for the compute and copy work sent before the last host sync ("list copy writers"
-/// site), not for every one sent so far ("list writers"). Off by default: both read words
-/// earlier than before. Verify with EDEN_NX2_LIST_VERIFY=1 ("list verify ... 0 differ"). Always
-/// on (bug fixes): copy engine copies and clears tell the list pages what they write to guest
-/// memory (their copies went stale), DMAClear checks its whole range (it passed words as bytes),
-/// and a front waiting for a list copy publishes first.
-/// EXP41 (live; command entries on pages no GPU work wrote yet, DmaPusher::Step): 1 = the writer
-/// waits before the port of zortos293/Lichii#805 6229487c8c + d4e8d85d4d: EDEN_NX2_LIST_WAIT_SKIP=1
-/// (built in) skips every entry's wait, =0 waits for every queued dispatch and copy. 0 (default)
-/// = the new shape: an entry waits only for the compute and copy work sent before the last host
-/// sync (WaitForSyncedWriters), and with LIST_WAIT_SKIP=1 an entry that begins between methods
-/// (a command buffer the CPU writes) doesn't wait unless copy engine work is still queued;
-/// entries inside a method's data (the parameters GPU work writes) still wait. Against the
-/// built-in skip-everything this only adds waits. Entries that didn't wait for every writer are
-/// checked on the back ("EDEN_NX2_LIST_WAIT_SKIP: command list at ... was GPU-written": stays 0).
-/// EXP42 (live; VkImage pool, fable_answer_12 2B; vk_texture_cache.cpp): 1 = a deleted
-/// single-level, single-layer render target's VkImage (and its rescaled copy), once the GPU is done
-/// with it, is kept with its memory for the next image made with the same create info and view
-/// formats, instead of vkDestroyImage + vkCreateImage. Only device-local, non-dedicated images of
-/// 256 KiB or more; the pool holds at most 512 MiB, 180 frames each, and empties when the switch
-/// goes off or an image does not fit in device memory. A taken image starts uninitialized
-/// (UNDEFINED layout, contents discarded) as a new one does. Its bytes are left out of the
-/// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
-/// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
-/// (LoadExperiments); 0 = off.
-/// EXP45 (live; 1 = off): the native compute write extent self-check (BufferCache::ExtentTrust,
-/// fable_answer_25): a program is marked in full until a dispatch at its dims showed its proof
-/// holds, and for good once one wrote past it (Ocarina of Time's glowing triangles, 2026-11-09).
-/// EXP43 (live; render target relocation, fable_answer_12 2A; TextureCache::JoinImages): a render
-/// target a clear overwrites whole, with no copies, aliases or remapped images among its overlaps
-/// and exactly one predecessor among its bad overlaps (an image of the same single-level,
-/// single-layer 2D shape it drifted off by less than its size, not written in this frame: Ocarina
-/// of Time's bump-allocated per-frame targets while an NPC moves), takes that image's place;
-/// bad overlaps of other shapes stay as for a new image. 2 = relocate: the image moves to the new
-/// address (stale at the old one, untracked, unregistered, its overlap links dropped, registered
-/// again; its VkImage, memory, views and framebuffers stay). 3 = as 2, and with several
-/// predecessors the most recently modified one moves (lets a chain made before the switch went
-/// on stop growing and age out). 1 = retire early: the predecessor is deleted at once and a new
-/// image made, as with 0. 0 = off: candidates are only counted. 4 = verify (fable_answer_16 1c): as
-/// 3 under the render-frame clock (as EDEN_NX2_RENDER_CLOCK=1), and each old range is kept as a
-/// tombstone for 2 render frames; reads that land on one are counted ("Relocation tombstones
-/// (EXP43=4) last 600 frames: N hits", first 8 logged), which must stay 0. Default 3 (LoadExperiments). Never for a shape
-/// whose GPU-written contents were sampled or rendered to without a clear in a later frame, or
-/// read by the CPU (sticky per shape for the session: "Render target relocation guard (EXP43)"),
-/// nor for rescaled, sparse, converted or CPU-read images, ones with a download queued, bound as
-/// another target of the clear or in another channel. Logs each shape's first candidate and
-/// relocation and "Render target relocation (EXP43=n) last 600 frames".
-/// EXP51 (live; RAM, fable_answer_26 C2c; Vulkan PipelineCache::EvictUnusedComputePipelines):
-/// compute pipelines unused for 9000 frames are destroyed, least recently used first, while more
-/// than 500 are held (checked every 600 frames). Their next dispatch translates them again on the
-/// GPU thread, binding the pointers they bound, and builds them from the driver's pipeline cache
-/// (no new disk cache record). 1 = only programs dispatched this session, 2 = also boot builds no
-/// dispatch used yet. Never one still building or with a rebuild pending; destroyed through
-/// retired_compute_pipelines once the GPU and their worker build are done. Off by default, not
-/// measured yet: compare the 10 s memory line's compute count and the working set over a long
-/// session, and the "Evicted N compute pipelines" log's "dispatched again" count (each is a
-/// GPU-thread rebuild, a possible hitch).
-/// EXP52 (live; with EXP19 / EDEN_NX2_PIPELINE_CLEAN on; fable52_answer_1 section 1; Vulkan
-/// PipelineCache::CurrentGraphicsPipelineClean): 1 = when only the bound programs changed since
-/// the last key (every other Refresh input stands), the key's state is kept and only what the
-/// programs feed is redone (with dynamic vertex input, the attribute types masked by what the
-/// programs read), then Next / the cache map looks the new key up, without
-/// FixedPipelineState::Refresh. 2 = as 1, and each such key is also built by the full Refresh and
-/// compared byte for byte; Refresh's is kept, the first 16 differences are logged ("Programs-only
-/// key (EXP52=2) differs"). The "EDEN_NX2_PIPELINE_CLEAN per second" line counts "programs only"
-/// and, at 2, "verified N, M differ". With EXP52 on its "programs" reason stays 0 (a change of
-/// programs together with other state counts under that state). Off by default, not measured yet:
-/// prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
-/// Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
-/// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
-inline constexpr int ExperimentCount = 64;
-inline std::atomic<int> g_experiments[ExperimentCount]{};
-
-inline void LoadExperiments() {
-    static const bool loaded = [] {
-        // Kept experiments: on unless their variable says otherwise. EXP8 = 15: Ocarina of Time
-        // walking through Hyrule Field, fresh launches: 1% low 30.3 -> 35.1 fps, frames over
-        // 25 ms 68 -> 38 of ~1650.
-        g_experiments[8].store(15, std::memory_order_relaxed);
-        // EXP9 = 1: native uniform bank pages compared only when they may have changed (verified
-        // with EXP9=2: 0 missed in 120 s walking). Idle 54.5 -> 57.7 fps, walking 56.6 -> 58.9.
-        // EXP9 = 3 (2026-11-08): the same without the once-a-frame compare of every page, which
-        // never found a change ("frame check N / 0", "missed without the frame check 0"). Castle
-        // Town, one session, 4 x 35 s each: uniform buffers 135.6 -> 97.9 ms/s on the split's back,
-        // 40.8 -> 42.3 fps; flash watch on the Castle Town route 267 reports vs 273 with EXP9=1.
-        g_experiments[9].store(3, std::memory_order_relaxed);
-        // EXP10 = 1: macro DMA reads wait only for the dispatches, uploads, copies and releases
-        // that may have written them (EDEN_NX2_DMA_SNAPSHOT=10 verify: 0 differed in 2 x 90 s
-        // walking). GPU front idle 81 -> 105 ms/s, waits for the back 368 -> 338 ms/s.
-        g_experiments[10].store(1, std::memory_order_relaxed);
-        // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
-        // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
-        g_experiments[14].store(1, std::memory_order_relaxed);
-        // EXP18 = 4 (exact, zortos293/Lichii#717 wave 1): a buffer touches its LRU node once
-        // per frame; a second touch in the same frame was already a no-op in LruCache::Touch
-        // (its tick is not older), so only the node's cache miss goes. Bits 1 and 2 stay off.
-        g_experiments[18].store(4, std::memory_order_relaxed);
-        // EXP21 = 1: a texture whose handle word is a storage buffer's address gets no texture
-        // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
-        // flickered every other frame in bursts without it.
-        g_experiments[21].store(1, std::memory_order_relaxed);
-        // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
-        // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
-        // GC sees and stays off.
-        g_experiments[29].store(6, std::memory_order_relaxed);
-        // EXP34 = 1: ACQUIRE_PRECHECK=2 no longer answers met over a write to the word still
-        // queued for the back (a reset there let a channel run before its producer). A strict
-        // tightening: only met answers become the normal path.
-        g_experiments[34].store(1, std::memory_order_relaxed);
-        // EXP35 = 1: guest writes of never-GPU-written cached pages collected for the back instead
-        // of OnCPUWrite under both caches' mutexes (see the EXP35 notes above).
-        // EXP35 = 2 (2026-11-08): every guest write collected (guest-core write lock spinning 0.7% ->
-        // 0, standing 45.3 -> 46.5 fps, route flash reports 253 = camera noise).
-        g_experiments[35].store(2, std::memory_order_relaxed);
-        // EXP42 = 1 and EXP43 = 3 (2026-11-08, moving-NPC dips): pooled VkImages for deleted
-        // render targets, and drifted per-frame targets relocated in place (the newest of several
-        // predecessors). Castle Town live toggles: EXP43 0/3 46.3 -> 49.3 fps, EXP42 0/1 on top
-        // 44.7 -> 47.9 (each won all 4 pairs); 21 loads 0 washed out; owner playtest: no visual
-        // bugs, rarely under 40 fps.
-        g_experiments[42].store(1, std::memory_order_relaxed);
-        g_experiments[43].store(3, std::memory_order_relaxed);
-        // EXP56 = 1 (2026-11-09): a cleared depth target larger than its colour targets is not
-        // uploaded from guest memory first (TextureCache::JoinImages, overwritten_by_clear).
-        // Castle Town live toggle 41.3 -> 43.8 fps, clear zone 54.7 -> 36.3 ms/s; screenshots
-        // off/on identical.
-        g_experiments[56].store(1, std::memory_order_relaxed);
-        // EXP58 = 1 (2026-11-10): guarded render targets that a newer target of another shape
-        // superseded are deleted once 60 frames old (TextureCache::SweepColdImages). Castle Town
-        // 150 s A/B: device memory 7.8-10.5 -> 5.2-5.7 GB, collector evictions 83-1915 a window
-        // -> 0, worst frames 140-180 -> 30-48 ms, moving median 42.2 -> 46.9 fps; skeleton fight
-        // 5.1-5.5 GB instead of 10.9 with 0 evictions; two owner playtests without glitches.
-        g_experiments[58].store(1, std::memory_order_relaxed);
-        // EXP61 = 1 (2026-11-10): FlushCommands submits nothing when nothing was recorded since
-        // the last submit. Castle Town live toggle: empty submits 4,600 -> 145 a second, 43.0 ->
-        // 45.6 fps (3 of 4 pairs, the 4th a tie), GPU thread split drain 432 -> 396 ms/s.
-        g_experiments[61].store(1, std::memory_order_relaxed);
-        // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
-        // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
-        // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
-        // played with it on from boot.
-        g_experiments[49].store(1, std::memory_order_relaxed);
-        // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
-        // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
-        g_experiments[39].store(3, std::memory_order_relaxed);
-        for (int n = 0; n < ExperimentCount; ++n) {
-            const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
-            if (const char* value = std::getenv(name.c_str())) {
-                g_experiments[n].store(std::atoi(value), std::memory_order_relaxed);
-            }
-        }
-        return true;
-    }();
-    static_cast<void>(loaded);
+/// EDEN_NX2_GPU_WAKE: docs/fritchii/switches.md.
+inline std::atomic<int> g_gpu_wake{-1};
+[[nodiscard]] inline bool GpuWake() {
+    return SwitchValue(g_gpu_wake, "EDEN_NX2_GPU_WAKE", 0) > 0;
 }
+/// EDEN_NX2_BACK_FENCE_STATS: docs/fritchii/switches.md.
+inline std::atomic<int> g_back_fence_stats{-1};
+[[nodiscard]] inline bool BackFenceStats() {
+    return SwitchValue(g_back_fence_stats, "EDEN_NX2_BACK_FENCE_STATS", 0) > 0;
+}
+/// EDEN_NX2_RUNAHEAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_runahead{-1};
+/// EDEN_NX2_RUNAHEAD_MS: docs/fritchii/switches.md.
+inline std::atomic<int> g_runahead_ms{-1};
+/// EDEN_NX2_BUFFER_CHURN_STATS: docs/fritchii/switches.md.
+inline std::atomic<int> g_buffer_churn_stats{-1};
+
+/// EDEN_NX2_CB_DIRECT: docs/fritchii/switches.md.
+inline std::atomic<int> g_cb_direct{-1};
+/// EDEN_NX2_RT_DEPTH_NOUPLOAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_rt_depth_noupload{-1};
+/// EDEN_NX2_FOLD_INSTANCE: docs/fritchii/switches.md.
+inline std::atomic<int> g_fold_instance{-1};
+/// EDEN_NX2_OOT_MACROS: docs/fritchii/switches.md.
+inline std::atomic<int> g_oot_macros{-1};
+/// EDEN_NX2_DRAW_PACKET: docs/fritchii/switches.md.
+inline std::atomic<int> g_draw_packet{-1};
+/// EDEN_NX2_BANK_SLOT_STATS: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_slot_stats{-1};
+/// EDEN_NX2_BANK_PAGE_TABLE: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_page_table{-1};
+/// EDEN_NX2_BANK_SLOTS: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_slots{-1};
+/// EDEN_NX2_BANK_SKIP_VERIFY: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_skip_verify{-1};
+/// EDEN_NX2_TEX_BANK_GEN: docs/fritchii/switches.md.
+inline std::atomic<int> g_tex_bank_gen{-1};
+/// EDEN_NX2_STORAGE_SYNC_SCAN: docs/fritchii/switches.md.
+inline std::atomic<int> g_storage_sync_scan{-1};
+/// EDEN_NX2_STORAGE_SYNC_MEMO: docs/fritchii/switches.md.
+inline std::atomic<int> g_storage_sync_memo{-1};
+/// FRITCHII_FILL_GEOM_KEEP (live, default 0): fable_b 25.2 cut e, the vertex and index binds'
+/// synchronize skipped while the range's tracker managers stay clean (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_fill_geom_keep{-1};
+/// FRITCHII_FILL_UPDATE_KEEP (live, default 0): fable_b 25.2 cut f, the index and vertex bindings
+/// kept while their registers, the mappings and the buffers are unchanged (1 on, 2 verify, 3 dry).
+inline std::atomic<int> g_fill_update_keep{-1};
+/// FRITCHII_HANDLE_PROG_KEEP (live, default 0): fable_b 25.2 cut g, E's handle program results kept
+/// while every word they read is unchanged (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_handle_prog_keep{-1};
+/// FRITCHII_FILL_BRACKET_LEAN (live, default 0): fable_b 25.2 cut h, E's tracker record only for the
+/// slots R can read, ring B's push without the window counters (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_fill_bracket_lean{-1};
+/// FRITCHII_REPORT_WAIT (live, default 0 = EXP30 decides, as before): a macro read's wait for
+/// pending query reports (FlushQueryResults). 1 = wait for those reports only (EXP30's wait),
+/// 2 = verify: that wait, then the old one, the words read after each compared (must be 0).
+inline std::atomic<int> g_report_wait{-1};
+/// FRITCHII_OCCL_LEAN (live, default 0; fritchii_occl_lean.h): a draw that writes no colour takes
+/// its pipeline without the pixel program when that program can change nothing else (1 on,
+/// 2 verify: siblings made and compared, the full pipeline draws, 3 dry: census and timer only).
+inline std::atomic<int> g_occl_lean{-1};
+/// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; set at each boot from a switch or the Occlusion
+/// speed-up setting): occlusion test draws store a flag instead of running a host query
+/// (2 verify: compared with the host queries, which still decide).
+inline std::atomic<int> g_occl_flag{-1};
+/// FRITCHII_TEST_DEVICE_LOSS (live, TEST, default 0): 1 = the next queue submission reports a
+/// device loss, so the report and the exit can be tested (docs/fritchii/switches.md).
+inline std::atomic<int> g_test_device_loss{0};
+/// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
+inline std::atomic<int> g_feed_memory_overlay{-1};
+/// FRITCHII_FEED_REARM: docs/fritchii/switches.md.
+inline std::atomic<int> g_feed_rearm{-1};
+/// FRITCHII_TEST_FEED_OFF (test only): docs/fritchii/switches.md.
+inline std::atomic<int> g_test_feed_off{-1};
+/// FRITCHII_TEST_SPLIT_RESTART (test only): docs/fritchii/switches.md.
+inline std::atomic<int> g_test_split_restart{-1};
+/// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.
+inline std::atomic<int> g_qmd_3d_patch{-1};
+/// FRITCHII_MEMSTAGE_THREAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_thread{-1};
+/// FRITCHII_MEMSTAGE_FULL_BINDS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_full_binds{-1};
+/// FRITCHII_MEMSTAGE_AHEAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_ahead{-1};
+/// FRITCHII_MEMSTAGE_LIST_DRAWS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_list_draws{-1};
+/// FRITCHII_MEMSTAGE_FAST_LOOP: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_fast_loop{-1};
+/// FRITCHII_MEMSTAGE_ENTRY_FAST: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_entry_fast{-1};
+/// FRITCHII_MEMSTAGE_CB_RUNS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_cb_runs{-1};
+/// FRITCHII_MEMSTAGE_GATHER: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_gather{-1};
+/// FRITCHII_MEMSTAGE_RELEASE: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_release{-1};
+/// FRITCHII_MEMSTAGE_PASS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_pass{-1};
+/// FRITCHII_MEMSTAGE_MARKS_AHEAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_marks_ahead{-1};
+/// FRITCHII_DELAY_MACRO_DRAIN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_macro_drain_us{-1};
+/// FRITCHII_DELAY_POLL_DRAIN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_poll_drain_us{-1};
+/// FRITCHII_DELAY_BEFORE: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_before{-1};
+/// FRITCHII_DELAY_E2C_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_e2c_us{-1};
+/// FRITCHII_DELAY_DISPATCH_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_dispatch_us{-1};
+/// FRITCHII_DELAY_DRAW_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_draw_us{-1};
+/// FRITCHII_DELAY_RUN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_us{-1};
+/// FRITCHII_DELAY_RUN_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_kind{-1};
+/// FRITCHII_DELAY_HANDOVER_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_handover_us{-1};
+/// FRITCHII_DELAY_HANDOVER_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_handover_kind{-1};
+/// FRITCHII_DELAY_RUNKIND_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_runkind_us{-1};
+/// FRITCHII_DELAY_RUNKIND_CLASS: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_runkind_class{-1};
+/// FRITCHII_NULL_RENDER: docs/fritchii/switches.md.
+inline std::atomic<int> g_null_render{-1};
+/// FRITCHII_DELAY_BACK_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_back_us{-1};
+/// FRITCHII_DELAY_BACK_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_back_kind{-1};
+/// FRITCHII_DELAY_FRONT_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_front_us{-1};
+/// FRITCHII_DELAY_FRONT_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_front_kind{-1};
+/// FRITCHII_DELAY_WORKER_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_worker_us{-1};
+/// FRITCHII_MEMSTAGE_RUN_SPIN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_run_spin_us{-1};
+/// FRITCHII_MEMSTAGE_SETUP_KEEP: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_setup_keep{-1};
+/// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
+inline std::atomic<int> g_front_ran_reads{-1};
+/// FRITCHII_DISPATCH_WALK_SUMMARY: docs/fritchii/switches.md.
+inline std::atomic<int> g_dispatch_walk_summary{-1};
+/// FRITCHII_DISPATCH_WAIT_CENSUS: docs/fritchii/switches.md.
+inline std::atomic<int> g_dispatch_wait_census{-1};
+/// FRITCHII_LAGGED_DEFER: docs/fritchii/switches.md.
+inline std::atomic<int> g_lagged_defer{-1};
+/// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.
+inline std::atomic<int> g_acquire_table_first{-1};
+/// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.
+inline std::atomic<int> g_e2c_census{-1};
+/// FRITCHII_KILL_RT_POOL: docs/fritchii/switches.md.
+inline std::atomic<int> g_kill_rt_pool{-1};
+/// FRITCHII_DEPTH_POOL_BIG: docs/fritchii/switches.md.
+inline std::atomic<int> g_depth_pool_big{-1};
+/// FRITCHII_HANG_REPORT_S: docs/fritchii/switches.md (default 5).
+inline std::atomic<int> g_hang_report_s{-1};
+/// FRITCHII_RAM_PREBUILT_KEEP: docs/fritchii/switches.md.
+inline std::atomic<int> g_ram_prebuilt_keep{-1};
+/// FRITCHII_DEPTH_POOL_RETRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_depth_pool_retry{-1};
+/// FRITCHII_VRAM_POOL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_pool_fit{-1};
+/// FRITCHII_VRAM_POOL_FLOOR: docs/fritchii/switches.md (0 off, 1 on).
+inline std::atomic<int> g_vram_pool_floor{-1};
+/// FRITCHII_VRAM_CRITICAL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_critical_fit{-1};
+/// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_report{-1};
+/// FRITCHII_VRAM_BUDGET_MODE: docs/fritchii/switches.md. 0 fixed, 1 vk, 2 os.
+inline std::atomic<int> g_vram_budget_mode{-1};
+/// FRITCHII_VRAM_BUDGET_MODE (live, default vk): where the texture cache's live budget cap comes
+/// from. The environment takes a name (fixed, vk, os) or its number; the debug server's `switch`
+/// takes the number.
+[[nodiscard]] inline int VramBudgetMode() {
+    int current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    if (current < 0) [[unlikely]] {
+        int initial = 1;
+        if (const char* value = std::getenv("FRITCHII_VRAM_BUDGET_MODE"); value != nullptr) {
+            const std::string_view text{value};
+            if (text == "fixed" || text == "off") {
+                initial = 0;
+            } else if (text == "vk") {
+                initial = 1;
+            } else if (text == "os") {
+                initial = 2;
+            } else {
+                initial = std::atoi(value);
+            }
+            initial = initial < 0 ? 0 : (initial > 2 ? 2 : initial);
+        }
+        int unset = -1;
+        if (g_vram_budget_mode.compare_exchange_strong(unset, initial,
+                                                       std::memory_order_relaxed)) {
+            BumpSwitchGeneration();
+        }
+        current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    }
+    return current;
+}
+/// FRITCHII_VRAM_HEADROOM_MIB: docs/fritchii/switches.md (0 = auto).
+inline std::atomic<int> g_vram_headroom_mib{-1};
+/// FRITCHII_TC_CRITICAL_ENFORCE: docs/fritchii/switches.md.
+inline std::atomic<int> g_tc_critical_enforce{-1};
+/// FRITCHII_TC_THRASH_GUARD: docs/fritchii/switches.md (0 off, 1 on, 2 counts only).
+inline std::atomic<int> g_tc_thrash_guard{-1};
+/// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
+inline std::atomic<int> g_vram_owners{-1};
+/// FRITCHII_VRAM_PACK: docs/fritchii/switches.md (0 off, 1 on, 2 auto = with the small card).
+inline std::atomic<int> g_vram_pack{-1};
+/// FRITCHII_VRAM_TRIM: docs/fritchii/switches.md (0 off, 1 auto, 2-100 percent of the budget).
+inline std::atomic<int> g_vram_trim{-1};
+/// FRITCHII_DEPTH_POOL_FIT: docs/fritchii/switches.md (bits: 1 size classes, 2 small depth pool).
+inline std::atomic<int> g_depth_pool_fit{-1};
+/// FRITCHII_VRAM_HOLES: docs/fritchii/switches.md (1 = hole and pinner histograms in the owners line).
+inline std::atomic<int> g_vram_holes{-1};
+/// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
+inline std::atomic<int> g_e2c_on_e{-1};
+/// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.
+inline std::atomic<int> g_stamp_read_pages{-1};
+/// FRITCHII_MACRO_SAME_DRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_macro_same_dry{-1};
+/// FRITCHII_MACRO_SEQ_DRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_macro_seq_dry{-1};
+/// FRITCHII_ACQUIRE_MET_BY: docs/fritchii/switches.md.
+inline std::atomic<int> g_acquire_met_by{-1};
+/// FRITCHII_GATHER_ONE_LOCK: docs/fritchii/switches.md.
+inline std::atomic<int> g_gather_one_lock{-1};
+/// FRITCHII_GATHER_EMPTY_TEST: docs/fritchii/switches.md.
+inline std::atomic<int> g_gather_empty_test{-1};
+/// FRITCHII_OOT_BYPASS_SAMPLED: docs/fritchii/switches.md.
+inline std::atomic<int> g_oot_bypass_sampled{-1};
+/// FRITCHII_SCALED_EXTENT_CAP: docs/fritchii/switches.md.
+inline std::atomic<int> g_scaled_extent_cap{-1};
+/// FRITCHII_SCALE_DEPTH_MAX: docs/fritchii/switches.md.
+inline std::atomic<int> g_scale_depth_max{-1};
+/// FRITCHII_FENCE_COMMIT_FAST: docs/fritchii/switches.md.
+inline std::atomic<int> g_fence_commit_fast{-1};
+/// FRITCHII_PIPELINE_KEY_HASH: docs/fritchii/switches.md.
+inline std::atomic<int> g_pipeline_key_hash{-1};
+/// FRITCHII_CB_WORDS_BLOCK: docs/fritchii/switches.md.
+inline std::atomic<int> g_cb_words_block{-1};
+/// FRITCHII_CB_MERGE (live, default 0; 1 = dry count): docs/fritchii/switches.md.
+inline std::atomic<int> g_cb_merge{-1};
+/// FRITCHII_BANK_CENSUS: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_census{-1};
+/// FRITCHII_BANK_FLAGGED: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_flagged{-1};
+/// FRITCHII_BANK_FLAGGED_SLOTS: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_flagged_slots{-1};
+/// FRITCHII_VERTEX_INPUT_COMPACT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vertex_input_compact{-1};
+/// FRITCHII_WORKER_SPIN: docs/fritchii/switches.md.
+inline std::atomic<int> g_worker_spin{-1};
+/// FRITCHII_SLOW_GPU: docs/fritchii/switches.md (vk_submit_times.h SlowGpu).
+inline std::atomic<int> g_slow_gpu{-1};
+/// FRITCHII_SLOW_GPU_MS: docs/fritchii/switches.md.
+inline std::atomic<int> g_slow_gpu_ms{-1};
+/// FRITCHII_BIND_ADDR_MEMO: docs/fritchii/switches.md.
+inline std::atomic<int> g_bind_addr_memo{-1};
+/// FRITCHII_STORE_MEMO: docs/fritchii/switches.md.
+inline std::atomic<int> g_store_memo{-1};
+/// FRITCHII_WRITE_REMARK (live, default 1): docs/fritchii/switches.md.
+inline std::atomic<int> g_write_remark{-1};
+/// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
+inline std::atomic<int> g_jit_hot_pack{-1};
+/// FRITCHII_ASYNC_REDRAWN (live, default 0, 1 on AMD's Windows driver or once the driver compiles
+/// prepared pipelines again; -1 = unset, see PipelineCache::AsyncRedrawnOn):
+/// docs/fritchii/switches.md.
+inline std::atomic<int> g_async_redrawn{-1};
+/// FRITCHII_ASYNC_COMPUTE_SKIP (live, default 0; 2 = dry): docs/fritchii/switches.md
+/// (renderer_vulkan/vk_async_compute_skip.h).
+inline std::atomic<int> g_async_compute_skip{-1};
+/// FRITCHII_COMPUTE_FAST_FIRST (live, default 0; 2 = test): docs/fritchii/switches.md
+/// (renderer_vulkan/vk_compute_pipeline.cpp).
+inline std::atomic<int> g_compute_fast_first{-1};
+/// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_occlusion_visible{-1};
+/// FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_unswizzle_in_place{-1};
+/// FRITCHII_KEEP_BLOCKS (live, MiB, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_keep_blocks{-1};
+/// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_LINK_STATS (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_link_stats{-1};
+/// FRITCHII_ZERO_UPLOAD (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_zero_upload{-1};
+/// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_HOSTTIMING_PRIORITY (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_priority{-1};
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_off_gpu{-1};
+/// FRITCHII_QUERY_FLUSH_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
+inline std::atomic<int> g_query_flush_dry{-1};
+/// FRITCHII_QUERY_LEND_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
+inline std::atomic<int> g_query_lend_dry{-1};
+/// FRITCHII_EXTENT_CENSUS (live, default 0): docs/fritchii/switches.md (buffer_cache.h).
+inline std::atomic<int> g_extent_census{-1};
+/// FRITCHII_EXTENT_CBUF (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_cbuf{-1};
+/// FRITCHII_EXTENT_SHARED (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_shared{-1};
+/// FRITCHII_EXTENT_GUARD (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_guard{-1};
+/// FRITCHII_STORE_FOOTPRINT (live 0/1/2/3 once armed: non-zero at boot; default 0): docs/fritchii/
+/// switches.md (store_footprint_live.h, buffer_cache.h).
+inline std::atomic<int> g_store_footprint_live{-1};
+/// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_gpu_priority{-1};
+/// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_thread_qos{-1};
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): docs/fritchii/switches.md (common/thread.cpp,
+/// KeepOffGpuCores).
+inline std::atomic<int> g_gpu_siblings_free{-1};
+/// FRITCHII_FOCUS_GRAB (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_focus_grab{-1};
+/// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_onef_raise_after_lend{-1};
+/// FRITCHII_PACE_FIX (live, default 0): docs/fritchii/switches.md (vk_host_pacer.cpp,
+/// vk_present_manager.cpp).
+inline std::atomic<int> g_pace_fix{-1};
+/// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
+inline std::atomic<int> g_onef{-1};
+/// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.
+inline std::atomic<int> g_onef_view{-1};
+/// FRITCHII_ONEF_BUILD (live): step 3, needs FRITCHII_ONEF_VIEW=1.
+inline std::atomic<int> g_onef_build{-1};
+/// FRITCHII_ONEF_UNLEND (live): step 4's draw kind mask, needs FRITCHII_ONEF_BUILD=1.
+inline std::atomic<int> g_onef_unlend{-1};
+/// FRITCHII_ONEF_VERIFY_EVERY (live): every Nth unlent draw forced lent and compared.
+inline std::atomic<int> g_onef_verify_every{-1};
+/// FRITCHII_ONEF_AHEAD (live): packets E may run ahead of R (0 = the ring).
+inline std::atomic<int> g_onef_ahead{-1};
+/// FRITCHII_ONEF_PIN (boot, default 1): R on PinnedRole::GpuMem's core.
+inline std::atomic<int> g_onef_pin{-1};
+/// FRITCHII_ONEF_E_PIPELINE (boot, default 1): fable_b 10.2 rule 3, E owns the pipeline lookup.
+inline std::atomic<int> g_onef_e_pipeline{-1};
+/// FRITCHII_ONEF_LEAN (boot, default 0): one follower at step 4 from boot with the verified
+/// configuration and no compares (docs/fritchii/switches.md).
+inline std::atomic<int> g_onef_lean{-1};
+/// FRITCHII_ONEF_QUERY_OPS (live, default 0): fable_b 11.1 item 1, queries without parking E.
+inline std::atomic<int> g_onef_query_ops{-1};
+/// FRITCHII_ONEF_WAITS_E (live, default 0): fable_b 11.2, the front's waits on game memory and
+/// lists read E's position.
+inline std::atomic<int> g_onef_waits_e{-1};
+/// FRITCHII_ONEF_INVAL_E (live, default 0): fable_b 11.1 item 2, the draw's invalidation on E.
+inline std::atomic<int> g_onef_inval_e{-1};
+/// FRITCHII_ONEF_COPY_E (live, default 0): fable_b 11.1 item 6's first piece, inline uploads on E.
+inline std::atomic<int> g_onef_copy_e{-1};
+/// FRITCHII_ONEF_POSTED (live, default 0): fable_b 12.2, posted is the default, lent the
+/// exception (docs/fritchii/switches.md).
+inline std::atomic<int> g_onef_posted{-1};
+/// FRITCHII_ONEF_GATHER_E (live, default 0): fable_b 12.3 fix 5, the guest-write gathers on E.
+inline std::atomic<int> g_onef_gather_e{-1};
+/// FRITCHII_ONEF_OP_INLINE (live, default 0): fable_b 13.4 group 1, inline uploads' buffer
+/// commands posted as ring B op packets.
+inline std::atomic<int> g_onef_op_inline{-1};
+/// FRITCHII_ONEF_OP_CLEAR (live, default 0): fable_b 13.4 group 3, clears as render ops.
+inline std::atomic<int> g_onef_op_clear{-1};
+/// FRITCHII_ONEF_TRACE (boot, default 0): fable_b 15.5's lend trace (one record per lend and
+/// per posted op) to the log folder.
+inline std::atomic<int> g_onef_trace{-1};
+/// FRITCHII_ONEF_OP_INVAL (live, default 0): fable_b 13.4, the invalidation site's buffer commands posted as op packets.
+inline std::atomic<int> g_onef_op_inval{-1};
+/// FRITCHII_ONEF_OP_LISTKEEP (live, default 0): fable_b 15.4, kept list words posted (E's buffer side, R's copy as a render op).
+inline std::atomic<int> g_onef_op_listkeep{-1};
+/// FRITCHII_ONEF_OP_DMA (live, default 0): fable_b 13.4, buffer-to-buffer DMA copies and clears on E, posted.
+inline std::atomic<int> g_onef_op_dma{-1};
+/// FRITCHII_ONEF_OP_DISPATCH (live, default 0): fable_b 13.4 group 6, compute dispatches as posted packets.
+inline std::atomic<int> g_onef_op_dispatch{-1};
+/// FRITCHII_ONEF_DISPATCH_RANGES (live, default 0): fable_b 27.9, a posted image-writing dispatch records its images' guest ranges on E (EXP10) instead of "may write anything".
+inline std::atomic<int> g_onef_dispatch_ranges{-1};
+/// FRITCHII_ONEF_FRONT_OPS (live, default 0): fable_b 27/28 S2-S3, six hot OoT macros sent as one
+/// op entry each (macro_ops_oot.h): 1 E expands the op, 2 + check, 3 E applies it directly, 4 + check.
+inline std::atomic<int> g_onef_front_ops{-1};
+/// FRITCHII_FRONT_CALL_LEAN (live, default 0): fable_b 27.2 B, the front's macro call set-up from
+/// switch values kept in the front state and a whole call's words read in the list (2 = + compare).
+inline std::atomic<int> g_front_call_lean{-1};
+/// FRITCHII_FRONT_LIST_LANE (live, default 0): fable_b 27.3, FrontWrite's same-value exit where the
+/// write starts: bit 1 command-list words, bit 2 handler writes (with FRITCHII_FRONT_CALL_LEAN),
+/// bit 4 verify instead of drop (must-be-0 count).
+inline std::atomic<int> g_front_list_lane{-1};
+/// FRITCHII_FRONT_OP_LEAN (live, default 0): fable_b2 1.4, a lean decide for FRITCHII_ONEF_FRONT_OPS'
+/// recorded writes (2 = + compared with the generic decide, must-be-0 count).
+inline std::atomic<int> g_front_op_lean{-1};
+/// FRITCHII_ONEF_DEAD_STORES (live, default 0): fable_b 27.7, 1 counts the 0xea0 trailing c[0][0x640]
+/// stores the next 0xea0 overwrites with nothing between (count only; dropping them is not built).
+inline std::atomic<int> g_onef_dead_stores{-1};
+/// FRITCHII_ONEF_FILL_COUNT (live, default 0): fable_b 28.5 S4, 1 counts bound constant buffer
+/// ranges whose bytes E reads differ from the front's noted upload words (count only).
+inline std::atomic<int> g_onef_fill_count{-1};
+/// FRITCHII_LIST_COPY_SKIP (live, default 0): fable_b 27.9 item 3, a CPU-written list entry skips the "list writers" wait when no queued writer's noted range touches its pages.
+inline std::atomic<int> g_list_copy_skip{-1};
+/// FRITCHII_ONEF_FLUSH_E (live, default 0): fable_b 17.3 (a), a flush E tests clean is not lent.
+inline std::atomic<int> g_onef_flush_e{-1};
+/// FRITCHII_ONEF_SYNC_MIRROR (live, default 0): fable_b 16.2's samples counter mirror, dry.
+inline std::atomic<int> g_onef_sync_mirror{-1};
+/// FRITCHII_ONEF_POST_FENCE (live, default 0): fable_b 16.3, clean sync points, references and
+/// forced fence releases posted.
+inline std::atomic<int> g_onef_post_fence{-1};
+/// FRITCHII_ONEF_R_SPIN / FRITCHII_ONEF_E_SPIN (live, pauses, default 8192 = as before): how long
+/// R (idle, waiting for packets) and E (parked, waiting) spin before they sleep (fable_b 23.3: R
+/// spins through half its time on a game core's sibling with FRITCHII_ONEF_PIN=2).
+inline std::atomic<int> g_onef_r_spin{-1};
+inline std::atomic<int> g_onef_e_spin{-1};
+/// FRITCHII_ONEF_LOOKUP_CHECK (live, default 0 = off; N = every Nth unlent draw): fable_b 18.4's
+/// "lookup programs", "lookup blend", "lookup vertex input" must-be-0s.
+inline std::atomic<int> g_onef_lookup_check{-1};
+/// FRITCHII_ONEF_DRY_RELEASE (live, default 0): fable_b 19.5 step 3's dry price.
+inline std::atomic<int> g_onef_dry_release{-1};
+/// FRITCHII_ONEF_SEM_E (live, default 0; with POST_FENCE): fable_b 19.4, 19.6 and 20.3, the
+/// sync point increments, the SignalFence callbacks and the payload writes on E.
+inline std::atomic<int> g_onef_sem_e{-1};
+/// FRITCHII_ONEF_SOFT_RELEASE_E (live, default 0): fable_b 22.3, a non-forced ReleaseFences
+/// (the command list end) is answered on E: with the fencing thread it does nothing.
+inline std::atomic<int> g_onef_soft_release_e{-1};
+/// FRITCHII_ONEF_POST_IDLE (live, default 0; with POST_FENCE): fable_b 22.3, WaitForIdle posted
+/// in 16.2's form: 1 only with R caught up, 2 also with R behind but no report landing due.
+inline std::atomic<int> g_onef_post_idle{-1};
+/// FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; with POST_FENCE): fence-flagged counter
+/// reports posted as the rasterizer's fences are.
+inline std::atomic<int> g_onef_post_fence_report{-1};
+/// FRITCHII_ONEF_SIGNAL_ON_R (live, default 0; with SEM_E): the guest-visible signals SEM_E
+/// would make at E's place happen at R's played place instead: a payload release is a posted op
+/// R writes when it plays it (E goes on), a fence-flagged payload is written by R in its posted
+/// fence, a sync point is signalled by R (posted fence kind 0), a SignalFence callback is lent.
+/// The guest then never sees work done that R has not recorded yet (AMD tester, test 4 §5c).
+inline std::atomic<int> g_onef_signal_on_r{-1};
+/// FRITCHII_ONEF_WAITS_R (live, default 0): the front's waits that FRITCHII_ONEF_WAITS_E (and
+/// SEM_E's lagged acquire check) end at E's position end at R's played position instead; the
+/// same as WAITS_E=0 plus SEM_E's lagged check on R, as one override over a preset.
+inline std::atomic<int> g_onef_waits_r{-1};
+/// FRITCHII_ONEF_MIRROR_STOP (live, default 0): "a samples report: E's mirror started, R's
+/// counter not" (R skipped a draw E's mirror counted). 1 = stop POST_FENCE for the session, as
+/// the opposite case does; 2 = when R skipped a draw with the samples count on since the last
+/// samples report, counted as explained (no must-be-0 note; E's mirror is a superset there).
+inline std::atomic<int> g_onef_mirror_stop{-1};
+/// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
+/// deferred into the next render pass's load op (the lean darkness of 15 Nov).
+inline std::atomic<int> g_onef_clear_nodefer{-1};
+/// FRITCHII_ONEF_UNLENT_RESET (live, default 0): fable_b 19 step 2, E runs the indirect reset
+/// test itself and lends only a draw that is one.
+inline std::atomic<int> g_onef_unlent_reset{-1};
+/// FRITCHII_ONEF_UNLENT_VALUES (live, default 0): fable_b 19 step 2, the engine hint, the macro
+/// mode and the constant buffer bindings go to R's view by value when they change.
+inline std::atomic<int> g_onef_unlent_values{-1};
+/// FRITCHII_ONEF_BIND_SEED (live, default 0): fable_b 19 step 2, the lent channel bind re-seeds
+/// R's view and E's tracking inside its own call (no lent draw after a bind).
+inline std::atomic<int> g_onef_bind_seed{-1};
+/// FRITCHII_ONEF_CARRY_OPS (live, default 0): fable_b 22.3 step 2, samples counter resets and
+/// reports ride in E's next packet instead of an op packet each.
+inline std::atomic<int> g_onef_carry_ops{-1};
+/// FRITCHII_ONEF_UNION_FILTER (live, default 0): fable_b 14.4 cut 5, E's invalidations test the
+/// union of R's page filters first.
+inline std::atomic<int> g_onef_union_filter{-1};
+/// FRITCHII_ONEF_CB_LEAN (live, default 0, bits): fable_b 23.1 cut 3, 1 = single constant buffer
+/// words through the block write, 2 = the stream-write guard tests the union filter first.
+inline std::atomic<int> g_onef_cb_lean{-1};
+/// FRITCHII_ONEF_KEY_KEEP (live, default 0): fable_b 23.1 cut 2, 1 = count the clean lookups
+/// with no watched word written since their snapshot (compare still run), 2 = skip the compare.
+inline std::atomic<int> g_onef_key_keep{-1};
+/// FRITCHII_ONEF_UBO_KEEP (live, default 0): fable_b 25.2 cut a, 1 = count the streamed uniform
+/// binds a keep could skip and verify them, 2 = bind the slot's copy again without the read.
+inline std::atomic<int> g_onef_ubo_keep{-1};
+/// FRITCHII_BANK_FAST (live, default 0): fable_b 25.2 cut b, a settled native bank of a slot the
+/// bank check skips whole is skipped before the check's switch reads and upkeep.
+inline std::atomic<int> g_bank_fast{-1};
+/// FRITCHII_FRONT_SPLIT_COUNT (live, default 0): the front split's step FS0, dry
+/// (fritchii_front_split.h): 1 = stage timers 1 in 64 list entries, the 2a/2c counts, the 0xe2c
+/// answers, front time per channel.
+inline std::atomic<int> g_front_split_count{-1};
+/// FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips the
+/// flush, the fill and the push of every draw it would fill (FrontSplit::NullFill).
+inline std::atomic<int> g_onef_null_fill{-1};
+/// FRITCHII_NOTED_SUMMARY (live, default 0): F4, GpuSplit::NotedWriteSince answers from the
+/// newest note position per page bucket before its walk: 1 = on, 2 = verify (both run, the walk
+/// answers), 3 = dry (both run, counted and timed 1 in 64).
+inline std::atomic<int> g_noted_summary{-1};
+/// FRITCHII_NOTED_FAST (live, default 0): GpuSplit::NotedWriteSince answers from per-page note
+/// chains instead of walking every note since: 1 = on, 2 = verify (both run, the walk answers,
+/// differences counted), 3 = dry (both run, counted and timed 1 in 64).
+inline std::atomic<int> g_noted_fast{-1};
+/// FRITCHII_FRONT_TRIM_RANGE (live, default 0; helper Z): GpuSplit::StampRangedRead takes each
+/// ranged write page's answer from a small per-page table instead of the one-entry caches that
+/// miss when pages take turns, and RangeLastWrite reads its environment switches from a member:
+/// 1 = on, 2 = verify (the old lookup answers, differences counted), 3 = dry (counted and timed
+/// 1 in 64).
+inline std::atomic<int> g_front_trim_range{-1};
+/// FRITCHII_FRONT_TRIM_QMD (live, default 0; helper Z): the front's QMD scheduler copy finds its
+/// overlays and upload shadows through compact address arrays instead of walking the large
+/// entries: 1 = on, 2 = verify (both run, the old walk answers, differences counted), 3 = dry
+/// (counted and timed 1 in 64).
+inline std::atomic<int> g_front_trim_qmd{-1};
+/// FRITCHII_FRONT_ASYNC_TABLE (live, default 0; helper AA): GpuSplit's async write table
+/// (counter reports and timed releases, read by RanReadCheck and SemaphoreReadableNow) kept per
+/// block of 8 neighbouring 16-byte slots, one cache line each, instead of one random line per
+/// slot: 1 = on, 2 = verify (both kept, the old table answers, differences counted), 3 = dry
+/// (both kept, counted and timed 1 in 64).
+inline std::atomic<int> g_front_async_table{-1};
+/// FRITCHII_TC_COLLECT_OVER (live, default 0; helper AG, port of zortos #1306): past the
+/// critical memory the collector deletes one more image a frame per 2 MiB over it (up to 1,024
+/// more), and from 1 GiB over also images unused for 3 frames instead of 10.
+inline std::atomic<int> g_tc_collect_over{-1};
+/// FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; helper AG, port of zortos #1731): the collector
+/// skips images it may not delete in this pass before it counts them against its budget, the
+/// old costly pass sorts by memory block fill too, and deletes keep the block fill current.
+inline std::atomic<int> g_tc_collect_evictable{-1};
+/// FRITCHII_SWEEP_SUPERSEDED (live, frames, default 0 = off; helper AG, port of Skitchii
+/// 16fb54111d): GPU-written images untouched for N frames whose memory a newer image of another
+/// shape covers are deleted without a download, checked every min(N, 30) frames.
+inline std::atomic<int> g_sweep_superseded{-1};
+/// FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16; helper AG, the part of zortos #1571 we lack):
+/// how many images the cold sweep deletes a frame at most.
+inline std::atomic<int> g_cold_sweep_max{-1};
+/// FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose
+/// whole memory newer GPU-written images cover (OoT's pot room: per-object D32 targets bump-
+/// allocated over last frames' ones, 20-300 dead ones under each new clear) is deleted without a
+/// download once untouched for N frames, by the cold sweep and by the collector, instead of
+/// living until EXP58's 60 frames or the collector's LRU reaching it.
+inline std::atomic<int> g_covered_retire{-1};
+/// FRITCHII_COLLECT_LAND_UNDER (live, default 0): EXP121's queued collector downloads still land
+/// when an overlapping image the GPU wrote since is still GPU-only (its own download lands over
+/// ours later, and landing it first drops ours); without it they were dropped and the image kept,
+/// then queued again by the next pass (pot room: 5,000 downloads per 600 frames, 99% dropped).
+inline std::atomic<int> g_collect_land_under{-1};
+/// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
+/// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
+/// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),
+/// 2 = verify (proved answers checked against the table and a sampled long shadow of notes),
+/// 3 = dry (counted and timed 1 in 64, with the front DMA read checks after the answer).
+inline std::atomic<int> g_noted_overflow{-1};
+/// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
+/// and the command list storage recycled to the submitter (dma_pusher.h).
+inline std::atomic<int> g_step_lean{-1};
+/// FRITCHII_REFRESH_LEAN (live, default 0): a list refresh translates each command page once
+/// (1), 2 = verify (dma_pusher.cpp, docs/fritchii/switches.md).
+inline std::atomic<int> g_refresh_lean{-1};
+/// FRITCHII_S4_COUNT (live, default 0): fable_b2 3.3's S4 counter, dry (fritchii_s4_count.h):
+/// 1 = count the fill's uniform binds by page, list entry and cause of change, 2 = also compare
+/// a sample of ranges at the front's list entry parse with E's bind in that entry.
+inline std::atomic<int> g_s4_count{-1};
+/// FRITCHII_BIND_SKIP (live, default 0): S4-lite (common/fritchii_bind_skip.h), a graphics uniform
+/// bind skips the read, compare, copy and bank check of a range whose bytes provably did not
+/// change since the same slot bound it: 1 = within a list entry, 2 = also across entries on
+/// tracked pages, 3 = 2 + verify, 4 = 1 + verify, 5 = dry (decide, count and time only).
+inline std::atomic<int> g_bind_skip{-1};
+/// FRITCHII_ESPLIT_COUNT (live, default 0): the E split's step S0, dry (fritchii_e_split.h):
+/// 1 = classify every ring entry E runs (E1, E2, join, lend), time 1 in 64, count the stalls,
+/// 2 = also build and consume the E1 to E2 records on E and compare E2's view at each hand-over,
+/// 3 = 2, and E's draw fill reads that view (SetInputsOverride) wherever it equals the engine.
+inline std::atomic<int> g_esplit_count{-1};
+/// FRITCHII_ESPLIT (boot, default 0): 1 = the E split's thread E2 (fritchii_e_split_thread.h).
+inline std::atomic<int> g_esplit{-1};
+/// FRITCHII_ESPLIT_DEPTH (live, default 0): E1's lead over E2 in draws; 0 = lockstep (S1).
+inline std::atomic<int> g_esplit_depth{-1};
+/// FRITCHII_ESPLIT_PIN (boot, default 0): where E1 and E2 run (fritchii_e_split_thread.h, S3).
+inline std::atomic<int> g_esplit_pin{-1};
+/// FRITCHII_ESPLIT_ASYNC_KINDS (live, default 7): the E2 entries the queued mode queues instead
+/// of joining (fritchii_e_split_thread.h): bit 0 memory stage cache calls, bit 1 the 3D methods
+/// that end in one rasterizer call, bit 2 compute engine entries.
+inline std::atomic<int> g_esplit_async_kinds{-1};
+/// FRITCHII_ESPLIT_IDLE (live, default 1): E1's batch end and idle without draining E2
+/// (fritchii_e_split_thread.h); 0 = joins as before.
+inline std::atomic<int> g_esplit_idle{-1};
+/// FRITCHII_ESPLIT_OWED (live, default 1): a draw's flush is owed by shader page writes and E1's
+/// own work, not by any cached write of an async job (fritchii_e_split_thread.h); 0 = S4's rule.
+inline std::atomic<int> g_esplit_owed{-1};
+/// FRITCHII_ESPLIT_CB_ASYNC (live, default 0; with DEPTH > 0): 1 = constant buffer words' memory
+/// half queued for E2 without a wait (fritchii_e_split_thread.h, S4).
+inline std::atomic<int> g_esplit_cb_async{-1};
+/// FRITCHII_ESPLIT_FLUSH_ASYNC (live, default 0; with DEPTH > 0): 1 = a draw's flush that is not
+/// owed goes after E1's lookup even with E2 idle (fritchii_e_split_thread.h, FlushPlace).
+inline std::atomic<int> g_esplit_flush_async{-1};
+/// FRITCHII_ESPLIT_BIND_BATCH (live, default 0; the queued mode): 1 = constant buffer binds packed
+/// into E2's records, same-value binds in a record dropped; 2 = verify; 3 = dry count
+/// (fritchii_e_split_thread.h).
+inline std::atomic<int> g_esplit_bind_batch{-1};
+/// FRITCHII_BARE_SSBO_MIB (live, default 16; EDEN_NX2_BARE_SSBO_MIB is read when it is unset):
+/// how far a storage binding of a bare pointer (no size word) reaches, in MiB, 8 to 1024. 8 (or
+/// 0) is the old cap. Written bindings stop at 16 at most. docs/fritchii/switches.md.
+inline std::atomic<int> g_bare_ssbo_mib{-1};
+/// FRITCHII_BARE_SSBO_CLAMP (live, default 0): a bare pointer's storage binding stops at the
+/// first device page with no host backing (read as zeros today); one with none at its start is
+/// the null binding. Not exact for written bindings (writes past the end are dropped, reads past
+/// it are robust-access values, not the zeros the host buffer held), hence off by default.
+inline std::atomic<int> g_bare_ssbo_clamp{-1};
+/// The bare pointer reach in bytes (FRITCHII_BARE_SSBO_MIB).
+[[nodiscard]] inline u32 BareStorageReach() {
+    int mib = g_bare_ssbo_mib.load(std::memory_order_relaxed);
+    if (mib < 0) [[unlikely]] {
+        const char* const alias = std::getenv("EDEN_NX2_BARE_SSBO_MIB");
+        mib = SwitchValue(g_bare_ssbo_mib, "FRITCHII_BARE_SSBO_MIB",
+                          alias != nullptr ? std::atoi(alias) : 16);
+    }
+    return static_cast<u32>(mib < 8 ? 8 : (mib > 1024 ? 1024 : mib)) << 20;
+}
+/// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
+[[nodiscard]] inline bool LightTableArrays() {
+    static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
+    return on;
+}
+
+/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP<ExperimentCount - 1>, live
+/// through the debug server. What each one does: docs/fritchii/switches.md; the defaults:
+/// src/common/fritchii_switch_defaults.cpp (LoadExperiments).
+inline constexpr int ExperimentCount = 128;
+inline std::atomic<int> g_experiments[ExperimentCount]{};
+/// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
+/// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in
+/// the 5.7 -> 5.8.4 sampler comparison, 2026-11-11).
+inline std::atomic<bool> g_experiments_loaded{false};
+
+/// Sets the experiments' defaults and reads EDEN_NX2_EXP<n> from the environment, once (a
+/// function-local static: thread-safe, and safe from any static initializer). Defined in
+/// src/common/fritchii_switch_defaults.cpp, compiled into common, since common (thread.cpp)
+/// and tools that link only common read Experiment() too.
+void LoadExperiments();
 
 /// The value of experiment switch `n` (EDEN_NX2_EXP<n>), 0 unless set.
 [[nodiscard]] inline int Experiment(int n) {
-    LoadExperiments();
+    if (!g_experiments_loaded.load(std::memory_order_acquire)) [[unlikely]] {
+        LoadExperiments();
+    }
     return g_experiments[n].load(std::memory_order_relaxed);
 }
 
 /// The live switch called `name`, or null.
-[[nodiscard]] inline std::atomic<int>* FindSwitch(std::string_view name) {
-    if (constexpr std::string_view prefix = "EDEN_NX2_EXP";
-        name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix) {
-        int n = 0;
-        for (const char c : name.substr(prefix.size())) {
-            if (c < '0' || c > '9') {
-                return nullptr;
-            }
-            n = n * 10 + (c - '0');
-        }
-        if (n >= ExperimentCount) {
-            return nullptr;
-        }
-        LoadExperiments();
-        return &g_experiments[n];
-    }
-    if (name == "EDEN_NX2_LIST_VERIFY") {
-        return &g_list_verify;
-    }
-    if (name == "EDEN_NX2_DMA_WAIT_WRITERS") {
-        return &g_dma_wait_writers;
-    }
-    if (name == "EDEN_NX2_SEM_FAST") {
-        return &g_sem_fast;
-    }
-    if (name == "EDEN_NX2_DMA_SNAPSHOT") {
-        return &g_dma_snapshot;
-    }
-    if (name == "EDEN_NX2_LOOP_SKIP") {
-        return &g_loop_skip;
-    }
-    if (name == "EDEN_NX2_HOST_PACE") {
-        return &g_host_pace;
-    }
-    if (name == "EDEN_NX2_ARB_SPIN") {
-        return &g_arb_spin;
-    }
-    if (name == "EDEN_NX2_IDLE_PAUSE") {
-        return &g_idle_pause;
-    }
-    return nullptr;
-}
+[[nodiscard]] std::atomic<int>* FindSwitch(std::string_view name);
 
 struct CaptureRequest {
     u64 id;

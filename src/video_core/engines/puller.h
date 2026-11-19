@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -86,6 +85,30 @@ public:
         std::chrono::steady_clock::time_point last_drain{};
         /// Suspended after the fence release of a word read current (EXP12's resume counts).
         bool readable_release{};
+        /// How CanResumeAcquire first found it met (FenceResumeRoute in puller.cpp), for EXP12's
+        /// resume histogram; RouteUnset until then. A resume asks CanResumeAcquire twice
+        /// (Scheduler::ResumePending, then ResumeAcquire): the first answer is kept.
+        static constexpr u8 RouteUnset = 0xFF;
+        u8 resume_route{RouteUnset};
+        /// Counted once in the 100 ms pending count (FenceWriterStats).
+        bool long_pending{};
+        /// EXP12=5/6: the ring position its next lagged check waits for (the position sent at
+        /// the previous check; at the suspension for the first).
+        u64 lagged_target{};
+        /// FRITCHII_LAGGED_DEFER: its last lagged check was put off (the back short of the
+        /// target), for the line's count of checks run later.
+        bool lagged_deferred{};
+        /// EXP13 on: the QMD copy's count of the back's releases at the suspension, so the
+        /// resume can ask which release the back made for the word since ("Acquire resumes met
+        /// by"); ~0 when not taken.
+        u64 back_sequence{~u64{0}};
+        /// fable_stage_levelpoints 18.4 rows 7 (GPU profile on): the ring position sent at the
+        /// suspension and when it began (time stamp ticks; 0: not timed), for the price line's
+        /// split of the wait (FritchiiPrice::NoteFrontWait).
+        u64 price_target{};
+        u64 price_start{};
+        /// FRITCHII_ONEF_DRY_RELEASE: the front's stalled time at the suspension.
+        u64 dry_stall{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -187,5 +210,15 @@ private:
 
 #undef ASSERT_REG_POSITION
 };
+
+/// FRITCHII_LAGGED_DEFER (puller.cpp, front only): suspended acquires' lagged checks put off
+/// while the back was short of their targets. The front loop clears them before it polls the
+/// channels and, when they are pending where it would sleep, waits for the smallest target
+/// there instead (the wait the checks would have made, now with nothing else to do).
+namespace LaggedDefer {
+void Clear();
+[[nodiscard]] bool Pending();
+void WaitBeforeSleep();
+} // namespace LaggedDefer
 
 } // namespace Tegra::Engines

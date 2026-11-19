@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -59,6 +58,23 @@ public:
 
     /// Erase channel's state.
     void EraseChannel(s32 id);
+
+    /// One follower (vk_one_follower_draw.cpp): the 3D engine this cache reads, swapped for R's
+    /// view engine while R plays an unlent draw and back after (BindToChannel sets it as before).
+    /// Returns the one it had.
+    Tegra::Engines::Maxwell3D* ExchangeMaxwell3D(Tegra::Engines::Maxwell3D* engine) noexcept {
+        Tegra::Engines::Maxwell3D* const previous = maxwell3d;
+        maxwell3d = engine;
+        return previous;
+    }
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH): the compute engine, swapped for R's view of it
+    /// while R plays a posted dispatch and back after. Returns the one it had.
+    Tegra::Engines::KeplerCompute* ExchangeKeplerCompute(
+        Tegra::Engines::KeplerCompute* engine) noexcept {
+        Tegra::Engines::KeplerCompute* const previous = kepler_compute;
+        kepler_compute = engine;
+        return previous;
+    }
 
     Tegra::MemoryManager* GetFromID(size_t id) const {
         std::unique_lock<std::mutex> lk(config_mutex);

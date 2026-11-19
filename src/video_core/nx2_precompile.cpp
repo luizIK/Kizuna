@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Fritchii: the shader precompile system was written by Frizti for Fritchii. Additional terms
+// under GPLv3 section 7 apply to Frizti's material here (attribution "Shader precompile system by
+// Frizti (Fritchii)" must be kept): see LICENSES/Fritchii-Additional-Terms.txt. The recipe files
+// (*.nx2recipe) are not GPL; using them in other builds needs Frizti's direct permission (Discord
+// DM): see LICENSES/Fritchii-Recipe.txt.
 
 #include "video_core/nx2_precompile.h"
 

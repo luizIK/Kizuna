@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds a Switch 2 title's precompiled pipeline file (precompiled.fork-v<N>.nx2prep) from the
-# game's own files and the Lichii disk caches recorded while playing it, and its recipe to share.
+# game's own files and the Fritchii disk caches recorded while playing it, and its recipe to share.
 #
 # usage: run_pipeline.sh CACHE.bin [CACHE.bin...]
 #
@@ -12,7 +12,7 @@
 #   NX2_TOOL     nx2-precompile executable (default: nx2-precompile on PATH)
 #   NX2_K        predicted render states per vertex/pixel pair (default 4)
 #   NX2_CACHE_VERSION  pipeline cache version, the file name's v<N> (default: the one NX2_TOOL was
-#                built with; it must match the Lichii build that reads the file)
+#                built with; it must match the Fritchii build that reads the file)
 #   PYTHON       Python 3.11+ (default python)
 set -euo pipefail
 

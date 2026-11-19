@@ -13,7 +13,10 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "common/fritchii_page_flags.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace VideoCommon {
 
@@ -30,7 +33,7 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     requires std::is_trivially_copyable_v<typename R::StreamUniformRef>;
     { runtime.LastStreamUniformRef() } -> std::same_as<typename R::StreamUniformRef>;
     runtime.RebindStreamUniform(runtime.LastStreamUniformRef(), size);
-    { runtime.CurrentTick() } -> std::convertible_to<u64>;
+    { runtime.StreamEpoch() } -> std::convertible_to<u64>;
 };
 
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
@@ -52,13 +55,37 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
         const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
         return value != nullptr && value[0] != '0';
     }();
-    return enabled;
+    // EXP93 (live, 0 = as the env says, 1 = on): the same, switchable in one session. Both modes
+    // compare against the slot's own bytes, so a change between two binds is safe.
+    return enabled || VideoCore::Nx2Debug::Experiment(93) != 0;
+}
+
+/// EXP115 (live; 0 = off, 1 = after 8 misses, N > 1 = after N misses): a slot whose last binds
+/// all found no reusable copy (bytes that change every bind, such as per-draw matrices) copies
+/// straight into the stream buffer for its next UniformDirectBinds binds, without the compares
+/// and the extra copy into the reuse store, then tries reuse again.
+[[nodiscard]] inline u32 UniformMissStreak() noexcept {
+    const int value = VideoCore::Nx2Debug::Experiment(115);
+    return value <= 0 ? 0U : (value == 1 ? 8U : static_cast<u32>(value));
+}
+inline constexpr u16 UniformDirectBinds = 64;
+
+/// EXP116 (live; 0 = 4096 bytes, as before; N = N bytes, 256 to 16384): uniform buffers up to
+/// this size are streamed (and reused) instead of going through the cached buffers (BufferCache
+/// TickFrame's skip size, Vulkan only). OoT's skinned models bind 7-13 KiB bone palettes about
+/// 8 times a frame each, with the same bytes within the frame.
+[[nodiscard]] inline u32 UniformStreamMaxBytes() noexcept {
+    const int value = VideoCore::Nx2Debug::Experiment(116);
+    if (value <= 0) {
+        return 4096U;
+    }
+    return static_cast<u32>(value < 256 ? 256 : (value > 16384 ? 16384 : value));
 }
 
 template <class Ref>
 class UniformStreamReuse {
 public:
-    static constexpr u32 MaxBytes = 4096; // BufferCache's DEFAULT_SKIP_CACHE_SIZE
+    static constexpr u32 MaxBytes = 16384; // the most EXP116 allows (UniformStreamMaxBytes)
     static constexpr size_t NumStages = 5;
     static constexpr size_t NumSlots = 18; // Maxwell constant buffers per stage
     /// One private copy per slot, then the copies keyed by guest range (range reuse): NumSets
@@ -69,7 +96,8 @@ public:
     static constexpr size_t NumCopies = NumPrivate + NumSets * NumWays;
 
     /// Bytes copied to a stream allocation, and that allocation: `ref` was filled from exactly
-    /// these bytes on scheduler tick `tick`. The bytes change only together with the serial.
+    /// these bytes at stream epoch `tick` (the runtime's StreamEpoch: the scheduler's tick, or the
+    /// count of packet tick closes). The bytes change only together with the serial.
     struct Copy {
         Ref ref{};
         u64 tick{};
@@ -82,6 +110,8 @@ public:
     struct Slot {
         u32 copy{};
         u32 serial{}; ///< the copy's serial then; 0: none
+        u16 misses{}; ///< binds in a row that found no reusable copy (EXP115)
+        u16 direct{}; ///< binds left that copy straight to the stream buffer (EXP115)
     };
 
     UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
@@ -137,10 +167,56 @@ inline void ResetUniformStreamReuse() noexcept {
     }
 }
 
+/// FRITCHII_ONEF_UBO_KEEP (fable_b 25.2 cut a): binds the (stage, cbuf `index`) slot's last
+/// stream copy again without reading or comparing guest memory, when that copy is still the
+/// slot's, `size` bytes, and made in the current stream epoch (as BindSmallUniformReusing's own
+/// rebind requires). The caller has proved the guest bytes equal the copy's. False: nothing
+/// bound, the caller binds the usual way.
+template <class Runtime>
+[[nodiscard]] bool RebindUniformSlotCopy(Runtime& runtime, size_t stage, u32 index, u32 size) {
+    if constexpr (!StreamUniformReusable<Runtime>) {
+        return false; // a runtime without stream copies (OpenGL): the usual bind
+    } else {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || stage >= Reuse::NumStages || index >= Reuse::NumSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.serial == 0 || slot.direct != 0) {
+        return false;
+    }
+    const typename Reuse::Copy& copy = reuse.copies[slot.copy];
+    if (copy.serial != slot.serial || copy.size != size || copy.tick != runtime.StreamEpoch()) {
+        return false;
+    }
+    runtime.RebindStreamUniform(copy.ref, size);
+    ++reuse.rebinds;
+    slot.misses = 0;
+    return true;
+    }
+}
+
+/// The serial of the copy the slot names (0: none): FRITCHII_ONEF_UBO_KEEP=1's verify reads it
+/// before and after a bind (a new serial means the bind found other bytes).
+template <class Ref>
+[[nodiscard]] u32 UniformSlotSerial(size_t stage, u32 index) noexcept {
+    using Reuse = UniformStreamReuse<Ref>;
+    if (stage >= Reuse::NumStages || index >= Reuse::NumSlots) {
+        return 0;
+    }
+    const Reuse& reuse = UniformStreamReuseState<Ref>();
+    const typename Reuse::Slot& slot = reuse.slots[stage][index];
+    // A slot in its direct run (EXP115) drops its copy at its next bind: nothing to check.
+    return slot.serial != 0 && slot.direct == 0 && reuse.copies[slot.copy].serial == slot.serial
+               ? slot.serial
+               : 0;
+}
+
 /// Binds the small uniform buffer at `device_addr` for (stage, cbuf `index`) through the stream
 /// buffer, binding an earlier allocation again when it holds the same bytes and was made in the
 /// current command buffer: the slot's previous copy or, with `range_reuse` (EDEN_NX2_EXP17,
-/// from zortos293/Lichii#641), a copy of the same guest range made by any stage or slot. Every
+/// from a ported change), a copy of the same guest range made by any stage or slot. Every
 /// reuse compares the guest bytes with the copy's. Returns false (nothing bound) when the buffer
 /// does not qualify, so the caller binds it the classic way.
 template <class Runtime, class DeviceMemory>
@@ -148,12 +224,34 @@ template <class Runtime, class DeviceMemory>
                                            size_t stage, u32 index, u32 binding_index,
                                            u64 device_addr, u32 size, bool range_reuse = false) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
-    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+    // UniformStreamMaxBytes: misaligned binds of any size stream too; above 4096 bytes they keep
+    // being copied without reuse unless EXP116 raises the limit.
+    if (size == 0 || size > UniformStreamMaxBytes() || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
         return false;
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    const u32 miss_streak = UniformMissStreak();
+    if (slot.direct != 0 && miss_streak != 0) {
+        // EXP115: a slot whose bytes change every bind: one copy, no compares. Its old copy is
+        // dropped (serial 0), so the next reuse attempt starts clean.
+        --slot.direct;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        slot.serial = 0;
+        return true;
+    }
+    // fable_stage_levelpoints 18.4 row 1 (GPU profile on, the back): the guest read and the
+    // compare below are timed and the bind classed by verdict (FritchiiPrice::NoteUniformBind);
+    // its range's write generations are read first. Off: the profile's test and a branch.
+    const bool price = FritchiiPrice::On() && GpuSplit::OnBackThread();
+    u64 price_sum = 0;
+    u64 price_start = 0;
+    if (price) [[unlikely]] {
+        price_sum = Common::PriceGenSum(device_addr, size);
+        price_start = FritchiiPrice::Ticks();
+    }
     // The bytes are compared in guest memory with EDEN_NX2_UBO_INPLACE, else in a scratch copy.
     // The stream allocation is filled from the copy's bytes, never from guest memory, so a later
     // reuse finds exactly the bytes that were uploaded. Test memories have no GetSpan.
@@ -168,7 +266,7 @@ template <class Runtime, class DeviceMemory>
         device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
         guest = reuse.scratch.data();
     }
-    const u64 tick = runtime.CurrentTick();
+    const u64 tick = runtime.StreamEpoch();
     const auto same_bytes = [&](size_t copy_index) {
         return reuse.copies[copy_index].size == size &&
                std::memcmp(reuse.Bytes(copy_index), guest, size) == 0;
@@ -186,6 +284,11 @@ template <class Runtime, class DeviceMemory>
     if (slot.serial != 0 && reuse.copies[slot.copy].serial == slot.serial) {
         slot_copy = slot.copy;
         slot_same = same_bytes(slot_copy);
+    }
+    if (price) [[unlikely]] {
+        FritchiiPrice::NoteUniformBind(static_cast<u32>(stage * 32 + index), device_addr, size,
+                                       slot_same, FritchiiPrice::Ticks() - price_start,
+                                       price_sum);
     }
     if (in_place) {
         namespace Profile = Nx2Profile;
@@ -244,9 +347,16 @@ template <class Runtime, class DeviceMemory>
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
     std::memcpy(span.data(), reuse.Bytes(target), size);
     copy.ref = runtime.LastStreamUniformRef();
-    // After the allocation: the tick the stream region is tagged with is the one current now.
-    copy.tick = runtime.CurrentTick();
-    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+    // After the allocation: the epoch the stream region is tagged in is the one current now.
+    copy.tick = runtime.StreamEpoch();
+    // EXP115: a slot whose bytes differed from its copy again counts a miss (`slot` still holds
+    // the previous count here); enough in a row and it copies directly for a while.
+    const u16 misses = slot_same || miss_streak == 0 ? u16{0} : static_cast<u16>(slot.misses + 1);
+    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial, misses, 0};
+    if (miss_streak != 0 && misses >= miss_streak) {
+        slot.misses = 0;
+        slot.direct = UniformDirectBinds;
+    }
     return true;
 }
 

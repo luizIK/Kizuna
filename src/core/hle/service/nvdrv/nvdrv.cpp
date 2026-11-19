@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -134,6 +133,7 @@ Module::Module(Core::System& system)
     Tegra::Nx2ClearSemaphoreRegions();
     Tegra::Nx2ClearSparseRegions();
     Tegra::Nx2ClearGpuWrittenPages();
+    Tegra::Nx2SemaphoreWaiters::Get().Clear();
     Devices::g_nx2_driver = false;
     Tegra::g_nx2_ampere = false;
     Core::g_nx2_present_count = 0;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -1468,7 +1467,7 @@ void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
         return;
     }
 
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
+    // Reject solid NCZ (.nsz without -B): Fritchii only supports block-compressed NCZ.
     if (!ContainerIsFullyBlockCompressed(nsp)) {
         LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
         return;

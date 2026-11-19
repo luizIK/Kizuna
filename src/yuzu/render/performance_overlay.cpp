@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/frame_budget.h"
 #include "core/perf_stats.h"
 #include "performance_overlay.h"
+#include "qt_common/config/uisettings.h"
 #include "ui_performance_overlay.h"
+#include "yuzu/render/frame_budget_view.h"
 
 #include "main_window.h"
 
@@ -15,7 +18,7 @@
 #include <QPainter>
 #include <QValueAxis>
 
-// TODO(crueter): Reset samples when user changes turbo, slow, etc.
+// TODO: Reset samples when user changes turbo, slow, etc.
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     : QWidget(parent), m_mainWindow{parent}, ui(new Ui::PerformanceOverlay) {
     ui->setupUi(this);
@@ -84,6 +87,13 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     m_dlssLabel->setVisible(false);
     ui->verticalLayout->insertWidget(0, m_dlssLabel);
 
+    // frame times, under the fps line
+    m_timesLabel = new QLabel(this);
+    m_timesLabel->setFont(font);
+    m_timesLabel->setStyleSheet(QStringLiteral("color: white;"));
+    ui->verticalLayout->insertWidget(ui->verticalLayout->indexOf(m_fpsChartView), m_timesLabel);
+    applyTimes();
+
     // pos/stats
     resetPosition(m_mainWindow->pos());
     connect(parent, &MainWindow::positionChanged, this, &PerformanceOverlay::resetPosition);
@@ -91,7 +101,28 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
 }
 
 PerformanceOverlay::~PerformanceOverlay() {
+    Common::FrameBudget::SetWanted(false);
     delete ui;
+}
+
+void PerformanceOverlay::applyTimes() {
+    m_timesOn = UISettings::values.perf_overlay_times.GetValue();
+    m_timesLabel->setText(QStringLiteral("-"));
+    m_timesLabel->setVisible(m_timesOn);
+    adjustSize();
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(m_timesOn && isVisible());
+}
+
+void PerformanceOverlay::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(m_timesOn);
+}
+
+void PerformanceOverlay::hideEvent(QHideEvent* event) {
+    QWidget::hideEvent(event);
+    Common::FrameBudget::SetWanted(false);
 }
 
 void PerformanceOverlay::resetPosition(const QPoint& _) {
@@ -103,6 +134,31 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                      const VideoCore::ShaderNotify& shaders) {
     m_dlssLabel->setText(m_mainWindow->DlssStatusText());
     m_dlssLabel->setVisible(!m_mainWindow->DlssStatusText().isEmpty());
+    if (UISettings::values.perf_overlay_times.GetValue() != m_timesOn) {
+        applyTimes();
+    } else if (m_timesOn && isVisible()) {
+        using Common::FrameBudget::Group;
+        using FrameBudgetView::Ms;
+        using FrameBudgetView::Percent;
+        const auto view =
+            FrameBudgetView::Make(Common::FrameBudget::Take(), results.average_game_fps);
+        const auto ms_of = [&](Group group) { return Ms(view.ms[static_cast<size_t>(group)]); };
+        const QString gpu = view.gpu_unsupported
+                                ? tr("GPU n/a")
+                                : tr("GPU %1 ms (%2)").arg(Ms(view.gpu_ms), Percent(view.gpu_share));
+        QString threads = tr("Front %1  Back %2  Game %3")
+                              .arg(ms_of(Group::Front), ms_of(Group::Back), ms_of(Group::Game));
+        if (view.ms[static_cast<size_t>(Group::Render)] >= 0) {
+            threads += tr("  Render %1").arg(ms_of(Group::Render));
+        }
+        QString text = tr("%1  CPU %2").arg(gpu, Percent(view.cpu_share)) + QLatin1Char('\n') +
+                       threads + tr(" ms");
+        const QString limit = FrameBudgetView::LimitText(view.limit);
+        if (!limit.isEmpty()) {
+            text += QLatin1Char('\n') + limit;
+        }
+        m_timesLabel->setText(text);
+    }
     auto fps = results.average_game_fps;
     if (!std::isnan(fps)) {
         // don't sample measurements < 3 fps because they are probably outliers or freezes

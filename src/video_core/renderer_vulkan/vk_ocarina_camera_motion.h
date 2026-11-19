@@ -24,6 +24,16 @@ class StagingBufferPool;
 /// DLSS availability, and native when FSR 3.1 is unsupported on the device.
 [[nodiscard]] VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device);
 
+/// Whether OoT's FSR draws the game's own 2560x1440 picture instead of a 4K one this session
+/// (FRITCHII_FSR_OUTPUT; the display is looked at once).
+[[nodiscard]] bool OcarinaFsrOutputsGameSize(VideoCommon::OcarinaUpscaleBackend backend);
+
+/// oot_upscale_output as this session starts with it: the setting checked against the card's
+/// main video memory heap and the small card profile (VideoCommon::ResolveOcarinaUpscaleOutput).
+/// `vram` gets the heap's size (0 = unknown).
+[[nodiscard]] VideoCommon::OcarinaOutputSetting OcarinaUpscaleOutput(const Device& device,
+                                                                     u64* vram = nullptr);
+
 struct OcarinaActorMesh {
     std::vector<u8> vertices;
     std::vector<u16> indices;
@@ -43,7 +53,8 @@ public:
     [[nodiscard]] bool EvaluationFailed() const;
     /// Save the 1440p temporal scene copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);
-    /// Composite the HUD from the guest image over the matching 4K scene.
+    /// Composite the HUD from the guest image over the matching upscaled scene, at the size of
+    /// the last recorded output (4K, or the one the player picked: oot_upscale_output).
     void Composite4k(VkImageView native_composite, u64 frame);
     /// Copy the scene colour once the fog is drawn, before the glows and particles that have no
     /// motion vectors of their own.
@@ -53,6 +64,8 @@ public:
     void MarkEffects(VkImageView scene, u64 frame);
     VkImage CompositedImage() const;
     VkImageView CompositedView() const;
+    /// The composited image's size (Composite4k).
+    VkExtent2D CompositedExtent() const;
 
     /// Queue motion, temporal evaluation and guest writeback for one frame. A false return leaves
     /// the guest dispatch in charge. The scheduler checks EvaluationFailed before skipping it.

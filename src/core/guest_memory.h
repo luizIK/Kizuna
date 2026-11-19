@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -211,9 +210,16 @@ public:
                     this->m_memory->WriteBlockUnsafe(this->m_addr, this->data(),
                                                      this->size_bytes());
                 }
-            } else if constexpr ((FLAGS & GuestMemoryFlags::Safe) ||
-                                 (FLAGS & GuestMemoryFlags::Cached)) {
-                this->m_memory->InvalidateRegion(this->m_addr, this->size_bytes());
+            } else {
+                // EXP92 (uniform keeps, tier 2): bytes were stored in place through the span;
+                // a memory that keeps uniform keeps informed is told after they landed.
+                if constexpr (requires { this->m_memory->NoteHostStore(u64{}, size_t{}); }) {
+                    this->m_memory->NoteHostStore(this->m_addr, this->size_bytes());
+                }
+                if constexpr ((FLAGS & GuestMemoryFlags::Safe) ||
+                              (FLAGS & GuestMemoryFlags::Cached)) {
+                    this->m_memory->InvalidateRegion(this->m_addr, this->size_bytes());
+                }
             }
         }
     }

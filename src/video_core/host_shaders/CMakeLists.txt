@@ -91,6 +91,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp32.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_occl_flag.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_quad_indexed.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_turbo_mode.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_uint8.comp
@@ -99,18 +100,19 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader_mobile.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader_mobile_edge_direction.frag
-    ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_optical_flow.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_frame_interpolation.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/dlss_network_probe.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_camera_motion.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/sim_gpu_burn.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_color.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_effects.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_effects_base.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_bias.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_motion_view.comp
 )
 
 if (HAIKUOS)

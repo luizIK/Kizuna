@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -56,6 +55,11 @@ vk::Pipeline CreateWrappedPremultipliedBlendingPipeline(
     const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
     std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
 vk::Pipeline CreateWrappedCoverageBlendingPipeline(
+    const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
+    std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
+/// Straight alpha "over": colour and alpha both src * a + dst * (1 - a). At a = 1 the source is
+/// written as is (alpha 1), at a = 0 the target keeps its colour and alpha.
+vk::Pipeline CreateWrappedOverBlendingPipeline(
     const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
     std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
 VkWriteDescriptorSet CreateWriteDescriptorSet(std::vector<VkDescriptorImageInfo>& images,

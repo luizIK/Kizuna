@@ -16,7 +16,7 @@ struct ZSTD_DDict_s;
 
 namespace VideoCommon::ShaderWarm {
 
-/// Readers for the NVN2 shader containers found in Switch 2 game files. Port of the PR #214
+/// Readers for the NVN2 shader containers found in Switch 2 game files. Port of the
 /// Python extractor (tools/nx2/extract_static_shaders.py, shader_archive.py,
 /// shader_containers.py): every check and every error case is kept, so both find the same
 /// programs.

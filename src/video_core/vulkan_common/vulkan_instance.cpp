@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
@@ -16,6 +15,7 @@
 #include <ranges>
 #include <vulkan/vulkan_core.h>
 #include "core/frontend/emu_window.h"
+#include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -85,8 +85,15 @@ namespace {
     if (AreExtensionsSupported(dld, properties, std::array{VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME}))
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 #endif
-    if (enable_validation && AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
+    // FRITCHII_VA_REPORT=1 (a device loss test tool) needs VK_EXT_debug_utils too: the device's
+    // VK_EXT_device_address_binding_report reports through its messenger.
+    if ((enable_validation || VaReport::Requested()) &&
+        AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME})) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (VaReport::Requested()) {
+            VaReport::NoteInstanceReady();
+        }
+    }
 #ifdef EGLANTINE_STREAMLINE
     // What NVIDIA's DLSS asks for through Streamline, where available. Static: the returned
     // pointers must outlive this call.

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -11,6 +10,7 @@
 #include <immintrin.h>
 #endif
 
+#include "common/lowend_sim.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
@@ -140,7 +140,7 @@ private:
     KAddressArbiter::ThreadTree* m_tree{};
 };
 
-/// EDEN_NX2_ARB_SPIN (live, VideoCore::Nx2Debug::g_arb_spin; off by default, #641 uses 8):
+/// EDEN_NX2_ARB_SPIN (live, VideoCore::Nx2Debug::g_arb_spin; off by default, the ported change uses 8):
 /// microseconds a thread about to wait on an address first watches the word. Capped at 1 ms.
 s64 ArbSpinMicroseconds() {
     const int value =
@@ -149,6 +149,7 @@ s64 ArbSpinMicroseconds() {
 }
 
 void SpinPause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     _mm_pause();
 #elif defined(__aarch64__)
@@ -156,7 +157,7 @@ void SpinPause() {
 #endif
 }
 
-/// From zortos293/Lichii#641. Guest job systems hand work between threads through these waits
+/// A ported change. Guest job systems hand work between threads through these waits
 /// many times a frame, and the signal often comes a few microseconds later. Before the thread
 /// sleeps (scheduler lock, context switch, then the signaler's EndWait, interrupt and switch
 /// back), it watches the word briefly without any lock. If the word stops satisfying the wait,

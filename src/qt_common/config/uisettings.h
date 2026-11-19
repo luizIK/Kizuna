@@ -148,6 +148,20 @@ struct Values {
     // The Fritchii version whose "What's new" window was shown (yuzu/fritchii/whats_new.cpp).
     Setting<std::string> fritchii_whats_new_seen{linkage, {}, "fritchii_whats_new_seen",
                                                  Category::Ui};
+    // The major version ("v6") that asked to clear the old shader caches (yuzu/fritchii/
+    // cache_cleanup.cpp), whatever the answer.
+    Setting<std::string> fritchii_cache_cleanup_asked{linkage, {}, "fritchii_cache_cleanup_asked",
+                                                      Category::Ui};
+    // The major version that turned OoT's Max Resolution add-on off once, and the one that asked
+    // whether to turn it on (yuzu/fritchii/max_resolution.cpp), whatever the answer.
+    Setting<std::string> fritchii_maxres_off{linkage, {}, "fritchii_maxres_off", Category::Ui};
+    Setting<std::string> fritchii_maxres_asked{linkage, {}, "fritchii_maxres_asked", Category::Ui};
+    // The major version ("v6") that showed "Good to know" (yuzu/fritchii/known_issues.cpp).
+    Setting<std::string> fritchii_known_issues_shown{linkage, {}, "fritchii_known_issues_shown",
+                                                     Category::Ui};
+    // The one-time offer of "OoT occlusion speed-up: Full" (yuzu/fritchii/occlusion_offer.cpp):
+    // empty, "pending" (a game could use it), or the answer. Never asked again once answered.
+    Setting<std::string> fritchii_occl_offer{linkage, {}, "fritchii_occl_offer", Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
@@ -232,6 +246,13 @@ struct Values {
 
     // perf overlay
     Setting<bool> show_perf_overlay{linkage, false, "show_perf_overlay", Category::UiGameList};
+    // View > Frame Times: the overlay's GPU, CPU and thread time rows (common/frame_budget.h).
+    Setting<bool> perf_overlay_times{linkage, true, "perf_overlay_times", Category::UiGameList};
+
+    // Profiling mode (Help > Profiling Mode): the profiling switches from the next start on and a
+    // banner on the game. main.cpp reads it straight from qt-config.ini ([UI] profiling_mode)
+    // before the settings load: keep the name and the category.
+    Setting<bool> profiling_mode{linkage, false, "profiling_mode", Category::Ui};
 
     // Size & File Types Column
     Setting<bool> show_size{linkage, true, "show_size", Category::UiGameList};
@@ -256,7 +277,7 @@ void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 34> default_hotkeys;
+extern const std::array<Shortcut, 33> default_hotkeys;
 
 } // namespace UISettings
 

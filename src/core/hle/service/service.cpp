@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/scope_exit.h"
@@ -15,10 +14,13 @@
 #include <string_view>
 #include <chrono>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
@@ -32,6 +34,122 @@
 #include "core/reporter.h"
 
 namespace Service {
+
+namespace {
+
+// Calls in flight for the hang report (FRITCHII_HANG_REPORT_S): one slot per thread that handles
+// service calls, claimed at its first call. A call stores five words on entry and one on exit,
+// relaxed, with the OS's coarse tick (Nx2Hitch::StallTickNs) for its start: nothing a game's
+// thousands of calls a second would notice. The report reads them without a lock; a torn read
+// only mixes two calls' fields in one diagnostic line.
+struct CallSlot {
+    std::atomic<const char*> service{};
+    std::atomic<const char*> function{}; ///< null until the handler is found
+    std::atomic<u32> command{};
+    std::atomic<u8> phase{}; ///< 0 no call, 1 waiting for the service's lock, 2 in the handler
+    std::atomic<u64> since{};
+};
+constexpr size_t CallSlotCount = 128;
+std::array<CallSlot, CallSlotCount> g_call_slots;
+std::atomic<size_t> g_call_slots_claimed{};
+thread_local CallSlot* t_call_slot{};
+thread_local bool t_call_slot_claimed{};
+
+CallSlot* ThisThreadCallSlot() {
+    if (!t_call_slot_claimed) {
+        t_call_slot_claimed = true;
+        const size_t index = g_call_slots_claimed.fetch_add(1, std::memory_order_relaxed);
+        if (index < CallSlotCount) {
+            t_call_slot = &g_call_slots[index];
+        }
+    }
+    return t_call_slot;
+}
+
+/// The call's slot for its scope; a call made from inside another one (same thread) restores
+/// the outer call's fields when it ends.
+class CallInFlight {
+public:
+    CallInFlight(const char* service, u32 command) : slot{ThisThreadCallSlot()} {
+        if (slot == nullptr) {
+            return;
+        }
+        outer_service = slot->service.load(std::memory_order_relaxed);
+        outer_function = slot->function.load(std::memory_order_relaxed);
+        outer_command = slot->command.load(std::memory_order_relaxed);
+        outer_phase = slot->phase.load(std::memory_order_relaxed);
+        outer_since = slot->since.load(std::memory_order_relaxed);
+        slot->service.store(service, std::memory_order_relaxed);
+        slot->function.store(nullptr, std::memory_order_relaxed);
+        slot->command.store(command, std::memory_order_relaxed);
+        slot->since.store(Common::Nx2Hitch::StallTickNs(), std::memory_order_relaxed);
+        slot->phase.store(1, std::memory_order_release);
+    }
+    ~CallInFlight() {
+        if (slot == nullptr) {
+            return;
+        }
+        slot->service.store(outer_service, std::memory_order_relaxed);
+        slot->function.store(outer_function, std::memory_order_relaxed);
+        slot->command.store(outer_command, std::memory_order_relaxed);
+        slot->since.store(outer_since, std::memory_order_relaxed);
+        slot->phase.store(outer_phase, std::memory_order_release);
+    }
+    CallInFlight(const CallInFlight&) = delete;
+    CallInFlight& operator=(const CallInFlight&) = delete;
+
+    void InHandler() {
+        if (slot != nullptr) {
+            slot->phase.store(2, std::memory_order_release);
+        }
+    }
+
+private:
+    CallSlot* slot;
+    const char* outer_service{};
+    const char* outer_function{};
+    u32 outer_command{};
+    u8 outer_phase{};
+    u64 outer_since{};
+};
+
+/// The handler's name, once InvokeRequest found it (no-op outside a tracked call).
+void NoteCallFunction(const char* name) {
+    if (t_call_slot != nullptr) {
+        t_call_slot->function.store(name, std::memory_order_relaxed);
+    }
+}
+
+} // Anonymous namespace
+
+std::string DescribeCallsInFlight() {
+    const u64 now = Common::Nx2Hitch::StallTickNs();
+    const size_t claimed =
+        (std::min)(g_call_slots_claimed.load(std::memory_order_relaxed), CallSlotCount);
+    std::string text;
+    size_t calls = 0;
+    for (size_t i = 0; i < claimed; ++i) {
+        const CallSlot& slot = g_call_slots[i];
+        const u8 phase = slot.phase.load(std::memory_order_acquire);
+        if (phase == 0) {
+            continue;
+        }
+        const char* const service = slot.service.load(std::memory_order_relaxed);
+        const char* const function = slot.function.load(std::memory_order_relaxed);
+        const u64 since = slot.since.load(std::memory_order_relaxed);
+        ++calls;
+        text += fmt::format("{}{} command {} ({}) {} for {:.1f} s", text.empty() ? "" : "; ",
+                            service != nullptr ? service : "?",
+                            slot.command.load(std::memory_order_relaxed),
+                            function != nullptr ? function : "no handler name",
+                            phase == 1 ? "waiting for the service's lock" : "in its handler",
+                            now > since ? static_cast<double>(now - since) / 1e9 : 0.0);
+    }
+    return fmt::format("{} ({} service threads tracked{})", calls == 0 ? "none" : text, claimed,
+                       g_call_slots_claimed.load(std::memory_order_relaxed) > CallSlotCount
+                           ? ", more threads than slots: some untracked"
+                           : "");
+}
 
 /// @brief Creates a function string for logging, complete with the name (or header code, depending
 /// on what's passed in) the port name, and all the cmd_buf arguments.
@@ -175,13 +293,18 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
     buf.push_back('}');
 
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
-    UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
-    if (auto_stub) {
-        LOG_WARNING(Service, "Using auto stub fallback (repeats of this command are not logged)");
-        IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
-        rb.Push(ResultSuccess);
-        PushStubZeroes(rb);
+    if (!auto_stub) {
+        UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
+        return;
     }
+    // An auto-stubbed command gets a reply, so it is logged rather than asserted: with debug
+    // asserts on, the assert broke before the reply was sent, at the first such command of every
+    // Switch 2 program (#1238).
+    LOG_CRITICAL(Service, "Unknown / unimplemented {}", fmt::to_string(buf));
+    LOG_WARNING(Service, "Using auto stub fallback (repeats of this command are not logged)");
+    IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
+    rb.Push(ResultSuccess);
+    PushStubZeroes(rb);
 }
 
 void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
@@ -191,6 +314,7 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
         return ReportUnimplementedFunction(ctx, info);
 
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
+    NoteCallFunction(info->name);
     // EDEN_NX2_IPC_TRACE=1 logs every dispatched command and the result word it returned.
     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
     if (ipc_trace) {
@@ -219,6 +343,7 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
         return ReportUnimplementedFunction(ctx, info);
 
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
+    NoteCallFunction(info->name);
     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
     if (ipc_trace) {
         const auto* w = ctx.CommandBuffer();
@@ -264,7 +389,9 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
+    CallInFlight in_flight{service_name, ctx.GetCommand()};
     const auto guard = LockService();
+    in_flight.InHandler();
     SCOPE_EXIT {
         const auto* cmd_buf = ctx.CommandBuffer();
         u32 result_word = 0;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -88,10 +87,31 @@ struct RuntimeInfo {
     VaryingState previous_stage_stores;
     /// Fragment stage after a mesh program: generic inputs it writes per primitive.
     std::bitset<32> per_primitive_generics{};
+    /// Fragment stage after the mesh emulation's vertex shader: per_primitive_generics arrive
+    /// flat from each primitive's own vertices instead of as PerPrimitiveEXT inputs.
+    bool per_primitive_flat{};
+    /// Fragment stage after the mesh emulation's vertex shader: PrimitiveId is the flat input at
+    /// this generic location, not the built-in. ~0 when the mesh program writes no PrimitiveId.
+    u32 primitive_id_location{~0U};
+    /// Last pre-rasterization stage: generic outputs the fragment stage reads screen-linear.
+    /// They are written times Position.w and the fragment stage reads them perspective-correct
+    /// times FragCoord.w, so clipping a primitive close to the camera interpolates them right.
+    std::bitset<32> noperspective_outputs{};
+    /// Fragment stage: the previous stage writes noperspective_outputs (not a mesh program).
+    bool scaled_noperspective_inputs{};
     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// FRITCHII_OCCL_FLAG (fragment, Vulkan): early fragment tests, and at the start of main a
+    /// store of uvec2(4096, 0) through the buffer device address in push constant bytes 40..47
+    /// (the open occlusion query's flag slot). Only for programs that cannot discard, write
+    /// depth or the sample mask, store, or use subgroup operations (the caller checks).
+    bool occl_flag_store{};
+    /// FRITCHII_OCCL_FLAG pre-pass (fragment, Vulkan): as occl_flag_store, but the store is at
+    /// the end of main (each exit, after the alpha test and every discard: a demoted invocation's
+    /// store is dropped), for a draw with depth and stencil writes off whose program discards.
+    bool occl_flag_store_at_end{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};

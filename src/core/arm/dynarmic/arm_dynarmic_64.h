@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include "common/container/unordered_map.h"
 
 #include <dynarmic/interface/A64/a64.h>
@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "core/arm/arm_interface.h"
+#include "core/arm/dynarmic/host_routines.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -61,10 +62,20 @@ public:
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
+    /// Fritchii host routines (host_routines.h): the hooked entries of this process, worked out
+    /// once (the first code read or breakpoint of any thread using these callbacks).
+    const HostRoutines::Sites& HostSites();
+    /// The word to compile at vaddr: `instruction`, or a host routine's BRK.
+    u32 HostCode(u64 vaddr, u32 instruction);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
+    /// Other threads invalidate by bumping code_generation instead of writing last_code_addr:
+    /// a page copy that raced an invalidation is refetched at the next read, where before
+    /// the owner's store of last_code_addr could overwrite the reset and keep old code.
+    u32 cached_code_generation = 0;
+    std::atomic<u32> code_generation{0};
     /// Warm compiles read code straight from memory: other threads reset last_code_addr
     /// (InvalidateCacheRange) and the page copy may hold another page (fable52_answer_12).
     bool direct_code_reads = false;
@@ -76,6 +87,8 @@ public:
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
+    std::once_flag m_host_sites_once;
+    HostRoutines::Sites m_host_sites{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;
@@ -106,6 +119,7 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
     std::size_t WarmCompile(std::span<const u64> keys, const std::atomic<bool>& stop) override;
+    std::size_t PackHotCode(const std::atomic<bool>& stop) override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;

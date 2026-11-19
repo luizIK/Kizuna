@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <optional>
@@ -47,7 +47,7 @@ enum class LoadCallbackStage {
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 
-/// EXP33 (zortos293/Lichii#337): set while the query cache signals the fence that writes a
+/// EXP33: set while the query cache signals the fence that writes a
 /// fence-flagged report, so the fence manager makes that fence and delays its operation even when
 /// it is empty (FenceManager::SignalFence).
 inline thread_local bool g_signaling_query_report_fence = false;
@@ -85,11 +85,39 @@ public:
     /// Signal disabling of a uniform buffer
     virtual void DisableGraphicsUniformBuffer(size_t stage, u32 index) = 0;
 
+    /// FRITCHII_ESPLIT_BIND_BATCH=2: a hash of what a uniform bind of `stage`, `index` writes
+    /// (the buffer cache's binding and bind memo); 0 where the renderer does not track it.
+    [[nodiscard]] virtual u64 GraphicsUniformBindState(size_t stage, u32 index) const {
+        (void)stage;
+        (void)index;
+        return 0;
+    }
+
     /// Signal a GPU based semaphore as a fence
     virtual void SignalFence(std::function<void()>&& func) = 0;
 
     /// Send an operation to be done after a certain amount of flushes.
     virtual void SyncOperation(std::function<void()>&& func) = 0;
+
+    /// EXP119 (fritchii_report_runs.h): as SyncOperation, and returns a stamp that names this
+    /// operation as the last one queued. 0: not supported (the operation was still queued).
+    virtual u64 SyncOperationStamped(std::function<void()>&& func) {
+        SyncOperation(std::move(func));
+        return 0;
+    }
+
+    /// EXP119: runs append(context) under the operation list's lock, only while the operation
+    /// `stamp` names is still the last one queued and not taken by a fence. False: nothing ran.
+    virtual bool AppendToLastOperation([[maybe_unused]] u64 stamp,
+                                       [[maybe_unused]] void (*append)(void*),
+                                       [[maybe_unused]] void* context) {
+        return false;
+    }
+
+    /// EXP119=2: as SyncOperation, but the stamp of the last queued operation stays valid.
+    virtual void SyncOperationKeepStamp(std::function<void()>&& func) {
+        SyncOperation(std::move(func));
+    }
 
     /// Signal a GPU based syncpoint as a fence
     virtual void SignalSyncPoint(u32 value) = 0;
@@ -134,6 +162,39 @@ public:
     /// submitted before it), waiting for the host GPU if it must. Any thread: the reading one
     /// before it reads, and the GPU's side before it writes guest memory there.
     virtual void FinishRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
+
+    /// EDEN_NX2_EXP72: waits (bounded) until fence download `sequence` is in guest memory;
+    /// false = not done in time, flush as usual.
+    virtual bool WaitFenceDownload([[maybe_unused]] u64 sequence) {
+        return false;
+    }
+
+    /// Switch 2, list draws (nx2_list_draw.h): whether DrawIndirect draws
+    /// from an array draw's two GPU-written list words (IndirectParams::list_words) without
+    /// reading them back.
+    [[nodiscard]] virtual bool Nx2ListDrawSupported() const {
+        return false;
+    }
+    /// Switch 2, list dispatches (nx2_list_dispatch.h): whether DispatchCompute dispatches from a
+    /// grid at KeplerCompute::GetIndirectComputeAddress that only the host GPU has.
+    [[nodiscard]] virtual bool Nx2ListDispatchSupported() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool MemStageQmd([[maybe_unused]] Tegra::MemoryManager& memory,
+                                           [[maybe_unused]] GPUVAddr address,
+                                           [[maybe_unused]] std::span<u32, 64> out) {
+        return false;
+    }
+    /// Switch 2, list draws and list dispatches, on the split's back at the list's place in the
+    /// stream: keeps a copy of the `count` (up to 3) words at `address` as `keep_id`.
+    virtual void Nx2KeepListWords([[maybe_unused]] u64 keep_id, [[maybe_unused]] GPUVAddr address,
+                                  [[maybe_unused]] u32 count) {}
+    /// On the split's back: the words kept as `keep_id`, waiting for the host GPU to copy them if
+    /// it must. False if none are kept (or a later copy took their place).
+    [[nodiscard]] virtual bool Nx2ReadKeptListWords([[maybe_unused]] u64 keep_id,
+                                                    [[maybe_unused]] std::span<u32> words) {
+        return false;
+    }
 
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
@@ -219,6 +280,21 @@ public:
     /// Sync memory between guest and host.
     virtual void InvalidateGPUCache() = 0;
 
+    /// Maxwell3D's invalidate_texture_data_cache: the game's collected CPU writes into the
+    /// caches, then a wait for idle. One call, so the Vulkan side can find it run already at its
+    /// entry (the memory stage, FRITCHII_MEMSTAGE_GATHER).
+    virtual void InvalidateTextureDataCache() {
+        InvalidateGPUCache();
+        WaitForIdle();
+    }
+
+    /// The memory stage (FRITCHII_MEMSTAGE_PASS, the back in a served entry): the game's
+    /// collected writes taken and their buffer half applied on the memory stage's thread, the
+    /// other caches' half here. False: not done (the caller gathers as usual).
+    virtual bool GatherOnStage() {
+        return false;
+    }
+
     /// Unmap memory range
     virtual void UnmapMemory(DAddr addr, u64 size) = 0;
 
@@ -301,6 +377,19 @@ public:
 
     virtual void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                           std::span<const u8> memory) = 0;
+
+    /// EXP124: an inline upload's data words flushed at once (Upload::State, a macro's words):
+    /// [address, address + copy_size) written as the calls the words would have made one by one,
+    /// AccelerateInlineToMemory of 4 bytes from `address` each (the last one maybe shorter). The
+    /// default makes those calls; a backend may write a run of words in one call where the
+    /// result is the same.
+    virtual void AccelerateInlineWords(GPUVAddr address, size_t copy_size,
+                                       std::span<const u8> memory) {
+        for (size_t offset = 0; offset < copy_size; offset += sizeof(u32)) {
+            const size_t size = (std::min)(sizeof(u32), copy_size - offset);
+            AccelerateInlineToMemory(address + offset, size, memory.subspan(offset, size));
+        }
+    }
 
     /// Initialize disk cached resources for the game being emulated
     virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

@@ -58,7 +58,7 @@ void GameCarousel::UpdateIconSize() {
     int heightMargin = 0;
     int widthMargin = 80;
 
-    // TODO(crueter): get rid of this nonsense
+    // TODO: get rid of this nonsense
     if (UISettings::values.show_game_name) {
         switch (icon_size) {
         case 128:

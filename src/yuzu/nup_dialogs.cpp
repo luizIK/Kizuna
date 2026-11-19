@@ -439,7 +439,12 @@ NupProgressDialog::NupProgressDialog(const QString& operation, const QString& ti
     auto* title_label = new QLabel(title.isEmpty() ? operation : title);
     QFont font = title_label->font();
     font.setBold(true);
-    font.setPointSizeF(font.pointSizeF() * 1.2);
+    // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+    if (font.pointSizeF() > 0) {
+        font.setPointSizeF(font.pointSizeF() * 1.2);
+    } else if (font.pixelSize() > 0) {
+        font.setPixelSize(static_cast<int>(font.pixelSize() * 1.2 + 0.5));
+    }
     title_label->setFont(font);
     title_label->setWordWrap(true);
     status = new QLabel(tr("Preparing..."));

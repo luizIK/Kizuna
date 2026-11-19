@@ -104,5 +104,5 @@ inline std::pair<Service::Set::FirmwareVersionFormat, Result> GetFirmwareVersion
     return {firmware_data, result};
 }
 
-// TODO(crueter): GET AS STRING
+// TODO: GET AS STRING
 }

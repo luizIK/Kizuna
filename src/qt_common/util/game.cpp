@@ -136,7 +136,7 @@ bool CreateShortcutLink(const std::filesystem::path& shortcut_path, const std::s
 
 bool MakeShortcutIcoPath(const u64 program_id, const std::string_view game_file_name,
                          std::filesystem::path& out_icon_path) {
-    // Get path to Yuzu icons directory & icon extension
+    // Get path to the icons directory & icon extension
     std::string ico_extension = "png";
 #if defined(_WIN32)
     out_icon_path = Common::FS::GetEdenPath(Common::FS::EdenPath::IconsDir);
@@ -368,7 +368,7 @@ void ResetMetadata(bool show_message) {
 
 // Uhhh //
 
-// TODO(crueter): Make QtCommon::Shortcut
+// TODO: Make QtCommon::Shortcut
 // Messages in pre-defined message boxes for less code spaghetti
 inline constexpr bool CreateShortcutMessagesGUI(ShortcutMessages imsg, const QString& game_title) {
     int result = 0;
@@ -405,7 +405,7 @@ inline constexpr bool CreateShortcutMessagesGUI(ShortcutMessages imsg, const QSt
 void CreateShortcut(const std::string& game_path, const u64 program_id,
                     const std::string& game_title_, const ShortcutTarget& target,
                     std::string arguments_, const bool needs_title) {
-    // Get path to Eden executable
+    // Get path to the Fritchii executable
     std::filesystem::path command = GetEdenCommand();
 
     // Shortcut path
@@ -486,7 +486,7 @@ void CreateShortcut(const std::string& game_path, const u64 program_id,
     if (CreateShortcutMessagesGUI(ShortcutMessages::Fullscreen, qgame_title)) {
         arguments = "-f " + arguments;
     }
-    const std::string comment = fmt::format("Start {:s} with the Eden Emulator", game_title);
+    const std::string comment = fmt::format("Start {:s} with Fritchii", game_title);
     const std::string categories = "Game;Emulator;Qt;";
     const std::string keywords = "Switch;Nintendo;";
 
@@ -534,7 +534,7 @@ void CreateHomeMenuShortcut(ShortcutTarget target) {
     auto qlaunch_applet_nca = bis_system->GetEntry(QLaunchId, FileSys::ContentRecordType::Program);
     const auto game_path = qlaunch_applet_nca->GetFullPath();
 
-    // TODO(crueter): Make this use the Eden icon
+    // TODO: Make this use the Fritchii icon
     CreateShortcut(game_path, QLaunchId, "Switch Home Menu", target, "-qlaunch", false);
 }
 

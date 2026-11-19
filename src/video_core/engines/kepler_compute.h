@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -24,6 +23,8 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_reader.h"
 #include "video_core/split_write_tracker.h"
 #include "video_core/textures/texture.h"
 
@@ -36,6 +37,9 @@ class GpuSplit;
 }
 namespace VideoCommon::QmdPrediction {
 struct Record;
+}
+namespace VideoCommon::OotNetwork {
+struct BypassState;
 }
 
 namespace Tegra {
@@ -261,22 +265,46 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// EXP124: a macro's inline upload words (GpuSplit::MacroWords), each called as its
+    /// MacroWrite was; where the flush writes them in place, one flush for them all
+    /// (Upload::State, AccelerateInlineWords).
+    void CallMacroWords(Core::System& system, u32 method, const u32* words, u32 amount) override;
+
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
     }
 
     bool IsNativeMode() const { return native_mode; }
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH): R's view of a channel's compute engine, which
+    /// runs no method, takes E's native mode by value for a played dispatch (nothing else of
+    /// SetNativeMacroMode applies to a view).
+    void SetViewNativeMode(bool native) noexcept { native_mode = native; }
+    /// One follower, the same view: the indirect arguments' address E's dispatch had (or none).
+    void SetViewIndirect(std::optional<GPUVAddr> address) noexcept { indirect_compute = address; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
+    /// Native program key of the dispatch being processed (0 until its shader is known).
+    u64 current_native_key{};
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
+    /// List dispatches (nx2_list_dispatch.h): the call of macro `method`
+    /// whose three parameters are the GPU-written words at `address`. If the macro only stores a
+    /// dispatch's grid, the front stores a marker instead and the dispatch that carries it takes
+    /// its grid from `address` on the host GPU. False when the words have to be read.
+    bool FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method, GPUVAddr address,
+                               const Nx2ListDispatch::ListReader& reader);
+    /// List guard (nx2_list_dispatch.h): where the channel keeps the list of the grid the data RAM's
+    /// marker stands for (the 3D engine's, which shares the data RAM).
+    void SetGridMarker(Nx2ListDispatch::GridMarker* marker) {
+        grid_marker = marker;
+    }
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -322,10 +350,15 @@ private:
                             u32 count, u64 position) const;
     /// EXP13=2: the data_upload words batched since (FrontState::upload_batch) to the copy.
     void FrontFlushUploads(VideoCommon::GpuSplit& split, FrontState& state) const;
+    /// EXP124: the data_upload words a macro emitted since (FrontState::macro_upload_words) as
+    /// one entry, then the notes their MacroWrites made (the upload's range, EXP13's batch).
+    void FrontSendUploadWords(VideoCommon::GpuSplit& split, FrontState& state);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    /// FRITCHII_OOT_BYPASS_SAMPLED: No sharpening from the image the output pass samples.
+    bool BypassOotNetworkSampled(VideoCommon::OotNetwork::BypassState& state, u64 native_key);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
@@ -430,8 +463,17 @@ private:
         u32 copy_size;
         bool was_dirty;
     };
+    static constexpr size_t MaxPendingUploads = 4096;
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+    Nx2ListDispatch::GridMarker* grid_marker{};
+    /// List dispatches, back: the lists taken last, by keep id (the low bits of a marker's x
+    /// carry it), and where each one's grid is.
+    struct ListDispatchEntry {
+        u64 keep_id{};
+        GPUVAddr address{};
+    };
+    std::array<ListDispatchEntry, 1024> list_dispatches{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

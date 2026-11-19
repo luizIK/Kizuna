@@ -11,18 +11,20 @@
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
 
-// EDEN_NX2_EXP49, async read-back (port of zortos293/Lichii#1028's core, 0b83798bf6): a guest CPU
+// EDEN_NX2_EXP49, async read-back (a port of the original's core): a guest CPU
 // read of GPU-written buffer memory (GPU::OnCPURead) has the GPU thread record and submit the
 // downloads and go on. The reading thread waits for that submission and writes the bytes to guest
 // memory itself (BufferCache::FinishReadDownloads). Before, the GPU thread waited for the host
 // GPU (Scheduler::Finish) with the buffer cache's lock held, and the reader waited for it.
 //
-// Not ported: #1028's early downloads (pages read after each GPU write downloaded right behind the
+// Not ported: the original's early downloads (pages read after each GPU write downloaded right behind the
 // write), its EDEN_NX2_READ_CHECK verify mode and the macro DMA read changes.
 namespace VideoCore::AsyncReadback {
 
 /// Set on a guest thread while GPU::OnCPURead writes its downloads to guest memory.
 inline thread_local bool t_reading{};
+/// The reads this thread waited for (EDEN_NX2_GUEST_THREAD_STATS tells read-backs apart by it).
+inline thread_local u64 t_reads{};
 
 [[nodiscard]] inline u64 Now() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -56,6 +58,12 @@ struct Counters {
     std::atomic<u64> clear_landings{};
     std::atomic<u64> clear_waits{};
     std::atomic<u64> clear_wait_ns{};
+    /// Where an async read's time goes (fable52_answer_after7778 5): from the request until the
+    /// GPU thread ran its flush (queued behind the ring), then in WaitForHostRead until the worker
+    /// submitted the download, then on the host GPU until the fence signalled.
+    std::atomic<u64> to_flushed_ns{};
+    std::atomic<u64> to_submitted_ns{};
+    std::atomic<u64> on_card_ns{};
     std::atomic<u64> window_start{};
 };
 
@@ -66,6 +74,7 @@ inline void Add(std::atomic<u64>& counter, u64 amount) {
 }
 
 inline void CountRead(Read kind, u64 ns) {
+    ++t_reads;
     Add(g_counters.reads[static_cast<size_t>(kind)], 1);
     Add(g_counters.read_ns[static_cast<size_t>(kind)], ns);
     Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ReadBack, ns);
@@ -130,6 +139,9 @@ inline void MaybeReport() {
     const u64 clear_landings = take(c.clear_landings);
     const u64 clear_waits = take(c.clear_waits);
     const u64 clear_wait_ns = take(c.clear_wait_ns);
+    const u64 to_flushed_ns = take(c.to_flushed_ns);
+    const u64 to_submitted_ns = take(c.to_submitted_ns);
+    const u64 on_card_ns = take(c.on_card_ns);
     constexpr auto sync = static_cast<size_t>(Read::Sync);
     constexpr auto async = static_cast<size_t>(Read::Async);
     constexpr auto in_flight = static_cast<size_t>(Read::InFlight);
@@ -146,6 +158,11 @@ inline void MaybeReport() {
              ms_per_second(reader_wait_ns), static_cast<double>(reader_max_wait_ns) / 1e6,
              per_second(gpu_side_waits), ms_per_second(gpu_side_wait_ns),
              per_second(clear_landings), per_second(clear_waits), ms_per_second(clear_wait_ns));
+    LOG_INFO(HW_GPU,
+             "Read-back wait split per second: request to the GPU thread's flush {:.1f} ms, then "
+             "until the worker submitted the download {:.1f} ms, then on the host GPU {:.1f} ms",
+             ms_per_second(to_flushed_ns), ms_per_second(to_submitted_ns),
+             ms_per_second(on_card_ns));
 }
 
 } // namespace VideoCore::AsyncReadback

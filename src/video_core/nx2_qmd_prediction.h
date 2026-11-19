@@ -18,16 +18,16 @@
 /// GpuSplit::queued_releases and no acquire is treated as met: counting only.
 /// 1: predicted at every signal that reads a QMD, from guest memory (the first gate run).
 /// 2: the front runs its own copy of the QMD scheduler (KeplerCompute's QMD mirror, from
-///    zortos293/Lichii#717), so each release is predicted once, where the back makes it, from
+///    ported), so each release is predicted once, where the back makes it, from
 ///    the inline QMD words the front sent; max releases (bit 19) are lower bounds, reductions
 ///    (bit 26) and compute report reductions are recorded for the reduction lower bound
 ///    (fable_answer_6 6c), which is counted too.
 /// 3: as 2, and the predictions meet acquires (fable_answer_6 6b slice B, 6c/6e): a queued (or
 ///    run but not landed) plain or max release whose value meets the acquire with nothing queued
 ///    after it that may write the word, or a reduction lower bound (GEQ only). The feed turns
-///    itself off for the rest of the session (until EXP13 leaves 3) at the first bound
-///    violation, payload mismatch, unpredicted back release or reduction, phantom record or
-///    lost event, with an ERROR line saying why.
+///    itself off at the first bound violation, payload mismatch, unpredicted back release or
+///    reduction, phantom record or lost event, with an ERROR line saying why: for the rest of the
+///    session (until EXP13 leaves 3) with FRITCHII_FEED_REARM=0, else as FeedRearm says.
 /// The tables are the front's own (no lock): the back's releases and the landings reach them
 /// through rings the front drains.
 /// One log line every 5 s (HW_GPU, Info), three with 2, four with 3.
@@ -59,6 +59,39 @@ namespace VideoCommon::QmdPrediction {
 [[nodiscard]] inline bool FeedRequested() {
     const int mode = Mode();
     return mode == 3 || mode == 4;
+}
+
+/// EDEN_NX2_FEED_MEMORY_OVERLAY (default 1): the feed takes Source::OverlayFromMemory records.
+[[nodiscard]] inline bool FeedMemoryOverlays() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_feed_memory_overlay,
+                                            "EDEN_NX2_FEED_MEMORY_OVERLAY", 1) != 0;
+}
+
+/// FRITCHII_FEED_REARM (live, default 1): the feed that turned itself off comes back on after
+/// 10 s with no new divergence, when the audit says nothing it met was wrong: no acquire judged
+/// wrongly met since, none named by the turn-off's own scan, no violation still being re-read.
+/// The words named by a turn-off stay out of the feed for the split session. Off for good (the
+/// session) at the third turn-off, at lost events, or at any acquire wrongly met (the process).
+/// A new split session (the game booted again) starts with the feed on. 0: off for the rest of
+/// the run, as before.
+[[nodiscard]] inline bool FeedRearm() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_feed_rearm,
+                                            "FRITCHII_FEED_REARM", 1) != 0;
+}
+
+/// FRITCHII_TEST_FEED_OFF (live, default 0, test only): every N seconds of feed on, the feed
+/// turns itself off as for an unpredicted back release of no word (FeedRearm's path, tested).
+[[nodiscard]] inline int TestFeedOffSeconds() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_test_feed_off,
+                                            "FRITCHII_TEST_FEED_OFF", 0);
+}
+
+/// EXP127 (live, fable_fence_writers_brief piece 2): the feed's QMD sources. 0: as before. 1
+/// (audit): the records get the sources below, the feed takes nothing new, and a line counts
+/// per source the back's check of the records and the acquires the feed would have met through
+/// the new ones. 2: the feed takes them too (with EDEN_NX2_FEED_MEMORY_OVERLAY on).
+[[nodiscard]] inline int FeedSourcesMode() {
+    return VideoCore::Nx2Debug::Experiment(127);
 }
 
 /// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
@@ -96,6 +129,15 @@ enum class Source : u8 {
     Shadow,            ///< An upload shadow's block
     Memory,            ///< Guest memory, nothing queued writing it
     Waited,            ///< Guest memory after waiting for the work writing it
+    /// As OverlayFromMemory, built while the feed or EDEN_NX2_FEED_MEMORY_OVERLAY was off (not
+    /// checked) or with an unbounded writer queued over the QMD: never fed.
+    OverlayFromMemoryUnchecked,
+    /// EXP127 not 0 and EXP126 = 1: as OverlayFromMemory, built while the ranged overflow (whose
+    /// writes are stamped) was the only unbounded writer queued; fed with EXP127 = 2
+    OverlayFromMemoryOverflow,
+    /// EXP127 not 0: as Memory, with no unbounded writer queued over the QMD either (the
+    /// overlays' belt, QueuedGuestWriters); fed with EXP127 = 2
+    MemoryChecked,
     Count,
 };
 struct Record {
@@ -136,6 +178,19 @@ enum class Mirror : u32 {
     ShadowNotLinear, ///< An upload of 256 bytes or more not linear and back to back: no shadow
     ShadowPatched,   ///< A shadow took a later upload's words over it
     OverlayFromMemory, ///< A small upload patched a QMD guest memory held: overlay from both
+    /// Of them, built with an unbounded writer queued over the QMD (GpuSplit::
+    /// QueuedGuestWriters): never fed (EDEN_NX2_FEED_MEMORY_OVERLAY's belt)
+    OverlayFromMemoryUnbounded,
+    /// EXP127 not 0: of the overlays from memory, built with the stamped ranged overflow as the
+    /// only unbounded writer queued
+    /// (Source::OverlayFromMemoryOverflow; not counted in OverlayFromMemoryUnbounded)
+    OverlayFromMemoryOverflow,
+    /// EXP127 not 0, of the Memory reads in a feed mode with EDEN_NX2_FEED_MEMORY_OVERLAY on:
+    /// no unbounded writer queued over the QMD (Source::MemoryChecked), or one queued, or the
+    /// page GPU-written once the back's position was loaded (asked with EXP126 not 0 only)
+    MemoryChecked,
+    MemoryUnbounded,
+    MemoryGpuWritten,
     Count,
 };
 void NoteMirror(Mirror event);
@@ -152,6 +207,12 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);
+/// Front, at the copy's start in a split session (GpuSplit::Session): a new session's ring
+/// positions start again at 0, so what is kept by position goes (Settle's horizon: kept, it
+/// stopped every back release from waiting for its record until the new ring passed the old
+/// one, and the first one that ran before its record turned the feed off). With FeedRearm the
+/// feed starts the new session on, as a fresh run would.
+void StartSplitSession(u64 session);
 /// Front, EXP13=2-4: the copy recorded every release of the work sent up to `position` (the end
 /// of the signal it just ran). Record first, compare after (6g (a)): the back's releases of
 /// entries after the previous one that found no record wait for this, and the phantom sweep
@@ -228,9 +289,19 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check);
 /// violation (word < bound) once the records folded landed.
 void CheckBound(const Bound& bound, u32 word);
 
+/// What met an acquire Feed answered (EDEN_NX2_RUNAHEAD's predicted boundaries).
+struct FedRelease {
+    u32 payload;   ///< The release's payload
+    u64 position;  ///< Its ring position (the end of the entry that sends it)
+    /// A queued plain release whose value is known exactly: a simple QMD's (made where the back
+    /// runs the launch) or a copy semaphore's. Max releases, landed-pending ones and the
+    /// reduction bound are not.
+    bool exact;
+};
 /// Front, EXP13=3: whether the predictions meet the unmet acquire `check` describes (`resume`:
 /// a poll of a suspended one). The caller notes a host sync (GpuSplit::NoteSync) when met.
-[[nodiscard]] bool Feed(const AcquireCheck& check, bool resume);
+/// `fed` (optional): what met it.
+[[nodiscard]] bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed = nullptr);
 
 /// The count of releases the back made (Verify), to tell which came after a point.
 [[nodiscard]] u64 BackSequence();
@@ -246,8 +317,25 @@ struct BackRelease {
 
 /// BeforeCheck counts on top: of the met ones, those whose release the back made before the
 /// check (it landed after it).
-enum class MetBy : u32 { QmdRelease, QmdReduction, DmaRelease, Other, Unmet, BeforeCheck, Count };
+/// OtherPullerRelease, OtherPayloadRelease: of Other, the release recorded for the word that
+/// meets it, a puller one or another payload release (fable_b 19.4).
+enum class MetBy : u32 {
+    QmdRelease,
+    QmdReduction,
+    DmaRelease,
+    Other,
+    Unmet,
+    BeforeCheck,
+    OtherPullerRelease,
+    OtherPayloadRelease,
+    Count
+};
 /// Front: what met an acquire NoteAcquire counted, once its fences were released.
 void NoteMetBy(MetBy met_by);
+
+/// Front, EXP12=6 (puller.cpp ReleaseFencesForReadable): the ring position of the newest record
+/// of any kind for the u32 at `device` that has not landed, 0 for none. Without EXP13=2's
+/// landing marks every record counts as not landed.
+[[nodiscard]] u64 NewestUnlandedPosition(u64 device);
 
 } // namespace VideoCommon::QmdPrediction

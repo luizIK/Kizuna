@@ -25,5 +25,6 @@
         <file>icons/photo.svg</file>
         <file>kizuna_logo.png</file>
         <file>kizuna_icon.png</file>
+        <file>icons/coffee.svg</file>
     </qresource>
 </RCC>

@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
 #include <typeinfo>
 #include <vector>
 #include <QComboBox>
+#include <QLabel>
 #include "common/common_types.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/thread.h"
 #include "configuration/shared_widget.h"
 #include "core/core.h"
 #include "ui_configure_cpu.h"
@@ -59,6 +60,11 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
     push(Settings::Category::CpuUnsafe);
 
     for (const auto setting : settings) {
+        // Only Intel CPUs with P- and E-cores have this choice.
+        if (setting->Id() == Settings::values.hybrid_cpu_placement.Id() &&
+            !Common::IntelHybridCpu()) {
+            continue;
+        }
         auto* widget = builder.BuildWidget(setting, apply_funcs);
 
         if (widget == nullptr) {
@@ -78,6 +84,22 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
             backend_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.cpu_ticks.Id()) {
             ui->general_layout->addWidget(widget);
+        } else if (setting->Id() == Settings::values.hybrid_cpu_placement.Id()) {
+            ui->general_layout->addWidget(widget);
+            // Why it can't be changed now. The saved choice stays as it is.
+            QString reason;
+            if (const int value = Common::HybridCoresSwitch(); value >= 0) {
+                reason = tr("Set by EDEN_HYBRID_CORES=%1 in Tools > Switches.").arg(value);
+                widget->setEnabled(false);
+            } else if (Common::GpuThreadsHaveOwnCores()) {
+                reason = tr("Your GPU threads already have their own P-cores.");
+                widget->setEnabled(false);
+            } else if (system.IsPoweredOn()) {
+                reason = tr("Close the game to change it.");
+            }
+            if (!reason.isEmpty()) {
+                ui->general_layout->addWidget(new QLabel(reason, this));
+            }
         } else {
             // Presently, all other settings here are unsafe checkboxes
             unsafe_hold.insert({setting->Id(), widget});
@@ -94,7 +116,7 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
 void ConfigureCpu::UpdateGroup() {
     const u32 accuracy = accuracy_combobox->currentIndex();
     const u32 backend = backend_combobox->currentIndex();
-    // TODO(crueter): see if this works on NCE
+    // TODO: see if this works on NCE
     ui->unsafe_group->setVisible(accuracy == (u32)Settings::CpuAccuracy::Unsafe &&
                                  backend == (u32)Settings::CpuBackend::Dynarmic);
 }

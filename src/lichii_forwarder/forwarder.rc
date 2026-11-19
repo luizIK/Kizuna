@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// The same pear icon as fritchii.exe, so shortcuts to lichii.exe look the same.
+IDI_ICON1 ICON "../../dist/fritchii.ico"

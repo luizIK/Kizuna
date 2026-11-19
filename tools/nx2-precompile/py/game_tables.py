@@ -2,7 +2,7 @@
 """The game's shader tables, from `nx2-precompile extract` and `nx2-precompile scan`.
 
 Writes, in OUT_DIR:
-  inventory.json    one row per extracted program: its scan result (Lichii shader hash, status) and
+  inventory.json    one row per extracted program: its scan result (Fritchii shader hash, status) and
                     where it was found (origin; fine = without the variation, coarse = the file)
   nx_pairs.json     vertex/pixel pairs drawn together: [vertex hash, pixel hash], one per pair of a
                     variation (a BNSH variation, an agl program variation, an NDSR pair)

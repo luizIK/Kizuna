@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -74,9 +73,25 @@ public:
         };
     } regs{};
 
+    /// GPU thread split's front (DmaPusher, EXP120): keeps a copy of the upload registers as
+    /// the methods are sent (the back owns `regs`). `argument`: the last word of a run.
+    void FrontNoteMethod(u32 method, u32 argument);
+    /// The GPU range [begin, begin + size) the data method sent next may write, as
+    /// Upload::State::ProcessData does for a linear upload. False for a block linear upload,
+    /// before the front saw an exec and every register the range needs, or for an empty range.
+    [[nodiscard]] bool FrontDataRange(GPUVAddr& begin, u64& size) const;
+
 private:
     void ConsumeSinkImpl(Core::System& system) override;
     Upload::State upload_state;
+
+    /// FrontNoteMethod's copy of registers 0x60 (upload) to 0x6C (exec).
+    static constexpr u32 FrontFirst = 0x60;
+    static constexpr u32 FrontCount = 0x0D;
+    std::array<u32, FrontCount> front_regs{};
+    u32 front_seen{};       ///< Bit n: front_regs[n] was sent
+    u64 front_exec_size{};  ///< line_length_in * line_count at the last exec (copy_size)
+    bool front_linear{};    ///< exec.linear at the last exec
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

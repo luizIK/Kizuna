@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -53,14 +52,12 @@ static const std::map<Settings::DlssPreset, QString> nvidia_dlss_preset_texts_ma
     {Settings::DlssPreset::K, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "K"))},
     {Settings::DlssPreset::L, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "L"))},
     {Settings::DlssPreset::M, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "M"))},
-};
-
-static const std::map<Settings::FrameGenType, QString> frame_gen_type_texts_map = {
-    {Settings::FrameGenType::Lsfg, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "LSFG"))},
-    {Settings::FrameGenType::Fsr3, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Optical Flow"))},
+    {Settings::DlssPreset::E, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "E"))},
+    {Settings::DlssPreset::Auto, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "K"))},
 };
 
 static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map = {
+    {Settings::ScalingFilter::Auto, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Auto"))},
     {Settings::ScalingFilter::NearestNeighbor,
      QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Nearest"))},
     {Settings::ScalingFilter::Bilinear,

@@ -463,7 +463,7 @@ void GameList::PopupContextMenu(const QPoint& menu_location) {
 }
 
 void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::string& path) {
-    // TODO(crueter): Refactor this and make it less bad
+    // TODO: Refactor this and make it less bad
     QAction* favorite = context_menu.addAction(tr("Favorite"));
     context_menu.addSeparator();
     QAction* start_game = context_menu.addAction(tr("Start Game"));

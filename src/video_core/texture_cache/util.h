@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -19,6 +18,10 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
+
+namespace Settings {
+struct ResolutionScalingInfo;
+}
 
 namespace Tegra::Texture {
 class UnswizzleWorker;
@@ -140,6 +143,17 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
 
+/// Sets `written[level * layers + layer]` for each level and layer of `dst` that `copies` from
+/// `src` write whole, unscaled and from the origin. Sets none when the images differ in 2D format,
+/// the format is compressed, or either image is rescaled or lacks part of its host memory (sparse,
+/// unbacked, trimmed levels).
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written);
+
+/// Whether `copies` from `src` write every texel of `dst` (MarkSubresourcesWrittenWhole).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
+
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);
 
@@ -150,6 +164,13 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 [[nodiscard]] bool IsBlockLinearSizeCompatible(const ImageInfo& new_info,
                                                const ImageInfo& overlap_info, u32 new_level,
                                                u32 overlap_level, bool strict_size) noexcept;
+
+/// Whether an image scaled by the resolution setting is at most max_extent texels wide and tall
+/// on the host (MSAA images have their sample grid in info.size). Always true for a scale that
+/// does not enlarge images (1x and the downscales).
+[[nodiscard]] bool ScaledImageFits(const ImageInfo& info,
+                                   const Settings::ResolutionScalingInfo& resolution,
+                                   u32 max_extent) noexcept;
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
                                          bool strict_size) noexcept;

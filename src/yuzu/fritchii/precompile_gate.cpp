@@ -152,7 +152,12 @@ void PrecompileGate::Poll() {
             timer->stop();
         } else if (counting) {
             const int percent = static_cast<int>(progress.done * 100 / progress.total);
-            status_note->setText(tr("Preparing shaders %1%").arg(percent));
+            // With the time left at the last half minute's rate, when it moves (on Intel it
+            // only builds while paused).
+            const QString left = TimeLeft(progress.done, progress.total);
+            status_note->setText(left.isEmpty()
+                                     ? tr("Preparing shaders %1%").arg(percent)
+                                     : tr("Preparing shaders %1% · %2").arg(percent).arg(left));
             status_note->show();
         }
         break;

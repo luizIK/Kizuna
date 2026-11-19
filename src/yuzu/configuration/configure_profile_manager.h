@@ -40,7 +40,7 @@ namespace Ui {
 class ConfigureProfileManager;
 }
 
-// TODO(crueter): Move this to a .ui def
+// TODO: Move this to a .ui def
 class ConfigureProfileManagerDeleteDialog : public QDialog {
     Q_OBJECT
 public:

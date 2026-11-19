@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <bit>
 #include <optional>
 
 #include <sirit/sirit.h>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "shader_recompiler/backend/bindings.h"
@@ -189,7 +190,7 @@ public:
     }
 
     Id Const(u32 value) {
-        return Constant(U32[1], value);
+        return CachedConstant(u32_constants, U32[1], value);
     }
 
     Id Const(u32 element_1, u32 element_2) {
@@ -223,7 +224,7 @@ public:
     }
 
     Id Const(f32 value) {
-        return Constant(F32[1], value);
+        return CachedConstant(f32_constants, F32[1], value);
     }
 
     const Profile& profile;
@@ -286,6 +287,9 @@ public:
     Id sample_id{};
     Id is_helper_invocation{};
     Id subgroup_local_invocation_id{};
+    /// SubgroupSize, when the host subgroup may be narrower than the guest warp and the program
+    /// shuffles (Profile::warp_size_potentially_smaller_than_guest).
+    Id subgroup_size{};
     Id subgroup_mask_eq{};
     Id subgroup_mask_lt{};
     Id subgroup_mask_le{};
@@ -330,6 +334,31 @@ public:
     Id mesh_draw_base_push_constant{};
     u32 mesh_draw_base_member_index{};
 
+    /// FRITCHII_OCCL_FLAG (RuntimeInfo::occl_flag_store): the push constant block holding the
+    /// flag slot address (a u64 at offset 40; the rescaling or render area block when the
+    /// program declares one: one push constant block per entry point), the member's index, and
+    /// the store's types. The address is a u64 member, never a struct the slot pointer could
+    /// share: Sirit merges identical type declarations, decorations and all.
+    Id occl_flag_push_constant{};
+    u32 occl_flag_member_index{};
+    Id occl_flag_u64{};
+    Id occl_flag_slot_pointer{};
+    /// The store, a function of its own: its branch must not split main's first block (the
+    /// deferred phis name their predecessors by the IR blocks' labels).
+    Id occl_flag_store_function{};
+
+    /// FRITCHII_OCCL_FLAG: this module stores the occlusion flag (fragment, Vulkan).
+    [[nodiscard]] bool UsesOcclFlagStore() const {
+        return stage == Stage::Fragment &&
+               (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) &&
+               profile.unified_descriptor_binding;
+    }
+
+    /// FRITCHII_OCCL_FLAG pre-pass: the store is at the end of main, not at its start.
+    [[nodiscard]] bool OcclFlagStoreAtEnd() const {
+        return UsesOcclFlagStore() && runtime_info.occl_flag_store_at_end;
+    }
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -371,6 +400,8 @@ public:
     bool need_input_position_indirect{};
     Id input_position{};
     std::array<InputGenericInfo, 32> input_generics{};
+    /// Screen-linear fragment inputs read through perspective interpolation, times FragCoord.w.
+    std::array<bool, 32> noperspective_as_smooth_inputs{};
 
     Id output_point_size{};
     Id output_position{};
@@ -392,6 +423,8 @@ public:
     Id tensor_subgroup_id{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+    /// Storage float32 atomic adds use OpAtomicFAddEXT (Profile::support_float32_atomic_add).
+    bool native_f32_atomic_add{};
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
     // (the mesh stage's input region); the mesh output regions live in workgroup memory until
@@ -446,6 +479,21 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    /// Sirit deduplicates constants, but by hashing a freshly allocated copy of their words on
+    /// every call; immediates are emitted over and over, so remember the ids of scalar constants.
+    /// Keys are bit patterns, like Sirit's (0.0f and -0.0f, and NaN payloads, stay distinct).
+    template <typename T>
+    Id CachedConstant(::Common::unordered_map<u32, Id>& cache, Id type, T value) {
+        const auto [it, is_new]{cache.try_emplace(std::bit_cast<u32>(value))};
+        if (is_new) {
+            it->second = Constant(type, value);
+        }
+        return it->second;
+    }
+
+    ::Common::unordered_map<u32, Id> u32_constants;
+    ::Common::unordered_map<u32, Id> f32_constants;
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);
@@ -468,6 +516,7 @@ private:
     void DefineRenderArea(const Info& info);
     void DefineMeshDrawBase();
     [[nodiscard]] bool UsesMeshDrawBase() const;
+    void DefineOcclFlag();
     [[nodiscard]] u32 MeshDrawBaseOffset() const;
 
     void DefineInputs(const IR::Program& program);

@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
 
 #include "common/algorithm.h"
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 
@@ -43,8 +44,14 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const u32 count = write_offset - flushed_offset;
         if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
-                std::span<const u8>{inner_buffer.data() + flushed_offset, count});
+            const GPUVAddr address = regs.dest.Address() + flushed_offset;
+            const std::span<const u8> bytes{inner_buffer.data() + flushed_offset, count};
+            if (words_as_calls) {
+                // EXP124: a macro's words, each a last call before (KeplerCompute::CallMacroWords).
+                rasterizer->AccelerateInlineWords(address, count, bytes);
+            } else {
+                rasterizer->AccelerateInlineToMemory(address, count, bytes);
+            }
             flushed_offset = write_offset;
         }
         return;
@@ -68,6 +75,7 @@ void State::ProcessData(const u32* data, size_t num_data) {
 }
 
 void State::ProcessData(std::span<const u8> read_buffer) {
+    const Common::WriteRing::SiteScope write_site{"inline upload (engine upload)", false};
     const GPUVAddr address{regs.dest.Address()};
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
@@ -90,6 +98,13 @@ void State::ProcessData(std::span<const u8> read_buffer) {
         const std::size_t dst_size = Tegra::Texture::CalculateSize(
             true, bytes_per_pixel, width, regs.dest.height, regs.dest.depth,
             regs.dest.BlockHeight(), regs.dest.BlockDepth());
+        // EDEN_NX2_MEMSTAGE_STATS: a block linear inline upload (linear ones are counted by the
+        // rasterizer's AccelerateInlineToMemory).
+        if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+            VideoCommon::MemStageStats::StreamWrite(
+                VideoCommon::MemStageStats::Write::Inline,
+                memory_manager.GpuToCpuAddress(address).value_or(0), dst_size);
+        }
 
         Tegra::Memory::GpuGuestMemoryScoped<u8,
                                             Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>

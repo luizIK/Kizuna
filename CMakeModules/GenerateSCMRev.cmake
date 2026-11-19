@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2019 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # generate git/build information
@@ -49,7 +48,7 @@ else()
 endif()
 
 if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
-    # Logs keep the commit: "Lichii Frizti vN | <branch>-<commit>".
+    # Logs keep the commit: "Fritchii vN | <branch>-<commit>".
     string(SUBSTRING ${GIT_COMMIT} 0 10 GIT_DESC)
 else()
     set(GIT_DESC ${BUILD_VERSION})
@@ -68,6 +67,19 @@ elseif (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
     set(REPO_NAME "Fritchii")
 else()
     set(REPO_NAME "Lichii")
+endif()
+
+# What players see (title bar, About, update messages): dist/frizti_version_label.txt when it
+# exists (v6: "v6.0 Beta", the .0 for 60 fps), else the version. The number in
+# dist/frizti_version.txt stays what updaters parse (N.0 is spelled N there).
+set(BUILD_LABEL "${BUILD_VERSION}")
+set(FRIZTI_LABEL_FILE "${CMAKE_SOURCE_DIR}/dist/frizti_version_label.txt")
+if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$" AND EXISTS "${FRIZTI_LABEL_FILE}")
+    file(STRINGS "${FRIZTI_LABEL_FILE}" FRIZTI_LABEL LIMIT_COUNT 1)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FRIZTI_LABEL_FILE}")
+    if (FRIZTI_LABEL)
+        set(BUILD_LABEL "${FRIZTI_LABEL}")
+    endif()
 endif()
 
 set(BUILD_ID ${GIT_REFSPEC})

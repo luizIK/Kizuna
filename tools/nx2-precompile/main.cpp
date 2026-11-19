@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// nx2-precompile: builds Lichii disk-cache shader environments for every native program a game
+// nx2-precompile: builds Fritchii disk-cache shader environments for every native program a game
 // ships, so the pipelines that use them can be compiled before they are first drawn.
 //
 //   nx2-precompile scan --pkg DIR --out PREFIX [--threads N] [--priors FILE]
@@ -715,7 +715,7 @@ struct CacheRecord {
 
 std::vector<CacheRecord> ParseCache(std::span<const u8> bytes) {
     if (bytes.size() < 12 || std::memcmp(bytes.data(), "yuzucach", 8) != 0)
-        throw std::runtime_error("Not a Lichii pipeline cache");
+        throw std::runtime_error("Not a Fritchii pipeline cache");
     std::vector<CacheRecord> records;
     size_t offset = 12;
     while (offset < bytes.size()) {

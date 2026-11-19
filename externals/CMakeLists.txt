@@ -74,10 +74,6 @@ if (IOS)
 endif()
 AddJsonPackage(httplib)
 
-if (YUZU_STATIC_ROOM)
-    return()
-endif()
-
 # Oaknut
 if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS)
     AddJsonPackage(oaknut)

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -32,6 +31,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -236,8 +236,6 @@ struct BcEncoderPushConstants {
     u32 height;
     u32 bc3;
     u32 out_offset; // in 8-byte units
-    u32 src_width;
-    u32 src_height;
 };
 
 struct QueriesPrefixScanPushConstants {
@@ -336,9 +334,11 @@ VertexRepackPass::VertexRepackPass(const Device& device_, Scheduler& scheduler_,
                   COMPUTE_PUSH_CONSTANT_RANGE<12>, VULKAN_VERTEX_REPACK_COMP_SPV),
       scheduler{scheduler_}, staging_pool{staging_pool_}, descriptor_queue{descriptor_queue_} {}
 
-std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBuffer source,
-                                                                            u32 offset, u32 size,
-                                                                            u64 buffer_size) {
+// The three buffer conversion passes are cut where they first use the compute descriptor queue or
+// the scheduler: Prepare (the memory stage's fill) takes the destination from the staging pool,
+// Record (its player) does the rest, in the order the single function had.
+std::optional<ComputePassRun> VertexRepackPass::Prepare(VkBuffer source, u32 offset, u32 size,
+                                                        u64 buffer_size) {
     const auto parameters = MakeVertexRepackParameters(
         offset, size, device.GetStorageBufferAlignment(), device.GetMaxStorageBufferRange(),
         device.GetMaxComputeWorkGroupCount()[0], buffer_size);
@@ -346,20 +346,33 @@ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBu
         LOG_ERROR(Render_Vulkan, "Vertex repack exceeds device limits: offset={}, size={}", offset, size);
         return std::nullopt;
     }
-    const u32 num_vertices = parameters->vertices;
     const u32 output_size = parameters->output_size;
-    const auto dest = staging_pool.Request(output_size, MemoryUsage::DeviceLocal);
-    const u32 base_offset = parameters->source_base;
-    const u32 bias = parameters->source_bias;
+    const auto dest = staging_pool.Request(output_size, MemoryUsage::DeviceLocal, false,
+                                           VideoCommon::BufferChurnStats::StagingCaller::ComputePass);
+    return ComputePassRun{
+        .src = source,
+        .src_offset = parameters->source_base,
+        .src_size = parameters->source_range,
+        .dst = dest.buffer,
+        .dst_offset = dest.offset,
+        .dst_size = output_size,
+        .args = {parameters->source_bias, size, parameters->vertices, parameters->dispatch_groups},
+    };
+}
+
+void VertexRepackPass::Record(const ComputePassRun& run) {
+    const u32 bias = run.args[0];
+    const u32 size = run.args[1];
+    const u32 num_vertices = run.args[2];
+    const u32 groups = run.args[3];
     descriptor_queue.Acquire(scheduler, 2);
-    descriptor_queue.AddBuffer(source, base_offset, parameters->source_range);
-    descriptor_queue.AddBuffer(dest.buffer, dest.offset, output_size);
+    descriptor_queue.AddBuffer(run.src, run.src_offset, run.src_size);
+    descriptor_queue.AddBuffer(run.dst, run.dst_offset, run.dst_size);
     const void* data = descriptor_queue.UpdateData();
     scheduler.RequestOutsideRenderPassOperationContext();
     LOG_DEBUG(Render_Vulkan, "Vertex repack queued: source_size={}, output_size={}, groups={}",
-              size, output_size, parameters->dispatch_groups);
-    scheduler.Record([this, data, bias, size, num_vertices,
-                      groups = parameters->dispatch_groups](vk::CommandBuffer cmdbuf) {
+              size, run.dst_size, groups);
+    scheduler.Record([this, data, bias, size, num_vertices, groups](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier read_barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -382,7 +395,6 @@ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBu
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, write_barrier);
     });
-    return std::pair<VkBuffer, VkDeviceSize>{dest.buffer, dest.offset};
 }
 
 Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,
@@ -396,14 +408,26 @@ Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPoo
 
 Uint8Pass::~Uint8Pass() = default;
 
-std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer src_buffer,
-                                                      u32 src_offset) {
+ComputePassRun Uint8Pass::Prepare(u32 num_vertices, VkBuffer src_buffer, u32 src_offset) {
     const u32 staging_size = static_cast<u32>(num_vertices * sizeof(u16));
-    const auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal);
+    const auto staging = staging_buffer_pool.Request(
+        staging_size, MemoryUsage::DeviceLocal, false, VideoCommon::BufferChurnStats::StagingCaller::ComputePass);
+    return ComputePassRun{
+        .src = src_buffer,
+        .src_offset = src_offset,
+        .src_size = num_vertices,
+        .dst = staging.buffer,
+        .dst_offset = staging.offset,
+        .dst_size = staging_size,
+        .args = {num_vertices, 0, 0, 0},
+    };
+}
 
+void Uint8Pass::Record(const ComputePassRun& run) {
+    const u32 num_vertices = run.args[0];
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
-    compute_pass_descriptor_queue.AddBuffer(src_buffer, src_offset, num_vertices);
-    compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
+    compute_pass_descriptor_queue.AddBuffer(run.src, run.src_offset, run.src_size);
+    compute_pass_descriptor_queue.AddBuffer(run.dst, run.dst_offset, run.dst_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -423,7 +447,6 @@ std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, WRITE_BARRIER);
     });
-    return {staging.buffer, staging.offset};
 }
 
 QuadIndexedPass::QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
@@ -438,9 +461,9 @@ QuadIndexedPass::QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
 
 QuadIndexedPass::~QuadIndexedPass() = default;
 
-std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
-    Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format, u32 num_vertices, u32 base_vertex,
-    VkBuffer src_buffer, u32 src_offset, bool is_strip) {
+ComputePassRun QuadIndexedPass::Prepare(Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format,
+                                        u32 num_vertices, u32 base_vertex, VkBuffer src_buffer,
+                                        u32 src_offset, bool is_strip) {
     const u32 index_shift = [index_format] {
         switch (index_format) {
         case Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedByte:
@@ -457,11 +480,27 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
     const u32 num_tri_vertices = (is_strip ? (num_vertices - 2) / 2 : num_vertices / 4) * 6;
 
     const std::size_t staging_size = num_tri_vertices * sizeof(u32);
-    const auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal);
+    const auto staging = staging_buffer_pool.Request(
+        staging_size, MemoryUsage::DeviceLocal, false, VideoCommon::BufferChurnStats::StagingCaller::ComputePass);
+    return ComputePassRun{
+        .src = src_buffer,
+        .src_offset = src_offset,
+        .src_size = input_size,
+        .dst = staging.buffer,
+        .dst_offset = staging.offset,
+        .dst_size = staging_size,
+        .args = {num_tri_vertices, base_vertex, index_shift, is_strip ? 1U : 0U},
+    };
+}
 
+void QuadIndexedPass::Record(const ComputePassRun& run) {
+    const u32 num_tri_vertices = run.args[0];
+    const u32 base_vertex = run.args[1];
+    const u32 index_shift = run.args[2];
+    const bool is_strip = run.args[3] != 0;
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
-    compute_pass_descriptor_queue.AddBuffer(src_buffer, src_offset, input_size);
-    compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
+    compute_pass_descriptor_queue.AddBuffer(run.src, run.src_offset, run.src_size);
+    compute_pass_descriptor_queue.AddBuffer(run.dst, run.dst_offset, run.dst_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -485,7 +524,6 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, WRITE_BARRIER);
     });
-    return {staging.buffer, staging.offset};
 }
 
 ConditionalRenderingResolvePass::ConditionalRenderingResolvePass(
@@ -701,6 +739,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                               : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        // FRITCHII_SLOW_GPU: one texture decode pass (one TLS load off).
+        vk::NoteBoundPass(VK_PIPELINE_BIND_POINT_COMPUTE, "astc", true);
     });
     // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
     // (see TextureCache::UploadImageContents), so its layer stride is that tail's size.
@@ -813,6 +853,26 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     if (!target.wait) {
         return;
     }
+    // FRITCHII_ASTC_HELD_DEFER (boot, default 0; helper BG's fix, ported by helper FJ): inside a
+    // held draw fill (EXP123 >= 2: the texture work sits between the fill and its PlayRest) this
+    // submit splits the packet across two command buffers (Memory seam 5.5). An RX 7900 XT and an
+    // RX 9070 XT lost the device 10-15 ms after such submits at the title (2026-11-16), which is
+    // why EXP123 is held to 1 on AMD's driver and the one follower posts nothing there. 1 = the
+    // decode and its barrier stay in this command buffer, ahead of the draw on the same queue, and
+    // the next flush submits them.
+    static const bool held_defer = [] {
+        const char* value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (held_defer && SeamHook::Holding()) [[unlikely]] {
+        static std::atomic<u32> held_skips{};
+        if (held_skips.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_INFO(Render_Vulkan, "ASTC GPU decode inside a held draw fill: submit left to the "
+                                    "next flush (FRITCHII_ASTC_HELD_DEFER=1)");
+        }
+        (void)scheduler.DeferFlushUntilWanted(); // off the back thread: the next flush takes it
+        return;
+    }
     const auto start = std::chrono::steady_clock::now();
     if (flush_only) {
         scheduler.Flush();
@@ -846,9 +906,8 @@ BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,
 
 BcEncoderPass::~BcEncoderPass() = default;
 
-void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 src_width,
-                           u32 src_height, u32 layers, bool bc3, VkBuffer buffer,
-                           VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
+void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3,
+                           VkBuffer buffer, VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
                            VkDeviceSize out_offset) {
     scheduler.RequestOutsideRenderPassOperationContext();
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
@@ -862,14 +921,14 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 src_wi
         .height = height,
         .bc3 = bc3 ? 1U : 0U,
         .out_offset = static_cast<u32>(out_offset / 8),
-        .src_width = src_width,
-        .src_height = src_height,
     };
     const VkPipeline vk_pipeline = *pipeline;
     scheduler.Record([this, vk_pipeline, uniforms, layers, descriptor_data](vk::CommandBuffer cmdbuf) {
         const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        // FRITCHII_SLOW_GPU: one texture encode pass (one TLS load off).
+        vk::NoteBoundPass(VK_PIPELINE_BIND_POINT_COMPUTE, "bc-encode", true);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
         cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
         cmdbuf.Dispatch(Common::DivCeil(uniforms.blocks_x, 8U), Common::DivCeil(uniforms.blocks_y, 8U),

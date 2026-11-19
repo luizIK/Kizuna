@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -307,7 +306,23 @@ public:
         s32 src_y1;
     };
 
+    /// GPU thread split's front (DmaPusher, EXP120): keeps a copy of the destination surface
+    /// registers as the methods are sent (the back owns `regs`). `argument`: the last word of a
+    /// run.
+    void FrontNoteMethod(u32 method, u32 argument);
+    /// The GPU range [begin, begin + size) the blit launched next may write: the whole
+    /// destination surface, as the software blitter sizes it (its covered rows stay inside it;
+    /// the texture cache's copy writes an image, not guest memory). False before the front saw
+    /// every destination register, for an undecodable format or an empty surface.
+    [[nodiscard]] bool FrontBlitRange(GPUVAddr& begin, u64& size) const;
+
 private:
+    /// FrontNoteMethod's copy of the destination surface registers (dst, 0x200 to 0x209).
+    static constexpr u32 FrontFirst = 0x200;
+    static constexpr u32 FrontCount = 0x0A;
+    std::array<u32, FrontCount> front_regs{};
+    u32 front_seen{}; ///< Bit n: front_regs[n] was sent
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
     std::unique_ptr<Blitter::SoftwareBlitEngine> sw_blitter;
     MemoryManager& memory_manager;

@@ -16,9 +16,10 @@
 
 // EXPERIMENT (not for nx2): GPU back-thread optimizations for Ocarina of Time.
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
-// default; those that change timing or reuse ideas reverted with zortos293/Lichii#161 (its
+// default; those that change timing or reuse ideas reverted with a ported change (its
 // slab of wrong geometry in Kokiri Forest) are off until EDEN_NX2_PERF_ON=<name>,... turns them
-// on: frames_ahead, clean_words, index_rebind, submit_budget, fence_flush, fragment_barrier,
+// on: frames_ahead, clean_words, index_rebind, fence_flush, fragment_barrier (submit_budget is
+// on since 2026-11-14),
 // front_sleep, async_pipelines, and bounds (this tree keeps its own range cache).
 // EDEN_NX2_PERF_OPT=0 turns every one off for the A/B; EDEN_NX2_PERF_OFF=<name>,... turns off
 // only those named (Opt below). EDEN_NX2_PERF_VERIFY=1 computes each optimized answer the old
@@ -54,15 +55,44 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "write_intersections", "sorted_page_batches", "async_pipelines", "unswizzle_workers",
 };
 
+namespace Detail {
+/// Enabled()'s and On()'s answers, each computed at its first use as before, then kept in an
+/// atomic word instead of a function's static: MSVC checks a static's initialization on every
+/// call through a thread-local, which cost the GPU thread 3 to 6 ms/s (fable_b 21.2 cut 4).
+/// 0 = not computed yet; Enabled: 1 off, 2 on; On: bit 31 set, the off mask below it.
+inline std::atomic<unsigned> g_enabled_word{0};
+inline std::atomic<unsigned> g_off_word{0};
+inline constexpr unsigned OffWordReady = 1U << 31;
+static_assert(static_cast<unsigned>(Opt::Count) < 31);
+inline unsigned ComputeOffMask();
+} // namespace Detail
+
 inline bool Enabled() {
-    static const bool enabled = [] {
+    unsigned word = Detail::g_enabled_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
         const char* value = std::getenv("EDEN_NX2_PERF_OPT");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+        unsigned expected = 0;
+        Detail::g_enabled_word.compare_exchange_strong(
+            expected, value == nullptr || value[0] != '0' ? 2U : 1U, std::memory_order_relaxed);
+        word = Detail::g_enabled_word.load(std::memory_order_relaxed);
+    }
+    return word == 2;
 }
 
 inline bool On(Opt opt) {
+    unsigned word = Detail::g_off_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
+        const unsigned mask = Detail::ComputeOffMask();
+        unsigned expected = 0;
+        Detail::g_off_word.compare_exchange_strong(expected, Detail::OffWordReady | mask,
+                                                   std::memory_order_relaxed);
+        word = Detail::g_off_word.load(std::memory_order_relaxed);
+    }
+    return Enabled() && (word >> static_cast<unsigned>(opt) & 1) == 0;
+}
+
+/// The off mask On() keeps (its first use only; it logs the state line).
+inline unsigned Detail::ComputeOffMask() {
     static const unsigned off = [] {
         const auto bit = [](Opt option) { return 1U << static_cast<unsigned>(option); };
         const auto names = [](const char* variable) {
@@ -87,8 +117,11 @@ inline bool On(Opt opt) {
         };
         // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
         // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
+        // SubmitBudget is on (2026-11-14, owner's call): fresh market A/B (2 off, 2 on, 90 s):
+        // median 53.4 -> 55.1 fps, 1% low 39.8 -> 40.8; a submit boundary changes when the card
+        // starts, not what it draws (fable_submits_brief 2). EDEN_NX2_PERF_OFF=submit_budget.
         const unsigned default_off = bit(Opt::CleanWords) |
-                                     bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
+                                     bit(Opt::IndexRebind) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
                                      bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
                                      bit(Opt::Bounds);
@@ -104,15 +137,27 @@ inline bool On(Opt opt) {
         LOG_INFO(HW_GPU, "Nx2Perf:{}", state);
         return mask;
     }();
-    return Enabled() && (off >> static_cast<unsigned>(opt) & 1) == 0;
+    return off;
+}
+
+[[nodiscard]] inline bool VerifySwitchSet() {
+    const char* value = std::getenv("EDEN_NX2_PERF_VERIFY");
+    return value != nullptr && value[0] == '1';
+}
+
+/// EDEN_NX2_PERF_VERIFY=1. A plain flag: the buffer cache, the memory tracker and the 3D engine
+/// check it on hot paths, and a function's static is checked for its initialization on every
+/// call (MSVC reads a thread-local for it).
+inline bool g_verify = VerifySwitchSet();
+
+/// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
+/// nx2_switches.txt, so a switch set only there takes effect from that point on.
+inline void ReadSwitch() {
+    g_verify = VerifySwitchSet();
 }
 
 inline bool Verify() {
-    static const bool verify = [] {
-        const char* value = std::getenv("EDEN_NX2_PERF_VERIFY");
-        return value != nullptr && value[0] == '1';
-    }();
-    return verify;
+    return g_verify;
 }
 
 /// The frame period the game asks for (nx2:vi2 present word 12 at the speed limit), 0 while
@@ -126,6 +171,16 @@ inline std::atomic<long long> g_host_refresh_ns{0};
 /// The display's refresh period once the host frame pacer has measured it, paced or not, else
 /// 0. Ocarina of Time's high refresh rate cap (nx2_gsv.h) stays at or below it.
 inline std::atomic<long long> g_display_refresh_ns{0};
+
+/// The swapchain's present mode as a Settings::VSyncMode value (0 Immediate, 1 Mailbox, 2 FIFO,
+/// 3 FIFO relaxed; what the driver gave, not the setting), -1 before the first swapchain.
+/// Ocarina of Time's high refresh rate cap only stays at or below the display rate with FIFO.
+inline std::atomic<int> g_present_mode{-1};
+
+/// True while the game presents as fast as it can on purpose (Ocarina of Time's high refresh
+/// rate with no frame period). With Mailbox the host frame pacer then holds no frames: holding
+/// one per refresh capped the game at the display rate.
+inline std::atomic<bool> g_guest_unpaced{false};
 
 /// Whether the Vulkan device runs the guest's tensor operations on native cooperative matrices
 /// (set at device creation). Ocarina's movie upscaler setting picks by it on Automatic.

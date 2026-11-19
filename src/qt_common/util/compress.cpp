@@ -22,7 +22,7 @@ bool compressDir(QString fileCompressed, QString dir, const Options& options,
 
     // See how big the overall fs structure is
     // good approx. of total progress
-    // TODO(crueter): QDirListing impl... or fs::recursive_dir_iterator
+    // TODO: QDirListing impl... or fs::recursive_dir_iterator
     QDirIterator iter(dir, QDir::NoDotAndDotDot | QDir::Hidden | QDir::Files,
                       QDirIterator::Subdirectories);
 

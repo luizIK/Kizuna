@@ -102,7 +102,7 @@ static u8 QualityToPercent(const iwrange& r, const wireless_scan* ws) {
     return u8(std::clamp(100 * lvl / max, 0, 100));
 }
 
-// TODO(crueter, Maufeat): Check if driver supports wireless extensions, fallback to nl80211 if not
+// TODO: Check if driver supports wireless extensions, fallback to nl80211 if not
 std::vector<Network::ScanData> ScanWifiNetworks(std::chrono::milliseconds deadline) {
     std::vector<Network::ScanData> out;
     int sock = iw_sockets_open();

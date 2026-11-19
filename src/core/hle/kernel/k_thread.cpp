@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -20,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/random.h"
@@ -39,6 +39,7 @@
 #include "core/hle/kernel/k_worker_task_manager.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_present.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/hle/kernel/thread_startup_policy.h"
@@ -199,6 +200,8 @@ namespace Kernel {
 
         // We haven't been scheduled, and we have done no light IPC.
         m_schedule_count = -1;
+        m_yield_core = -1; // EXP98: no yield stamp
+        m_yield_kind = 0;
         m_last_scheduled_tick = 0;
         m_light_ipc_data = nullptr;
 
@@ -444,14 +447,16 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
-
         // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
+        {
+            KScopedSchedulerLock sl{kernel};
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Close the thread.
+        // Close the thread outside the scheduler lock: objects are destroyed on their last Close
+        // here (HOS defers that), and if this one is the last, Finalize takes the process's light
+        // locks, which can't block while the scheduler lock is held.
         this->Close(kernel);
     }
 
@@ -1406,6 +1411,9 @@ namespace Kernel {
 
         // Set our wait queue.
         m_wait_queue = queue;
+
+        // EXP24 = 4: a guest wait is the moment OoT's MainThread has written the present event.
+        Svc::Nx2OotPresentPollCheck(kernel, this);
     }
 
     void KThread::RecordWaitForTimeline(ThreadWaitReasonForDebugging reason,
@@ -1437,6 +1445,191 @@ namespace Kernel {
         }
         Common::Nx2Timeline::Instant("guest wait", {"tid", m_thread_id}, {"reason", code},
                                      {"key", key});
+    }
+
+    namespace {
+
+        // The hang report's table of guest waits (DescribeGuestWaits): a slot per thread id
+        // modulo the table size, written as each wait begins and ends (under the scheduler lock,
+        // so one writer at a time), read without a lock. Two live threads whose ids share a slot
+        // show only the later wait; a torn read mixes two waits in one diagnostic line.
+        struct HangWaitSlot {
+            std::atomic<u64> thread_id{};
+            std::atomic<u32> code{}; ///< 0 no wait; ThreadWaitReasonForDebugging, 7 a mutex
+            std::atomic<u64> key{};
+            std::atomic<const char*> object_type{}; ///< Synchronization: the first object's
+            std::atomic<s32> priority{};
+            std::atomic<s32> core{};
+            std::atomic<u64> since{}; ///< Nx2Hitch::StallTickNs
+        };
+        constexpr size_t HangWaitSlotCount = 512;
+        std::array<HangWaitSlot, HangWaitSlotCount> g_hang_waits;
+        constexpr u32 HangMutexWait = 7;
+
+        // NoteGuestCrashForHangReport: the newest stopped thread (torn reads possible, read only).
+        std::atomic<u64> g_crash_count{};
+        std::atomic<u64> g_crash_thread{};
+        std::atomic<u64> g_crash_pc{};
+        std::atomic<u64> g_crash_since{};
+        std::atomic<const char*> g_crash_what{};
+
+    } // Anonymous namespace
+
+    void NoteGuestCrashForHangReport(u64 thread_id, u64 pc, const char* what) {
+        g_crash_thread.store(thread_id, std::memory_order_relaxed);
+        g_crash_pc.store(pc, std::memory_order_relaxed);
+        g_crash_what.store(what, std::memory_order_relaxed);
+        g_crash_since.store(Common::Nx2Hitch::StallTickNs(), std::memory_order_relaxed);
+        g_crash_count.fetch_add(1, std::memory_order_release);
+    }
+
+    void KThread::NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
+                                        const void* timeline_key) const {
+        if (m_thread_type == ThreadType::Dummy) {
+            return;
+        }
+        HangWaitSlot& slot = g_hang_waits[m_thread_id % HangWaitSlotCount];
+        if (reason == ThreadWaitReasonForDebugging::None) {
+            if (slot.code.load(std::memory_order_relaxed) != 0 &&
+                slot.thread_id.load(std::memory_order_relaxed) == m_thread_id) {
+                slot.code.store(0, std::memory_order_relaxed);
+            }
+            return;
+        }
+        // The same keys as the timeline's guest wait marker (RecordWaitForTimeline).
+        u32 code = static_cast<u32>(reason);
+        u64 key = 0;
+        const char* object_type = nullptr;
+        switch (reason) {
+        case ThreadWaitReasonForDebugging::Synchronization:
+            key = reinterpret_cast<uintptr_t>(timeline_key);
+            if (timeline_key != nullptr) {
+                object_type =
+                    static_cast<const KSynchronizationObject*>(timeline_key)->GetTypeName();
+            }
+            break;
+        case ThreadWaitReasonForDebugging::ConditionVar:
+            if (m_condvar_tree != nullptr) {
+                key = m_condvar_key;
+            } else {
+                code = HangMutexWait;
+                key = GetInteger(m_address_key);
+            }
+            break;
+        case ThreadWaitReasonForDebugging::Arbitration:
+            key = m_condvar_key;
+            break;
+        default:
+            break;
+        }
+        slot.code.store(0, std::memory_order_relaxed);
+        slot.thread_id.store(m_thread_id, std::memory_order_relaxed);
+        slot.key.store(key, std::memory_order_relaxed);
+        slot.object_type.store(object_type, std::memory_order_relaxed);
+        slot.priority.store(m_priority, std::memory_order_relaxed);
+        slot.core.store(m_core_id, std::memory_order_relaxed);
+        slot.since.store(Common::Nx2Hitch::StallTickNs(), std::memory_order_relaxed);
+        slot.code.store(code, std::memory_order_release);
+    }
+
+    std::string DescribeGuestWaits() {
+        struct Wait {
+            u64 thread_id;
+            u32 code;
+            u64 key;
+            const char* object_type;
+            s32 priority;
+            s32 core;
+            u64 since;
+        };
+        std::vector<Wait> waits;
+        for (const HangWaitSlot& slot : g_hang_waits) {
+            const u32 code = slot.code.load(std::memory_order_acquire);
+            if (code == 0) {
+                continue;
+            }
+            waits.push_back({slot.thread_id.load(std::memory_order_relaxed), code,
+                             slot.key.load(std::memory_order_relaxed),
+                             slot.object_type.load(std::memory_order_relaxed),
+                             slot.priority.load(std::memory_order_relaxed),
+                             slot.core.load(std::memory_order_relaxed),
+                             slot.since.load(std::memory_order_relaxed)});
+        }
+        std::ranges::sort(waits, [](const Wait& a, const Wait& b) { return a.since < b.since; });
+        const u64 now = Common::Nx2Hitch::StallTickNs();
+        // The longest 8, then the newest 24 (newest first): the long ones are the game's idle
+        // workers (a tester's Jabu-Jabu freeze 2026-11-17: 137 waits, the first 32 all workers
+        // parked since the boot); what the game's main loop waits on began just before the freeze.
+        std::vector<size_t> shown;
+        for (size_t i = 0; i < (std::min)(waits.size(), size_t{8}); ++i) {
+            shown.push_back(i);
+        }
+        const size_t newest_from = (std::max)(shown.size(), waits.size() > 24 ? waits.size() - 24 : 0);
+        for (size_t i = waits.size(); i > newest_from; --i) {
+            shown.push_back(i - 1);
+        }
+        std::string text;
+        for (size_t n = 0; n < shown.size(); ++n) {
+            const Wait& wait = waits[shown[n]];
+            if (n == 8 && shown.size() > 8) {
+                text += fmt::format("; ... {} more ...; newest first: ",
+                                    waits.size() - shown.size());
+            }
+            std::string what;
+            switch (wait.code) {
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Sleep):
+                what = "in SleepThread";
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::IPC):
+                what = "for an IPC reply";
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Synchronization):
+                what = fmt::format("in WaitSynchronization on a {} ({:#x})",
+                                   wait.object_type != nullptr ? wait.object_type : "object",
+                                   wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::ConditionVar):
+                what = fmt::format("on condition variable key {:#x}", wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Arbitration):
+                what = fmt::format("on address {:#x} (WaitForAddress)", wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Suspended):
+                what = "suspended";
+                break;
+            case HangMutexWait:
+                what = fmt::format("on a mutex (ArbitrateLock) at {:#x}", wait.key);
+                break;
+            default:
+                what = fmt::format("reason {}", wait.code);
+                break;
+            }
+            text += fmt::format("{}thread {} (priority {}, core {}) {} for {:.1f} s",
+                                text.empty() || text.ends_with(": ") ? "" : "; ", wait.thread_id,
+                                wait.priority, wait.core, what,
+                                now > wait.since ? static_cast<double>(now - wait.since) / 1e9
+                                                 : 0.0);
+        }
+        std::string crashed;
+        if (const u64 crashes = g_crash_count.load(std::memory_order_acquire); crashes != 0) {
+            const u64 since = g_crash_since.load(std::memory_order_relaxed);
+            const char* const what = g_crash_what.load(std::memory_order_relaxed);
+            crashed = fmt::format(
+                "; GAME THREAD STOPPED FOR GOOD: thread {} after {} at pc {:#x}, {:.1f} s ago ({} "
+                "this session; the freeze is the game's crash, see its backtrace in the log)",
+                g_crash_thread.load(std::memory_order_relaxed), what != nullptr ? what : "?",
+                g_crash_pc.load(std::memory_order_relaxed),
+                now > since ? static_cast<double>(now - since) / 1e9 : 0.0, crashes);
+        }
+        return fmt::format("{} waiting{}{}{}", waits.size(),
+                           text.empty() ? "" : ", longest first: ", text, crashed);
+    }
+
+    void ClearGuestWaitsForHangReport() {
+        for (HangWaitSlot& slot : g_hang_waits) {
+            slot.code.store(0, std::memory_order_relaxed);
+        }
+        g_crash_count.store(0, std::memory_order_relaxed);
     }
 
     void KThread::NotifyAvailable(KernelCore& kernel, KSynchronizationObject* signaled_object, Result wait_result) {

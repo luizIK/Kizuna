@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <mutex>
@@ -8,6 +7,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/fritchii_write_ring.h"
 #include "common/literals.h"
 #include "common/scratch_buffer.h"
 #include "video_core/engines/sw_blitter/blitter.h"
@@ -207,6 +207,7 @@ SoftwareBlitEngine::~SoftwareBlitEngine() = default;
 
 bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                               Fermi2D::Config& config) {
+    const Common::WriteRing::SiteScope write_site{"software blit (Fermi2D)", false};
     const auto get_surface_size = [](Fermi2D::Surface& surface, u32 bytes_per_pixel) {
         if (surface.linear == Fermi2D::MemoryLayout::BlockLinear) {
             return CalculateSize(true, bytes_per_pixel, surface.width, surface.height,

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-FileCopyrightText: Ryujinx Team and Contributors
 // SPDX-License-Identifier: GPL-2.0-or-later AND MIT
 
@@ -11,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <numeric>
 #include <optional>
@@ -24,6 +25,7 @@
 #include "common/div_ceil.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
+#include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/guest_memory.h"
@@ -1274,8 +1276,107 @@ UnswizzlePlan PlanUnswizzleImageRows(
     return plan;
 }
 
+namespace {
+/// FRITCHII_UNSWIZZLE_IN_PLACE's counts for its 10 s line.
+struct InPlaceCounts {
+    std::atomic<u64> in_place{};
+    std::atomic<u64> in_place_bytes{};
+    std::atomic<u64> copied{};
+    std::atomic<u64> copied_bytes{};
+    std::atomic<u64> checked{};
+    std::atomic<u64> mismatched{};
+    std::atomic<s64> last_log_ns{};
+};
+InPlaceCounts g_in_place_counts;
+
+void LogInPlaceCounts(int mode) {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = g_in_place_counts.last_log_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_in_place_counts.last_log_ns.compare_exchange_strong(last, now,
+                                                              std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000 ||
+        !g_in_place_counts.last_log_ns.compare_exchange_strong(last, now,
+                                                               std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 in_place = g_in_place_counts.in_place.exchange(0, std::memory_order_relaxed);
+    const u64 in_place_bytes =
+        g_in_place_counts.in_place_bytes.exchange(0, std::memory_order_relaxed);
+    const u64 copied = g_in_place_counts.copied.exchange(0, std::memory_order_relaxed);
+    const u64 copied_bytes = g_in_place_counts.copied_bytes.exchange(0, std::memory_order_relaxed);
+    const u64 checked = g_in_place_counts.checked.exchange(0, std::memory_order_relaxed);
+    const u64 mismatched = g_in_place_counts.mismatched.exchange(0, std::memory_order_relaxed);
+    if (in_place + copied == 0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Unswizzle in place in 10 s (FRITCHII_UNSWIZZLE_IN_PLACE={}): {} runs read in place "
+             "({} MiB), {} copied first ({} MiB); verify {} checked, {} differ (must be 0)",
+             mode, in_place, in_place_bytes >> 20, copied, copied_bytes >> 20, checked,
+             mismatched);
+}
+} // Anonymous namespace
+
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output) {
+    // FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0; port of tomk134/lichii-custom e8e50e797 via
+    // DahBard/Blitchii 43321b8db9, d05a021080 and d3251a67cf): a run that is contiguous in host
+    // memory is untiled straight from guest memory instead of being copied into a vector first
+    // (the copy was ~40% of the GPU thread in a texture-loading hitch in OoT, leaving Link's
+    // house). GetSpan, not IsContinuousRange: the run must be contiguous in host memory too, as
+    // device pages map to guest memory one by one (reading past a run contiguous only in device
+    // memory crashed Blitchii between Hyrule Field and Kokiri Forest). Other runs are copied into
+    // a grow-only scratch buffer. 2 = also untile every in-place run from a copy and compare
+    // (counted on the 10 s line, must be 0; a game write between the two reads can differ).
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_unswizzle_in_place,
+                                                      "FRITCHII_UNSWIZZLE_IN_PLACE");
+    if (mode > 0) {
+        static thread_local Common::ScratchBuffer<u8> scratch;
+        static thread_local Common::ScratchBuffer<u8> check;
+        for (const auto& r : plan.runs) {
+            std::span<const u8> input;
+            const u8* const direct = gpu_memory.GetSpan(r.src_addr, r.guest_bytes);
+            if (direct != nullptr) {
+                input = std::span<const u8>{direct, r.guest_bytes};
+                g_in_place_counts.in_place.fetch_add(1, std::memory_order_relaxed);
+                g_in_place_counts.in_place_bytes.fetch_add(r.guest_bytes,
+                                                           std::memory_order_relaxed);
+            } else {
+                scratch.resize_destructive(r.guest_bytes);
+                gpu_memory.ReadBlockUnsafe(r.src_addr, scratch.data(), r.guest_bytes);
+                input = std::span<const u8>{scratch.data(), r.guest_bytes};
+                g_in_place_counts.copied.fetch_add(1, std::memory_order_relaxed);
+                g_in_place_counts.copied_bytes.fetch_add(r.guest_bytes, std::memory_order_relaxed);
+            }
+            const std::span<u8> destination = output.subspan(r.host_offset, r.host_bytes);
+            Tegra::Texture::UnswizzleTexture(destination, input, 1U << plan.bpp_log2,
+                                             r.run_tiles, r.tile_rows, 1, r.block.height,
+                                             r.block.depth, r.run_alignment,
+                                             gpu_memory.UsesNativeTiling());
+            if (mode >= 2 && direct != nullptr) {
+                // The old path's result for the same run, compared with what was just written.
+                scratch.resize_destructive(r.guest_bytes);
+                gpu_memory.ReadBlockUnsafe(r.src_addr, scratch.data(), r.guest_bytes);
+                check.resize_destructive(r.host_bytes);
+                Tegra::Texture::UnswizzleTexture(
+                    std::span<u8>{check.data(), r.host_bytes},
+                    std::span<const u8>{scratch.data(), r.guest_bytes}, 1U << plan.bpp_log2,
+                    r.run_tiles, r.tile_rows, 1, r.block.height, r.block.depth, r.run_alignment,
+                    gpu_memory.UsesNativeTiling());
+                g_in_place_counts.checked.fetch_add(1, std::memory_order_relaxed);
+                if (std::memcmp(check.data(), destination.data(), r.host_bytes) != 0) {
+                    g_in_place_counts.mismatched.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        LogInPlaceCounts(mode);
+        return;
+    }
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
         run.resize(r.guest_bytes);
@@ -1453,6 +1554,49 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
 }
 
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written) {
+    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
+                                       ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse |
+                                       ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles;
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
+        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
+        True((src.flags | dst.flags) & excluded)) {
+        return;
+    }
+    // Alias copies count a compressed extent in blocks, but the backends copy it as texels, so
+    // such a copy writes only part of the image.
+    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
+        return;
+    }
+    const s32 layers = dst.info.resources.layers;
+    for (const ImageCopy& copy : copies) {
+        const s32 level = copy.dst_subresource.base_level;
+        if (level < 0 || level >= dst.info.resources.levels) {
+            continue;
+        }
+        const Extent3D size = MipSize(dst.info.size, level);
+        if (copy.dst_offset != Offset3D{} || copy.extent.width < size.width ||
+            copy.extent.height < size.height) {
+            continue;
+        }
+        const s32 first = (std::max)(copy.dst_subresource.base_layer, 0);
+        const s32 last =
+            (std::min)(copy.dst_subresource.base_layer + copy.dst_subresource.num_layers, layers);
+        for (s32 layer = first; layer < last; ++layer) {
+            written[static_cast<size_t>(level * layers + layer)] = 1;
+        }
+    }
+}
+
+bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    std::vector<u8> written(
+        static_cast<size_t>(dst.info.resources.levels * dst.info.resources.layers));
+    MarkSubresourcesWrittenWhole(dst, src, copies, written);
+    return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
+}
+
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
     const Extent2D tile_size = DefaultBlockSize(info.format);
     if (info.type == ImageType::Linear) {
@@ -1488,6 +1632,11 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
+    const Common::WriteRing::SiteScope write_site{"texture download (SwizzleImage)", true};
+    // The memory seam (SEAM 2/3): a guest write between a held fill and its draw is checked.
+    if (MemReadLog::g_held.load(std::memory_order_relaxed)) [[unlikely]] {
+        MemReadLog::NoteGuestWrite(gpu_memory, gpu_addr, CalculateGuestSizeInBytes(info));
+    }
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
         if (is_pitch_linear) {
@@ -1496,6 +1645,21 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
             SwizzleBlockLinearImage(gpu_memory, gpu_addr, info, copy, memory, tmp_buffer);
         }
     }
+}
+
+bool ScaledImageFits(const ImageInfo& info, const Settings::ResolutionScalingInfo& resolution,
+                     u32 max_extent) noexcept {
+    // A scale that does not enlarge the image (1x, 0.5x, 0.75x) always fits: refusing it would
+    // leave the image at its native size, larger than the scaled one.
+    if (resolution.up_scale <= (1U << resolution.down_shift)) {
+        return true;
+    }
+    const auto [samples_x, samples_y] = SamplesLog2(info.num_samples);
+    const u32 width = resolution.ScaleUp(info.size.width) >> samples_x;
+    const u32 height =
+        (info.type == ImageType::e2D ? resolution.ScaleUp(info.size.height) : info.size.height) >>
+        samples_y;
+    return width <= max_extent && height <= max_extent;
 }
 
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,

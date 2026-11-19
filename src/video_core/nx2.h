@@ -6,21 +6,25 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/nx2_gpu_write_listener.h"
+#include "common/thread.h"
 #include "video_core/nx2_frame_fence.h"
+#include "video_core/one_follower_hooks.h"
 
 namespace Tegra {
 
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
-// Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
+// Ampere classes and the Turing+ macro ISA, which the emulator's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
@@ -109,8 +113,7 @@ inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_com
     return true;
 }
 
-// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it
-// (zortos293/Lichii#559).
+// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it.
 inline std::atomic<u32> g_nx2_async_reports_generation{};
 inline std::atomic<u32> g_nx2_async_reports_waiters{};
 
@@ -209,7 +212,7 @@ inline std::atomic<u64> g_nx2_guest_writes_collected{};
 /// mutexes stayed taken (EDEN_NX2_EXP60).
 inline std::atomic<u64> g_nx2_guest_reads_handed{};
 
-/// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
+/// Whether any page of the range may have been written by the GPU.
 [[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return false;
@@ -464,7 +467,7 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 }
 
 // GPU semaphore writes as they land in guest memory: EXP13=2 marks the release records they
-// belong to (#717's landed counter, per record: VideoCommon::QmdPrediction::NoteLanded, which
+// belong to (the original landed counter, per record: VideoCommon::QmdPrediction::NoteLanded, which
 // sets the hook once it records). The landing sites call it BEFORE they write the word, so a
 // front that reads the new word also finds the record marked.
 enum class Nx2Landing : u32 {
@@ -488,8 +491,70 @@ inline void Nx2NoteLanded(u64 device_address, u32 value, Nx2Landing kind) {
     }
 }
 
+/// EDEN_NX2_GPU_WAKE (ported): wakes the GPU thread while it waits for
+/// suspended channels (gpu_thread.cpp) on what lets a channel go on: a new command
+/// (ThreadManager::PushCommand) and a GPU write that latches a waiter (Nx2SemaphoreWaiters::
+/// OnWrite). A guest CPU store to a semaphore goes straight to memory through fastmem and sends
+/// nothing: the waiting thread watches the words instead (Nx2SemaphoreWaiters::WordStored).
+/// The original's wake on a GPU tick a command list copy waits for is not ported: this tree has no such
+/// waits. While the switch is off (`enabled` false) Notify returns at once.
+class Nx2PendingWake {
+public:
+    static Nx2PendingWake& Get() {
+        static Nx2PendingWake wake;
+        return wake;
+    }
+
+    /// GPU thread: whether the wait below is used (EDEN_NX2_GPU_WAKE). A Notify racing a change
+    /// may be missed; every wait is bounded, so that costs at most one wait.
+    void SetEnabled(bool on) {
+        if (enabled.load(std::memory_order_relaxed) != on) {
+            enabled.store(on, std::memory_order_relaxed);
+        }
+    }
+    [[nodiscard]] bool Enabled() const {
+        return enabled.load(std::memory_order_relaxed);
+    }
+
+    void Notify() {
+        if (!enabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (!woken.exchange(true, std::memory_order_seq_cst) &&
+            sleeping.load(std::memory_order_seq_cst)) {
+            event.Set();
+        }
+    }
+
+    /// Called before the waiter checks its channels: a Notify after it ends the next wait.
+    void Arm() {
+        woken.exchange(false, std::memory_order_acq_rel);
+    }
+
+    /// Waits in hardware (Common::WaitForFlag) until a Notify or the deadline; true if notified.
+    bool Poll(std::chrono::steady_clock::time_point deadline) {
+        return Common::WaitForFlag(woken, deadline);
+    }
+
+    /// Blocks in the OS until a Notify, for at most `time`; true if notified.
+    bool Sleep(std::chrono::nanoseconds time) {
+        sleeping.store(true, std::memory_order_seq_cst);
+        if (!woken.load(std::memory_order_seq_cst)) {
+            event.SleepFor(time);
+        }
+        sleeping.store(false, std::memory_order_relaxed);
+        return woken.load(std::memory_order_acquire);
+    }
+
+private:
+    alignas(64) std::atomic<bool> woken{};
+    std::atomic<bool> sleeping{};
+    std::atomic<bool> enabled{};
+    Common::Event event;
+};
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
-/// Eden writes releases in bursts when fences signal and resumes waiters only between command
+/// The emulator writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
 class Nx2SemaphoreWaiters {
 public:
@@ -503,10 +568,16 @@ public:
         return waiters;
     }
 
-    void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
+    /// `word`, if set, is the semaphore in host memory (4-byte aligned), for WordStored
+    /// (EDEN_NX2_GPU_WAKE; null while it is off).
+    void Add(const void* owner, u64 device_address, u32 value, u32 operation,
+             u32* word = nullptr) {
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        waiters.push_back({owner, device_address, value, operation, false});
+        const u32 seen =
+            word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
+        waiters.push_back({owner, device_address, value, operation, false, word, seen,
+                           std::chrono::steady_clock::now()});
         count.store(waiters.size(), std::memory_order_release);
     }
 
@@ -519,6 +590,15 @@ public:
         count.store(waiters.size(), std::memory_order_release);
     }
 
+    /// A new emulation session (nvdrv's Module): the previous session's waiters are gone. Left
+    /// in, a hang report listed acquires waiting longer than the session ran (a tester's log
+    /// 2026-11-17: 6 waiters of 2,500-6,300 s) and read their words through stale pointers.
+    void Clear() {
+        std::scoped_lock lk{mutex};
+        waiters.clear();
+        count.store(0, std::memory_order_release);
+    }
+
     [[nodiscard]] bool Latched(const void* owner) {
         if (count.load(std::memory_order_acquire) == 0) {
             return false;
@@ -528,19 +608,81 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
+    /// GPU thread (EDEN_NX2_GPU_WAKE): whether a watched word changed in memory since it was
+    /// added or since the last call. Guest CPU stores to a semaphore notify nothing; the thread
+    /// checks this while it waits.
+    [[nodiscard]] bool WordStored() {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        bool stored = false;
+        std::scoped_lock lk{mutex};
+        for (auto& w : waiters) {
+            if (w.word == nullptr) {
+                continue;
+            }
+            const u32 current = std::atomic_ref<u32>{*w.word}.load(std::memory_order_relaxed);
+            if (current != w.seen) {
+                w.seen = current;
+                stored = true;
+            }
+        }
+        return stored;
+    }
+
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
         // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, and Nx2NoteLanded
         // are called by each write site itself.)
+        VideoCommon::OneFollower::NoteSemaphoreWrite(device_address);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    latched = true;
+                }
             }
         }
+        if (latched) {
+            VideoCommon::OneFollower::NoteLatch();
+            // EDEN_NX2_GPU_WAKE: wakes the GPU thread's wait (returns at once while it is off).
+            Nx2PendingWake::Get().Notify();
+        }
+    }
+
+    /// One follower's hang watchdog: each waiter as `f(address, value, operation, latched,
+    /// word)`, `word` the semaphore's host copy or null. Under the lock: `f` must not block.
+    template <typename F>
+    void ForEach(F&& f) {
+        std::scoped_lock lk{mutex};
+        for (const auto& w : waiters) {
+            f(w.address, w.value, w.operation, w.latched, w.word);
+        }
+    }
+
+    /// The hang report (FRITCHII_HANG_REPORT_S): ForEach without blocking.
+    /// `f(address, value, operation, latched, word, seconds waiting)`. False, with nothing
+    /// visited, when the lock stayed held for 200 ms (a report must never hang on it).
+    template <typename F>
+    bool TryForEach(F&& f) {
+        std::unique_lock lk{mutex, std::defer_lock};
+        for (int attempt = 0; !lk.try_lock(); ++attempt) {
+            if (attempt >= 200) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& w : waiters) {
+            f(w.address, w.value, w.operation, w.latched, w.word,
+              std::chrono::duration<double>(now - w.since).count());
+        }
+        return true;
     }
 
 private:
@@ -550,6 +692,9 @@ private:
         u32 value;
         u32 operation;
         bool latched;
+        u32* word;  ///< The semaphore in host memory, or null (EDEN_NX2_GPU_WAKE)
+        u32 seen;   ///< *word when last looked at (WordStored)
+        std::chrono::steady_clock::time_point since; ///< When it was added (the hang report)
     };
 
     static bool Matches(const Waiter& w, u32 current) {

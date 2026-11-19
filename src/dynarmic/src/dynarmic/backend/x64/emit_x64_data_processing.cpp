@@ -985,6 +985,11 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, size_t 
         code.lahf();
         code.seto(code.al);
         ctx.reg_alloc.DefineValue(code, nzcv_inst, nzcv);
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): nzcv is a snapshot of the live flags, and what
+        // follows here (setc, seto) leaves them alone.
+        if (ctx.track_host_flags) {
+            ctx.HostFlagsHoldNZCV(nzcv_inst);
+        }
     }
     if (carry_inst) {
         code.setc(carry);
@@ -1081,6 +1086,11 @@ static void EmitSub(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
         code.lahf();
         code.seto(code.al);
         ctx.reg_alloc.DefineValue(code, nzcv_inst, nzcv);
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): nzcv is a snapshot of the live flags (CF already
+        // turned into ARM C by the cmc), and what follows here (setc/setnc, seto) leaves them.
+        if (ctx.track_host_flags) {
+            ctx.HostFlagsHoldNZCV(nzcv_inst);
+        }
     }
     if (carry_inst) {
         if (invert_output_carry) {

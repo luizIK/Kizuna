@@ -165,19 +165,12 @@ bool ApplyTheme() {
     return true;
 }
 
-bool HidesSetting(const std::string& label) {
-    if (!Enabled()) {
-        return false;
+QIcon IconTinted(const QString& name, const QColor& color, int px) {
+    QFile file(QStringLiteral(":/fritchii/icons/%1.svg").arg(name));
+    if (!file.open(QFile::ReadOnly)) {
+        return {};
     }
-    // Kizuna: frame generation is offered (the owner asked for it, 2026-11-11); its flow dump
-    // stays a dev tool.
-    if (Common::KizunaDetail::IsKizunaBuild()) {
-        return label == "frame_gen_dump_flow";
-    }
-    // No frame generation in Fritchii (real frames only), and its options are dev tools.
-    return label.starts_with("frame_gen");
-}
-
+    return QIcon(RenderSvg(file.readAll(), color, px));
 void ShowNotice(QWidget* anchor, const QString& text) {
     static QPointer<QLabel> label;
     static QPointer<QTimer> timer;
@@ -278,6 +271,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     view->addAction(ui.action_Single_Window_Mode);
     view->addSeparator();
     view->addAction(ui.action_Show_Performance_Overlay);
+    view->addAction(ui.action_Show_Frame_Times);
     view->addAction(ui.action_Show_Status_Bar);
     view->addAction(ui.action_Show_Filter_Bar);
     view->addSeparator();
@@ -315,7 +309,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     tools->addMenu(advanced);
     ui.menubar->removeAction(ui.menu_Multiplayer->menuAction());
 
-    // Help: the log first; Eden's mods page leaves the menu.
+    // Help: the log first; the original mods page leaves the menu.
     auto* export_log = new QAction(tr("&Export Log..."), &window);
     QObject::connect(export_log, &QAction::triggered, &window, hooks.export_log);
     ui.menu_Help->removeAction(ui.action_Open_Mods_Page);
@@ -368,6 +362,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Carousel_View, tr("&Carousel"));
     Rename(ui.action_Show_Game_Name, tr("Show Game &Names"));
     Rename(ui.action_Show_Performance_Overlay, tr("&Performance Overlay"));
+    Rename(ui.action_Show_Frame_Times, tr("Overlay &Frame Times"));
     Rename(ui.action_Show_Status_Bar, tr("&Status Bar"));
     Rename(ui.action_Show_Filter_Bar, tr("Search &Bar"));
     Rename(ui.action_Single_Window_Mode, tr("Single &Window"));
@@ -437,67 +432,6 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
             Settings::values.anti_aliasing.GetValue(),
             [](Settings::AntiAliasing mode) { Settings::values.anti_aliasing.SetValue(mode); },
             true);
-        if (Common::KizunaDetail::IsKizunaBuild()) {
-            // Kizuna: AMD FSR in place of Ocarina's own upscale pass (the "Ocarina of Time
-            // anti-aliasing" setting), read when the game starts.
-            const std::map<Settings::OotAntiAliasing, QString> upscalers{
-                {Settings::OotAntiAliasing::Game, QObject::tr("Game (its own anti-aliasing)")},
-                {Settings::OotAntiAliasing::NoSharpening, QObject::tr("No sharpening")},
-                {Settings::OotAntiAliasing::Fsr3, QObject::tr("AMD FSR 3.1")},
-                {Settings::OotAntiAliasing::Fsr4,
-                 QObject::tr("AMD FSR 4 (FSR 3.1 without AMD's files)")},
-            };
-            QMenu* upscaler = add_choices(
-                QObject::tr("Ocarina &Upscaler (FSR)"), upscalers,
-                Settings::values.oot_anti_aliasing.GetValue(),
-                [hooks](Settings::OotAntiAliasing mode) {
-                    Settings::values.oot_anti_aliasing.SetValue(mode);
-                    if (hooks.save) {
-                        hooks.save();
-                    }
-                    if (hooks.notice && hooks.game_running && hooks.game_running()) {
-                        hooks.notice(QObject::tr(
-                            "Upscaler: takes effect the next time the game starts"));
-                    }
-                },
-                true);
-            upscaler->addSeparator();
-            upscaler->addAction(QObject::tr("FSR sharpness: More Settings > Graphics"))
-                ->setEnabled(false);
-
-            // Frame generation (the built-in optical flow interpolation after AMD FSR 3, by
-            // default; Lossless Scaling's in More Settings): live, no restart.
-            const std::map<u32, QString> multipliers{
-                {0, QObject::tr("Off")},
-                {2, QObject::tr("On, 2x")},
-                {3, QObject::tr("On, 3x")},
-                {4, QObject::tr("On, 4x")},
-            };
-            const u32 current = Settings::values.frame_gen.GetValue()
-                                    ? Settings::FrameGenMultiplier()
-                                    : 0;
-            QMenu* frame_gen = add_choices(
-                QObject::tr("Frame &Generation"), multipliers, current,
-                [hooks](u32 multiplier) {
-                    Settings::values.frame_gen.SetValue(multiplier != 0);
-                    if (multiplier != 0) {
-                        Settings::values.frame_gen_multiplier.SetValue(multiplier);
-                    }
-                    if (hooks.save) {
-                        hooks.save();
-                    }
-                    if (hooks.notice) {
-                        hooks.notice(multiplier != 0
-                                         ? QObject::tr("Frame generation: %1x").arg(multiplier)
-                                         : QObject::tr("Frame generation: off"));
-                    }
-                },
-                true);
-            frame_gen->addSeparator();
-            frame_gen->addAction(QObject::tr("Best with 30 FPS (Ctrl+U) on a 60 Hz screen"))
-                ->setEnabled(false);
-            frame_gen->addAction(QObject::tr("Ctrl+G turns it on and off"))->setEnabled(false);
-        }
 #ifdef HAS_RESHADE
         QMenu* effects = menu.addMenu(QObject::tr("&Effects"));
         auto* effects_group = new QActionGroup(effects);

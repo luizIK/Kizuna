@@ -19,7 +19,7 @@ namespace Vulkan {
 using SparseBuffer = vk::Handle<VkBuffer, VkDevice, vk::DeviceDispatch>;
 
 class Device;
-class Scheduler;
+class SeamClock;
 
 struct MultiRangeSource {
     VkBuffer handle{};
@@ -48,7 +48,7 @@ public:
 
     YUZU_NON_COPYABLE(MultiRangeBufferCache);
 
-    [[nodiscard]] MultiRangeRef Get(const Device& device, Scheduler& scheduler,
+    [[nodiscard]] MultiRangeRef Get(const Device& device, SeamClock& clock,
                                     MemoryAllocator& memory_allocator, u64 key,
                                     std::span<const MultiRangeSource> sources,
                                     VkDeviceSize total);
@@ -57,7 +57,7 @@ public:
 
     void Invalidate(u64 key);
 
-    void DropOwner(Scheduler& scheduler, VkBuffer owner);
+    void DropOwner(SeamClock& clock, VkBuffer owner);
 
     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
     bool use_sparse{};
@@ -86,15 +86,15 @@ private:
 
     [[nodiscard]] bool CanBindSparse(std::span<const MultiRangeSource> sources) const;
 
-    [[nodiscard]] SparseBuffer CreateSparse(const Device& device, Scheduler& scheduler,
+    [[nodiscard]] SparseBuffer CreateSparse(const Device& device, SeamClock& clock,
                                             std::span<const MultiRangeSource> sources,
                                             VkDeviceSize total);
 
     [[nodiscard]] VkDeviceSize QueryBlockSize(const Device& device, u32& memory_type_bits) const;
 
-    void RetireEntry(Scheduler& scheduler, Entry& entry);
+    void RetireEntry(SeamClock& clock, Entry& entry);
 
-    void DrainRetired(Scheduler& scheduler);
+    void DrainRetired(SeamClock& clock);
 
     ::Common::unordered_map<u64, Entry> entries;
     boost::container::static_vector<Retired, MAX_RETIRED> retired;

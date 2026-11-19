@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_subdirectory(host_shaders)
@@ -15,15 +14,20 @@ endif()
 
 add_library(video_core STATIC
     async_translate.h
+    back_read_audit.cpp
+    back_read_audit.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/cache_inputs.h
+    buffer_cache/mem_read_log.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/nx2_bytes_equal.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
+    buffer_churn_stats.h
     cache_types.h
     capture.h
     cdma_pusher.cpp
@@ -31,6 +35,7 @@ add_library(video_core STATIC
     churn_counters.h
     compatible_formats.cpp
     compatible_formats.h
+    compute_skip_hook.h
     control/channel_state.cpp
     control/channel_state.h
     control/channel_state_cache.cpp
@@ -42,6 +47,7 @@ add_library(video_core STATIC
     dirty_flags.h
     dma_pusher.cpp
     dma_pusher.h
+    early_compute.h
     engines/sw_blitter/blitter.cpp
     engines/sw_blitter/blitter.h
     engines/sw_blitter/converter.cpp
@@ -65,6 +71,9 @@ add_library(video_core STATIC
     engines/puller.h
     framebuffer_config.cpp
     framebuffer_config.h
+    fritchii_delta_path.h
+    fritchii_draw_kinds.h
+    fritchii_report_runs.h
     render_trace.h
     fsr.cpp
     fsr.h
@@ -100,9 +109,26 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_hle_oot.cpp
+    macro_hle_oot.h
+    macro_ops_oot.h
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    fritchii_e_split.cpp
+    fritchii_e_split.h
+    fritchii_e_split_thread.cpp
+    fritchii_e_split_thread.h
+    fritchii_fill_cuts.h
+    fritchii_occl_lean.h
+    fritchii_front_split.cpp
+    fritchii_front_split.h
+    fritchii_focus.h
+    fritchii_occlusion.h
+    fritchii_price.cpp
+    fritchii_price.h
+    fritchii_s4_count.cpp
+    fritchii_s4_count.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -114,6 +140,11 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    memstage_shadow.cpp
+    memstage_shadow.h
+    memstage_shadow_engine.h
+    memory_stage_link.cpp
+    memory_stage_link.h
     page_filter.h
     pipeline_cache_files.cpp
     pipeline_cache_files.h
@@ -121,21 +152,36 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_cb_path.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
+    nx2_fastdraw_count.h
+    nx2_ghost_pools.h
     nx2_precompile.cpp
     nx2_precompile.h
     nx2_recipe.cpp
     nx2_recipe.h
+    nx2_report_census.h
     nx2_debug_control.h
     nx2_frame_fence.h
     nx2_list_verify.h
     nx2_profile.h
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
+    nx2_runahead.cpp
+    nx2_runahead.h
+    nx2_write_track.cpp
+    nx2_write_track.h
     nx2_perf.h
     nx2_download_trace.h
     nx2_async_readback.h
+    one_follower.cpp
+    one_follower.h
+    one_follower_draw.cpp
+    one_follower_hooks.h
+    one_follower_view.cpp
+    one_follower_stats.cpp
+    one_follower_stats.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -199,6 +245,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_buffer_cache_base.cpp
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
+    renderer_vulkan/vk_buffer_recycler.h
     renderer_vulkan/vk_command_pool.cpp
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
@@ -214,6 +261,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
     renderer_vulkan/vk_ocarina_camera_motion.h
+    renderer_vulkan/vk_async_compute_skip.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_cooperative_hmma_test.cpp
@@ -236,6 +284,14 @@ add_library(video_core STATIC
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
+    renderer_vulkan/vk_mem_stage.cpp
+    renderer_vulkan/vk_mem_stage.h
+    renderer_vulkan/vk_mem_stage_hook.h
+    renderer_vulkan/vk_mem_stage_shadow.h
+    renderer_vulkan/vk_one_follower_draw.cpp
+    renderer_vulkan/vk_one_follower_draw.h
+    renderer_vulkan/vk_pipeline_binary.cpp
+    renderer_vulkan/vk_pipeline_binary.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp
@@ -258,13 +314,24 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/vk_seam_clock.h
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
+    renderer_vulkan/vk_side_queue.cpp
+    renderer_vulkan/vk_side_queue.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
+    renderer_vulkan/vk_pcie_link.cpp
+    renderer_vulkan/vk_pcie_link.h
+    renderer_vulkan/vk_sim_gpu_slow.cpp
+    renderer_vulkan/vk_sim_gpu_slow.h
+    renderer_vulkan/vk_sim_link_hog.cpp
+    renderer_vulkan/vk_sim_link_hog.h
+    renderer_vulkan/vk_submit_times.cpp
+    renderer_vulkan/vk_submit_times.h
     renderer_vulkan/vk_swapchain.cpp
     renderer_vulkan/vk_swapchain.h
     renderer_vulkan/vk_texture_cache.cpp
@@ -275,6 +342,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
     renderer_vulkan/descriptor_payload_growth.h
+    vulkan_common/vulkan_cmd_stats.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -287,8 +355,8 @@ add_library(video_core STATIC
     vulkan_common/unbacked_fallback.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
-    vulkan_common/vulkan_pipeline_binaries.cpp
-    vulkan_common/vulkan_pipeline_binaries.h
+    vulkan_common/vulkan_kept_blocks.cpp
+    vulkan_common/vulkan_kept_blocks.h
     vulkan_common/vulkan_surface.cpp
     vulkan_common/vulkan_surface.h
     vulkan_common/vulkan_wrapper.cpp
@@ -305,6 +373,7 @@ add_library(video_core STATIC
     shader_environment.h
     evicted_pointer_slots.h
     shader_handle_program.h
+    texture_handle_values.h
     shader_notify.cpp
     shader_notify.h
     shader_warm/shader_archives.cpp
@@ -336,10 +405,14 @@ add_library(video_core STATIC
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
+    texture_cache/relocation_memory.cpp
+    texture_cache/relocation_memory.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
+    test_watermark.cpp
+    test_watermark.h
     texture_cache/texture_cache_base.h
     texture_cache/types.h
     texture_cache/util.cpp
@@ -361,40 +434,6 @@ add_library(video_core STATIC
     video_core.cpp
     video_core.h
 )
-
-if (ENABLE_LSFG)
-    target_sources(video_core PRIVATE
-        frame_gen/lossless_dll.cpp
-        frame_gen/lossless_dll.h
-        frame_gen/lsfg_translate.cpp
-        frame_gen/lsfg_translate.h
-        renderer_vulkan/present/frame_gen.cpp
-        renderer_vulkan/present/frame_gen.h
-        renderer_vulkan/present/fsr3_frame_gen.cpp
-        renderer_vulkan/present/fsr3_frame_gen.h
-        renderer_vulkan/present/frame_gen_pacer.cpp
-        renderer_vulkan/present/frame_gen_pacer.h
-        renderer_vulkan/present/lsfg_alpha.cpp
-        renderer_vulkan/present/lsfg_alpha.h
-        renderer_vulkan/present/lsfg_beta.cpp
-        renderer_vulkan/present/lsfg_beta.h
-        renderer_vulkan/present/lsfg_chain.cpp
-        renderer_vulkan/present/lsfg_chain.h
-        renderer_vulkan/present/lsfg_common.cpp
-        renderer_vulkan/present/lsfg_common.h
-        renderer_vulkan/present/lsfg_delta.cpp
-        renderer_vulkan/present/lsfg_delta.h
-        renderer_vulkan/present/lsfg_gamma.cpp
-        renderer_vulkan/present/lsfg_gamma.h
-        renderer_vulkan/present/lsfg_generate.cpp
-        renderer_vulkan/present/lsfg_generate.h
-        renderer_vulkan/present/lsfg_mipmaps.cpp
-        renderer_vulkan/present/lsfg_mipmaps.h
-        renderer_vulkan/present/lsfg_shaders.cpp
-        renderer_vulkan/present/lsfg_shaders.h
-    )
-    target_compile_definitions(video_core PUBLIC HAS_LSFG)
-endif()
 
 if (ENABLE_RESHADE)
     set(BUNDLED_FX_DIR ${CMAKE_SOURCE_DIR}/dist/post_shaders)
@@ -442,7 +481,8 @@ endif()
 
 # "Preparing shaders" is stamped with a hash of what decides the driver's compiled pipelines (the
 # shader recompiler, pipeline creation, the precompile step), not the release version
-# (CMakeModules/Nx2ShaderStamp.cmake): releases that change no shader skip the step.
+# (CMakeModules/Nx2ShaderStamp.cmake): releases that change no shader skip the step. A change to
+# any of these files, even a comment, makes every player prepare again: read that script first.
 file(GLOB_RECURSE NX2_SHADER_STAMP_INPUTS CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.cpp"
     "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.h"
@@ -526,8 +566,7 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
-    # dwmapi: vk_host_pacer.cpp (its #pragma comment(lib) is ignored by MinGW's linker).
-    target_link_libraries(video_core PRIVATE advapi32 dwmapi)
+    target_link_libraries(video_core PRIVATE advapi32)
 endif()
 
 # Shader warm-up builder: game archives use zstd (also with dictionaries) and zlib.

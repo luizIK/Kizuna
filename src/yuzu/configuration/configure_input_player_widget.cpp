@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -227,9 +226,23 @@ void PlayerControlPreview::UpdateInput() {
 
 void PlayerControlPreview::paintEvent(QPaintEvent* event) {
     QFrame::paintEvent(event);
+    if (rect().width() <= 0 || rect().height() <= 0) {
+        return;
+    }
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
-    const QPointF center = rect().center();
+
+    // The drawings span about 460 x 340 px around the center. A smaller frame shrinks them to fit
+    // instead of cutting them off; a frame that fits draws them exactly as before.
+    constexpr qreal BaseWidth = 460.0;
+    constexpr qreal BaseHeight = 340.0;
+    const qreal scale = (std::min)(static_cast<qreal>(rect().width()) / BaseWidth,
+                                   static_cast<qreal>(rect().height()) / BaseHeight);
+    p.translate(QPointF(rect().center()));
+    if (scale < 1.0) {
+        p.scale(scale, scale);
+    }
+    const QPointF center(0, 0);
 
     switch (controller_type) {
     case Core::HID::NpadStyleIndex::Handheld:

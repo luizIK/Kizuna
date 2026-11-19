@@ -67,7 +67,7 @@ Launch Schedule(NativeQmdScheduler& scheduler, Address address, const std::map<A
 
 TEST_CASE("An undecodable QMD release slot keeps the other releases and the dependent QMD",
           "[video_core][native_qmd]") {
-    // Orbitals (#400): both channels wait on 0x1b18871010, released by slot 0 of this QMD.
+    // Orbitals: both channels wait on 0x1b18871010, released by slot 0 of this QMD.
     constexpr Address first = 0x1b19635400;
     constexpr Address second = 0x1b19635500;
     auto qmd = MakeQmd();

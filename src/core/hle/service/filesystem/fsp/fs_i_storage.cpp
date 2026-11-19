@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -37,8 +36,8 @@ Result IStorage::Read(
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
 
-    // EDEN_NX2_READ_THROTTLE=0 (boot): no 40 MB/s pacing of game file reads. Upstream added it
-    // for video freezes in other games (Eden #4525); in Ocarina of Time it slept 36-151 ms at
+    // EDEN_NX2_READ_THROTTLE=0 (boot): no 40 MB/s pacing of game file reads. The original code added it
+    // for video freezes in other games; in Ocarina of Time it slept 36-151 ms at
     // boot and area loads and 47 ms when a killed Peahat loaded its effects (2026-11-10).
     static const bool throttle = [] {
         const char* const value = std::getenv("EDEN_NX2_READ_THROTTLE");

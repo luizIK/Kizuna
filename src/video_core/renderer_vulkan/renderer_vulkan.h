@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -13,9 +12,6 @@
 #include "common/dynamic_library.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_base.h"
-#ifdef HAS_LSFG
-#include "video_core/renderer_vulkan/present/frame_gen.h"
-#endif
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -71,8 +67,6 @@ private:
     std::chrono::steady_clock::time_point trace_last_frame{};
     u64 trace_frame{};
 
-    void InterpolateFrames(Frame* prev_frame, Frame* curr_frame);
-    Frame* previous_frame = nullptr;  // Store the previous frame for interpolation
     VkCommandBuffer BeginSingleTimeCommands();
     void EndSingleTimeCommands(VkCommandBuffer command_buffer);
     void Report() const;
@@ -99,6 +93,8 @@ private:
     vk::Instance instance;
 
     vk::DebugUtilsMessenger debug_messenger;
+    /// FRITCHII_VA_REPORT=1: the driver's GPU address binds and unbinds (device loss reports).
+    vk::DebugUtilsMessenger va_report_messenger;
 
     vk::SurfaceKHR surface;
 
@@ -112,9 +108,6 @@ private:
     BlitScreen blit_capture;
     BlitScreen blit_applet;
     RasterizerVulkan rasterizer;
-#ifdef HAS_LSFG
-    FrameGen frame_gen;
-#endif
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;

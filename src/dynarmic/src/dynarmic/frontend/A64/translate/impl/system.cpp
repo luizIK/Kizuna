@@ -8,6 +8,8 @@
 
 #include "dynarmic/frontend/A64/translate/impl/impl.h"
 
+#include "dynarmic/common/fritchii_cheap_barriers.h"
+
 namespace Dynarmic::A64 {
 
 // Register encodings used by MRS and MSR.
@@ -86,7 +88,20 @@ bool TranslatorVisitor::DSB(Imm<4> /*CRm*/) {
     return true;
 }
 
-bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
+bool TranslatorVisitor::DMB(Imm<4> CRm) {
+#ifdef ARCHITECTURE_x86_64
+    // FRITCHII_JIT_CHEAP_BARRIERS=1 or 3 (zortos293/Lichii #1327): DMB *LD (loads before later
+    // accesses) and DMB *ST (stores before later stores) order what x86 already orders, so only a
+    // full barrier needs the mfence. CRm<1:0> = 00 is a full barrier too.
+    if (Fritchii::SkipLoadStoreDmb()) {
+        const u32 access = CRm.ZeroExtend() & 3U;
+        if (access == 1U || access == 2U) {
+            return true;
+        }
+    }
+#else
+    (void)CRm;
+#endif
     ir.DataMemoryBarrier();
     return true;
 }

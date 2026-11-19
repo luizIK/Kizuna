@@ -66,6 +66,17 @@ private:
     u64 generation{1};
     std::array<u64, FRAMES_IN_FLIGHT> frame_ticks{};
     bool frame_reused{};
+
+    // Counters for the two places that submit in the middle of a draw's setup (a full GPU wait):
+    // logged at most once a minute while they rise, and at shutdown with the peak frame use.
+    void ReportCounters(bool shutdown);
+    VkDeviceSize frame_spill{};      ///< This frame's bytes before an exhausted frame restarted
+    VkDeviceSize peak_frame_bytes{}; ///< The most descriptor bytes one frame used
+    u64 exhausted{};                 ///< The frame's chunks ran out: scheduler.Finish()
+    u64 reuse_flushes{};             ///< Reusing a frame slot whose tick was not submitted yet
+    u64 frames{};
+    u64 reported_events{};
+    u64 reported_frame{};
 };
 
 } // namespace Vulkan

@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -22,6 +21,12 @@ public:
     void Lock();
     void Unlock();
     bool TryLock();
+
+    // EXP98: true when no one holds the lock. The acquire pairs with Unlock's release, so every
+    // write of a completed critical section is visible after it reads true.
+    bool IsFree() const {
+        return m_state.load(std::memory_order_acquire) == 0;
+    }
 
 private:
     // 0 free, 1 held, 2 held with (possible) sleepers. The scheduler lock is taken by every

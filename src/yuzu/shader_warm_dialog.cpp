@@ -115,7 +115,12 @@ ShaderWarmDialog::ShaderWarmDialog(Core::System& system_, std::filesystem::path 
                                 this);
         note->setWordWrap(true);
         QFont font = note->font();
-        font.setPointSizeF(font.pointSizeF() * 1.2);
+        // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+        if (font.pointSizeF() > 0) {
+            font.setPointSizeF(font.pointSizeF() * 1.2);
+        } else if (font.pixelSize() > 0) {
+            font.setPixelSize(static_cast<int>(font.pixelSize() * 1.2 + 0.5));
+        }
         note->setFont(font);
         note->setContentsMargins(0, 0, 0, 8);
         layout->addWidget(note);

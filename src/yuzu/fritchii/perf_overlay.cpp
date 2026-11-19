@@ -12,8 +12,10 @@
 #include <QPainter>
 #include <QPainterPath>
 
+#include "common/frame_budget.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
+#include "qt_common/config/uisettings.h"
 #include "yuzu/main_window.h"
 
 #ifdef _WIN32
@@ -34,6 +36,10 @@ constexpr int Width = 272;
 constexpr int Height = 210;
 constexpr int RamRowTop = 66;
 constexpr int VramRowTop = RamRowTop + 26;
+// View > Frame Times: four rows under VRAM, the line moves down.
+constexpr int TimesRowTop = VramRowTop + 26;
+constexpr int TimesRows = 4;
+constexpr int TimesHeight = TimesRows * 26;
 constexpr int Pad = 18;
 constexpr int GraphHeight = 54;
 
@@ -110,7 +116,7 @@ PerfOverlay::PerfOverlay(MainWindow* main_window_, std::function<void()> on_hidd
       main_window{main_window_}, on_hidden{std::move(on_hidden_)} {
     setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_ShowWithoutActivating);
-    setFixedSize(Width, Height);
+    ApplyTimes();
     setCursor(Qt::OpenHandCursor);
     FollowWindow();
     connect(main_window, &MainWindow::positionChanged, this, &PerfOverlay::FollowWindow);
@@ -120,11 +126,39 @@ PerfOverlay::PerfOverlay(MainWindow* main_window_, std::function<void()> on_hidd
             });
 }
 
+PerfOverlay::~PerfOverlay() {
+    Common::FrameBudget::SetWanted(false);
+}
+
 void PerfOverlay::FollowWindow() {
     move(main_window->pos() + offset);
 }
 
+void PerfOverlay::ApplyTimes() {
+    times_on = UISettings::values.perf_overlay_times.GetValue();
+    setFixedSize(Width, Height + (times_on ? TimesHeight : 0));
+    times = {};
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(times_on && isVisible());
+}
+
+void PerfOverlay::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    Common::FrameBudget::Reset();
+    Common::FrameBudget::SetWanted(times_on);
+}
+
+void PerfOverlay::hideEvent(QHideEvent* event) {
+    QWidget::hideEvent(event);
+    Common::FrameBudget::SetWanted(false);
+}
+
 void PerfOverlay::OnStats(const Core::PerfStatsResults& results) {
+    if (UISettings::values.perf_overlay_times.GetValue() != times_on) {
+        ApplyTimes();
+    } else if (times_on && isVisible()) {
+        times = FrameBudgetView::Make(Common::FrameBudget::Take(), results.average_game_fps);
+    }
     if (!std::isnan(results.average_game_fps)) {
         fps = results.average_game_fps;
         fps_samples.push_back(fps > GapFps ? fps : std::numeric_limits<double>::quiet_NaN());
@@ -222,8 +256,51 @@ void PerfOverlay::paintEvent(QPaintEvent*) {
     memory_row(RamRowTop, ram_used_gb, tr("RAM"), ram_free_gb, 2.0);
     memory_row(VramRowTop, vram_used_gb, tr("VRAM"), vram_left_gb, 1.0);
 
+    // Frame Times: a value, then its name, like the memory rows; two to a row below the CPU.
+    if (times_on) {
+        using FrameBudgetView::Ms;
+        using FrameBudgetView::Percent;
+        using Common::FrameBudget::Group;
+        const auto item = [&](int left, int top, const QString& number, const QString& name) {
+            painter.setFont(value);
+            painter.setPen(Text);
+            painter.drawText(QRect(left, top, 120, 22), Qt::AlignLeft | Qt::AlignVCenter, number);
+            const int number_width = QFontMetrics(value).horizontalAdvance(number);
+            painter.setFont(label);
+            painter.setPen(Muted);
+            painter.drawText(QRect(left + number_width + 6, top, 80, 22),
+                             Qt::AlignLeft | Qt::AlignVCenter, name);
+        };
+        const auto right_text = [&](int top, const QString& text, const QColor& color) {
+            painter.setFont(label);
+            painter.setPen(color);
+            painter.drawText(QRect(right - 160, top, 160, 22), Qt::AlignRight | Qt::AlignVCenter,
+                             text);
+        };
+        const auto ms_of = [&](Group group) { return times.ms[static_cast<size_t>(group)]; };
+        int top = TimesRowTop;
+        item(Pad, top,
+             times.gpu_unsupported ? tr("n/a") : tr("%1 ms").arg(Ms(times.gpu_ms)), tr("GPU"));
+        if (!times.gpu_unsupported) {
+            right_text(top, tr("%1 busy").arg(Percent(times.gpu_share)), Muted);
+        }
+        top += 26;
+        item(Pad, top, Percent(times.cpu_share), tr("CPU"));
+        const bool capped = times.limit == FrameBudgetView::Limit::Capped;
+        right_text(top, FrameBudgetView::LimitText(times.limit), capped ? Muted : Accent);
+        top += 26;
+        const int column = Width / 2 + 4;
+        item(Pad, top, Ms(ms_of(Group::Front)), tr("Front"));
+        item(column, top, Ms(ms_of(Group::Back)), tr("Back"));
+        top += 26;
+        item(Pad, top, Ms(ms_of(Group::Game)), tr("Game"));
+        if (ms_of(Group::Render) >= 0) {
+            item(column, top, Ms(ms_of(Group::Render)), tr("Render"));
+        }
+    }
+
     // The line: the last samples against the target frame rate.
-    const QRectF graph(Pad, Height - Pad - GraphHeight, Width - 2 * Pad, GraphHeight);
+    const QRectF graph(Pad, height() - Pad - GraphHeight, Width - 2 * Pad, GraphHeight);
     const double target = Settings::values.oot_30fps.GetValue() ? 30.0 : 60.0;
     double top = target * 1.25;
     for (const double sample : fps_samples) {

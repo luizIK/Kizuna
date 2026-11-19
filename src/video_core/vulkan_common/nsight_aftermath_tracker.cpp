@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef HAS_NSIGHT_AFTERMATH
@@ -179,7 +178,7 @@ void NsightAftermathTracker::OnShaderDebugInfoCallback(const void* shader_debug_
 
 void NsightAftermathTracker::OnCrashDumpDescriptionCallback(
     PFN_GFSDK_Aftermath_AddGpuCrashDumpDescription add_description) {
-    add_description(GFSDK_Aftermath_GpuCrashDumpDescriptionKey_ApplicationName, "Eden");
+    add_description(GFSDK_Aftermath_GpuCrashDumpDescriptionKey_ApplicationName, "Fritchii");
 }
 
 void NsightAftermathTracker::GpuCrashDumpCallback(const void* gpu_crash_dump,

@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <functional>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -148,6 +149,14 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
+    /// The memory stage (FRITCHII_MEMSTAGE_PASS): takes the game's collected CPU writes into
+    /// `out` without applying them (nothing when every collector is empty), and lists `out` as
+    /// pending until ReleaseTakenWrites (rule T: landings of downloaded bytes leave them out).
+    /// `out` must not move or change while listed. True when listed.
+    bool TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out);
+    void ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list);
+    /// The lists taken and not applied yet (applying_writes; rule T's check).
+    [[nodiscard]] size_t ListedWrites();
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
@@ -224,6 +233,11 @@ public:
 
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
+
+    /// The hang report (FRITCHII_HANG_REPORT_S): logs the acquires channels are suspended on
+    /// (address, wait, value now, for how long), the syncpoint waits, and the GPU split / one
+    /// follower state. Read only, from any thread; never blocks on a lock for long.
+    void LogHangState();
 
     [[nodiscard]] bool UseNvdec() const;
 

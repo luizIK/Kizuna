@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -18,6 +17,8 @@
 #include <optional>
 #include <bit>
 #include <type_traits>
+#include <unordered_map>
+#include "common/cityhash.h"
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -27,21 +28,32 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "video_core/buffer_cache/mem_read_log.h"
+#include "video_core/compute_skip_hook.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/early_compute.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
+#include "video_core/small_card.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/texture_cache/relocation_memory.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/churn_counters.h"
 #include "video_core/nx2_profile.h"
+#include "common/nx2_hitch.h"
+#include "shader_recompiler/shader_info.h"
+#include "video_core/nx2_report_census.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -70,6 +82,16 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    // EXP100 (fable52_answer_imagereads 2): the mutex's release closes the counter a hold opened
+    // for gpu_image_filter. Before any other thread sees the cache.
+    mutex.SetReleaseHook(&VideoCommon::MirrorSeq::ReleaseHook, &image_seq);
+    // FRITCHII_RELOCATION_MEMORY: shapes guarded in earlier sessions (and the seed) never
+    // relocate, so their first read this session isn't lost (relocation_memory.h).
+    if (RelocationMemory::Enabled()) {
+        for (const auto& [shape_key, guard] : RelocationMemory::Load()) {
+            relocation_shapes[shape_key].guard |= guard;
+        }
+    }
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -147,7 +169,9 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const Common::WriteRing::SiteScope write_site{"texture download (garbage collector)", true};
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -157,23 +181,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
             allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
-        // Kizuna: past the critical threshold, but with no allocation refused for 600 frames, an
-        // image used in the last 120 frames is one the game is drawing with. Device memory can
-        // sit over the threshold for reasons the cache cannot free (other programs' share of the
-        // budget, Windows near its commit limit): for a whole session on an 8 GB card the
-        // 10-frame rule deleted textures a third of a second after their last use and decoded
-        // them again when the camera turned back, 60-150 ASTC decodes a second in Hyrule Field
-        // at 19-25 FPS (11,765 decodes in 450 s, 2026-11-13). EDEN_NX2_TC_AGGRESSIVE_AGE=<frames>
-        // sets the age (10: as before).
-        static const u64 calm_aggressive_age = [] {
-            const char* value = std::getenv("EDEN_NX2_TC_AGGRESSIVE_AGE");
-            return value != nullptr ? (std::max)(std::strtoull(value, nullptr, 10), 10ULL)
-                                    : 120ULL;
-        }();
-        const bool refused_lately = out_of_memory || (last_memory_failure_frame != ~0ULL &&
-                                                      frame_tick - last_memory_failure_frame < 600);
-        const u64 aggressive_age = refused_lately ? 10ULL : calm_aggressive_age;
-        ticks_to_destroy = aggressive_mode ? aggressive_age : high_priority_mode ? 25ULL : 50ULL;
+        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
@@ -181,57 +189,167 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
-        if (emergency) {
-            // A render target could not be allocated: this pass has to free enough for it, so it
-            // may take images idle for only a couple of frames (the next frame re-uploads them).
-            ticks_to_destroy = (std::max)(min_age, u64{2});
-            num_iterations = 48;
+        // FRITCHII_TC_COLLECT_OVER (live, default 0): past the critical memory, 40 deletes a
+        // frame is not enough where the game makes more images than that. Breaking pots in
+        // OoT's Hyrule Castle makes ~55 a frame (about 25 new 384x384 D32 shadow maps and the
+        // frame's targets, at addresses that move every frame), none replacing an older one: the
+        // cache grew ~15 images a frame until device memory ran out and the driver crashed on
+        // the next image (zortos #1306, RX 9070 XT). So one more delete per 2 MiB over the
+        // critical memory (up to 1,024 more), and from 1 GiB over, images unused for 3 frames go
+        // too instead of 10.
+        // FRITCHII_VRAM_BUDGET_MODE: also while the budget is short (budget_pressure).
+        if (aggressive_mode && total_used_memory > critical_memory &&
+            (budget_pressure ||
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
+                                              "FRITCHII_TC_COLLECT_OVER") != 0)) {
+            const u64 over = total_used_memory - critical_memory;
+            const size_t extra = static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
+            num_iterations += extra;
+            auto& stats = collect_port_stats;
+            ++stats.over_passes;
+            stats.over_extra += extra;
+            stats.over_peak = (std::max)(stats.over_peak, over);
+            if (over >= 1_GiB) {
+                ticks_to_destroy = (std::max)(min_age, u64{3});
+                ++stats.over_young;
+            }
+        }
+        // FRITCHII_TC_THRASH_GUARD: images the game keeps coming back to stay, however far past
+        // critical the cache is. An allocation that failed needs the memory now.
+        if (!out_of_memory) {
+            ticks_to_destroy = (std::max)(ticks_to_destroy, thrash_floor);
         }
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
-        if (num_iterations == 0) {
-            return true;
-        }
-        --num_iterations;
-        auto& image = slot_images[image_id];
+    // FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; zortos #1731): images this pass may not
+    // delete are skipped before they count against its budget. Without it, 10 or 20 old costly
+    // (ASTC) images at the old end of the list used up a normal or high-priority pass, which then
+    // deleted nothing although deletable images sat right behind them.
+    const bool skip_kept = VideoCore::Nx2Debug::SwitchValue(
+                               VideoCore::Nx2Debug::g_tc_collect_evictable,
+                               "FRITCHII_TC_COLLECT_EVICTABLE") != 0;
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode,
+                           &evict_old_costly](const Image& image, bool& must_download) {
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
-            (!high_priority_mode && must_download)) {
-            return false;
+        must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        return !((!aggressive_mode && !evict_old_costly &&
+                  True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                 (!high_priority_mode && must_download));
+    };
+    const bool covered_on = VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_covered_retire,
+                                "FRITCHII_COVERED_RETIRE") > 0;
+    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
+                          &CanEvict, skip_kept, out_of_memory, covered_on](ImageId image_id) {
+        if (num_iterations == 0) {
+            return true;
+        }
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::CollectPending)) {
+            return false; // EXP121: already counted as freed
+        }
+        bool must_download = false;
+        if (skip_kept) {
+            if (!CanEvict(image, must_download)) {
+                ++collect_port_stats.skipped;
+                return false;
+            }
+            --num_iterations;
+        } else {
+            --num_iterations;
+            if (!CanEvict(image, must_download)) {
+                return false;
+            }
+        }
+        // FRITCHII_COVERED_RETIRE: newer GPU writes cover every byte of it, so a download would
+        // only put bytes in guest memory that those images' own downloads replace. Checked again
+        // only after a newer image came to overlap it.
+        if (must_download && covered_on &&
+            image.covered_overlap_frame > image.covered_check_frame &&
+            CoveredByNewerWrites(image_id, image)) {
+            must_download = false;
+            ++covered_stats.collect_deleted;
+            covered_stats.deleted_bytes += ImageMemoryBytes(image);
+            if (covered_swept.size() >= 65536) {
+                covered_swept.clear();
+            }
+            covered_swept[image.gpu_addr] = frame_tick;
+        }
+        // EXP121 (live, 0 = off): record the download and delete the image at a later frame end,
+        // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
+        // allocation that failed needs the memory now, so it still waits.
+        bool queued = false;
+        // FRITCHII_LOST_WRITEBACK (default 1; zortos293/Lichii #1501's idea): a GPU-written bad
+        // overlap is written back before it goes, through the same queue; it was dropped, and the
+        // next image there showed other memory (the dialogue text corruption, #1310). An
+        // allocation that failed needs the memory now: dropped as before.
+        if (!must_download && !out_of_memory && True(image.flags & ImageFlagBits::BadOverlap)) {
+            switch (QueueLostWriteback(image_id, image, LostPathCollector)) {
+            case LostWriteback::Queued:
+                queued = true;
+                break;
+            case LostWriteback::Keep:
+                return false;
+            case LostWriteback::Drop:
+                break;
+            }
+        }
+        if (must_download && VideoCore::Nx2Debug::Experiment(121) != 0) {
+            if (out_of_memory) {
+                ++collect_stats.fallback_oom;
+            } else {
+                queued = QueueCollectDownload(image_id);
+            }
         }
         // EDEN_NX2_EXP57 (live, 0 = off): at most one download with a full wait for the GPU per
         // frame unless an allocation failed. A player's first high-priority pass downloaded
         // image after image and froze for 3 s (fable52_answer_3 s7); the rest wait for later
         // frames.
-        if (must_download && !out_of_memory && VideoCore::Nx2Debug::Experiment(57) != 0 &&
-            gc_waited_frame == frame_tick) {
+        if (!queued && must_download && !out_of_memory &&
+            VideoCore::Nx2Debug::Experiment(57) != 0 && gc_waited_frame == frame_tick) {
             ++gc_downloads_deferred;
             return false;
         }
-        if (must_download) {
-            gc_waited_frame = frame_tick;
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
-            // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
-            image.flags &= ~ImageFlagBits::GpuModified;
-            ClearStaleImage(image);
-        } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
+        if (!queued) {
+            if (must_download) {
+                gc_waited_frame = frame_tick;
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                ++collect_stats.waits;
+                DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+                ++gc_download_deletes;
+                NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
+                unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
+                // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
+                image.flags &= ~ImageFlagBits::GpuModified;
+                ClearStaleImage(image);
+            } else {
+                MarkStale(image); // before UntrackImage (see MarkStale)
+            }
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            // FRITCHII_TC_COLLECT_EVICTABLE: the block's fill stays current between the 60-frame
+            // refreshes, so later passes still find the emptiest blocks.
+            if constexpr (requires(const Image& img) { img.MemoryBlock(); }) {
+                if (skip_kept) {
+                    const auto block = image.MemoryBlock();
+                    const auto it = block.block != 0 ? block_image_bytes.find(block.block)
+                                                     : block_image_bytes.end();
+                    if (it != block_image_bytes.end()) {
+                        it->second -= (std::min)(it->second, block.size);
+                    }
+                }
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            collect_port_stats.deleted_aggressive += aggressive_mode ? 1 : 0;
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
         }
@@ -250,15 +368,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
     // used). Among the oldest candidates (8 per image this pass may delete), those in the
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
-    const auto Collect = [&] {
-        // Nothing is that old yet (the unsigned difference would wrap and take every image).
-        if (frame_tick <= ticks_to_destroy) {
-            return;
-        }
+    const auto Collect = [&](u64 age) {
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+            lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                if (skip_kept) {
+                    // FRITCHII_TC_COLLECT_EVICTABLE: only images this pass may delete.
+                    const Image& image = slot_images[image_id];
+                    bool must_download = false;
+                    if (True(image.flags & ImageFlagBits::CollectPending) ||
+                        !CanEvict(image, must_download)) {
+                        return false;
+                    }
+                }
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
@@ -296,7 +419,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
                 }
             }
         } else {
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+            lru_cache.ForEachItemBelow(frame_tick - age, Cleanup);
         }
     };
     Configure(false);
@@ -306,60 +429,233 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool emergency) {
     }();
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        if (skip_kept) {
+            // FRITCHII_TC_COLLECT_EVICTABLE: old costly images by block fill too, so their
+            // deletes empty blocks as the other passes' do.
+            Collect(old_age);
+        } else {
+            lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        }
         evict_old_costly = false;
     }
-    Collect();
+    Collect(ticks_to_destroy);
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        Collect(ticks_to_destroy);
     }
 }
 
 template <class P>
-bool TextureCache<P>::ReclaimMemoryNow() {
-    const u64 deleted_before = images_deleted;
-    RunGarbageCollector(true, true);
-    bool freed = images_deleted != deleted_before;
+bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
     if constexpr (requires { runtime.CurrentTick(); }) {
-        if (!gpu_sentenced_images.empty()) {
-            // The images just deleted (and earlier ones) still hold their memory until the GPU is
-            // past them. A failed render target is worth one wait: without it the frame is drawn
-            // into the null view (a skipped draw, or a crash) and the memory only comes back on a
-            // later frame.
-            runtime.Finish();
-            while (!gpu_sentenced_images.empty() &&
-                   runtime.IsFree(gpu_sentenced_images.front().tick)) {
-                if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
-                    gpu_sentenced_images.front().image.ReleaseToPool();
-                }
-                gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
-                gpu_sentenced_images.pop_front();
-            }
-            freed = true;
+        // Caps on what is held at once; past them the collector waits as before.
+        constexpr size_t MaxQueued = 64;
+        constexpr u64 MaxStaging = 256_MiB;
+        Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Sparse)) {
+            return false;
         }
+        const u64 staging_bytes = image.unswizzled_size_bytes;
+        if (collect_downloads.size() >= MaxQueued ||
+            collect_download_staging + staging_bytes > MaxStaging) {
+            ++collect_stats.fallback_cap;
+            return false;
+        }
+        // Deferred: the pool must not hand the buffer to anyone else until it is freed here.
+        auto map = runtime.DownloadStagingBuffer(staging_bytes, true);
+        const auto copies = FullDownloadCopies(image.info);
+        image.DownloadMemory(map, copies);
+        const u64 memory_bytes = (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
+                                 ImageMemoryBytes(image);
+        collect_downloads.push_back(CollectDownload{
+            .image_id = image_id,
+            .map = map,
+            .copies = copies,
+            .tick = runtime.CurrentTick(),
+            .frame = frame_tick,
+            .lru_tick = lru_cache.Tick(image.lru_index),
+            .image_modification = image.modification_tick,
+            .cache_modification = modification_tick,
+            .staging_bytes = staging_bytes,
+            .memory_bytes = memory_bytes,
+            .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
+            .lost_path = 0,
+        });
+        image.flags |= ImageFlagBits::CollectPending;
+        collect_download_staging += staging_bytes;
+        collect_download_memory += memory_bytes;
+        total_used_memory -= (std::min)(total_used_memory, memory_bytes);
+        ++collect_stats.made;
+        return true;
+    } else {
+        (void)image_id;
+        return false;
     }
-    if constexpr (requires { runtime.ReleaseImagePool(); }) {
-        freed |= runtime.ReleaseImagePool();
-    }
-    ++(freed ? emergency_reclaims : emergency_reclaim_failures);
-    static u32 logged{};
-    if (logged++ < 32) {
-        LOG_WARNING(HW_GPU, "Out of memory for a render target: {} (images deleted: {})",
-                    freed ? "reclaimed memory and retrying" : "nothing left to evict",
-                    images_deleted - deleted_before);
-    }
-    return freed;
 }
 
 template <class P>
-bool TextureCache<P>::RenderTargetsFailed() const noexcept {
-    for (const ImageViewId view : render_targets.color_buffer_ids) {
-        if (view == NULL_IMAGE_VIEW_ID) {
-            return true;
+void TextureCache<P>::DropCollectDownload(size_t index) {
+    CollectDownload& entry = collect_downloads[index];
+    slot_images[entry.image_id].flags &= ~ImageFlagBits::CollectPending;
+    // The image stays: its memory counts again (TickFrame leaves out the rest still queued).
+    total_used_memory += entry.memory_bytes;
+    collect_download_staging -= entry.staging_bytes;
+    collect_download_memory -= entry.memory_bytes;
+    runtime.FreeDeferredStagingBuffer(entry.map);
+    collect_downloads.erase(collect_downloads.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+template <class P>
+void TextureCache<P>::DropCollectDownloadsIn(DAddr cpu_addr, size_t size) {
+    // Newer bytes went to guest memory: the queued, older ones must not land over them.
+    for (size_t i = collect_downloads.size(); i-- > 0;) {
+        const ImageBase& image = slot_images[collect_downloads[i].image_id];
+        if (image.cpu_addr < cpu_addr + size && cpu_addr < image.cpu_addr + image.guest_size_bytes) {
+            DropCollectDownload(i);
+            ++collect_stats.dropped_written;
         }
     }
-    return render_targets.depth_buffer_id == NULL_IMAGE_VIEW_ID;
+}
+
+template <class P>
+void TextureCache<P>::LandCollectDownloads() {
+    const Common::WriteRing::SiteScope write_site{"EXP121 landing (LandCollectDownloads)", true};
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
+        for (size_t i = 0; i < collect_downloads.size();) {
+            CollectDownload& entry = collect_downloads[i];
+            Image& image = slot_images[entry.image_id];
+            // Used again (bound, drawn to, copied; registered again): keep it, as if never picked.
+            if (False(image.flags & ImageFlagBits::Registered) ||
+                lru_cache.Tick(image.lru_index) != entry.lru_tick) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_used;
+                continue;
+            }
+            // Written again by the GPU or the CPU, or downloaded by a guest read.
+            bool written = !IsDownloadable(image) ||
+                           image.modification_tick != entry.image_modification;
+            // A CPU write since it was queued (WriteMemory marks it CpuModified; nothing drops
+            // the entry there): landing would put the GPU's older bytes over the CPU's.
+            if (!written && !entry.cpu_modified && True(image.flags & ImageFlagBits::CpuModified)) {
+                written = true;
+                ++collect_stats.dropped_cpu;
+            }
+            bool overlap_written = false;
+            bool landed_under = false;
+            if (!written && runtime.IsFree(entry.tick)) {
+                // An overlapping image the GPU wrote since holds newer bytes for this memory.
+                // FRITCHII_COLLECT_LAND_UNDER: unless it is still GPU-only. Its bytes are not in
+                // guest memory, its own download lands over ours later, and one that lands first
+                // drops ours (DropCollectDownloadsIn), so landing ours is what the waiting path
+                // does. Dropped, the image stayed and the next pass queued it again.
+                // FRITCHII_LOST_WRITEBACK's entries always land under such overlaps.
+                const bool land_under = entry.lost_path != 0 ||
+                                        VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_collect_land_under,
+                                            "FRITCHII_COLLECT_LAND_UNDER") > 0;
+                const ImageId self = entry.image_id;
+                const u64 since = entry.cache_modification;
+                ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
+                                     [&](ImageId other_id, ImageBase& other) {
+                                         if (other_id == self || other.modification_tick <= since) {
+                                             return;
+                                         }
+                                         if (land_under &&
+                                             True(other.flags & ImageFlagBits::GpuModified)) {
+                                             landed_under = true;
+                                             return;
+                                         }
+                                         overlap_written = true;
+                                     });
+            }
+            // FRITCHII_LOST_WRITEBACK: a newer write-back landed over some of its bytes since.
+            const bool newer_landed = entry.lost_path != 0 && !written && !overlap_written &&
+                                      runtime.IsFree(entry.tick) && NewerWritebackOver(image);
+            if (overlap_written || newer_landed) {
+                // FRITCHII_COVERED_RETIRE: newer GPU writes cover all of it, so nothing of it is
+                // left to land: deleted now instead of kept for the next pass to queue again.
+                if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire,
+                                                     "FRITCHII_COVERED_RETIRE") > 0 &&
+                    CoveredByNewerWrites(entry.image_id, image)) {
+                    const ImageId image_id = entry.image_id;
+                    DropCollectDownload(i);
+                    ++collect_stats.dropped_written;
+                    ++collect_stats.dropped_under;
+                    ++covered_stats.landing_deleted;
+                    RetireCovered(image_id, image);
+                    continue;
+                }
+                written = true;
+                ++collect_stats.dropped_under;
+                if (entry.lost_path != 0) {
+                    // FRITCHII_LOST_WRITEBACK: newer bytes in its memory now; deleted without the
+                    // write-back, as before (queued again, it would download every pass).
+                    const ImageId image_id = entry.image_id;
+                    ++lost_stats.wb_refused[entry.lost_path];
+                    DropCollectDownload(i);
+                    ++collect_stats.dropped_written;
+                    image.lost_drop_why = LostWhyLanding;
+                    MarkStale(image); // before UntrackImage (see MarkStale)
+                    if (True(image.flags & ImageFlagBits::Tracked)) {
+                        UntrackImage(image, image_id);
+                    }
+                    ++gc_deletes;
+                    UnregisterImage(image_id);
+                    DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+                    continue;
+                }
+            }
+            if (written) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_written;
+                continue;
+            }
+            if (!runtime.IsFree(entry.tick)) {
+                ++i;
+                continue;
+            }
+            // EXP121=2: compare with a download that waits (nothing touched the image since).
+            if (VideoCore::Nx2Debug::Experiment(121) == 2) {
+                auto fresh = runtime.DownloadStagingBuffer(entry.staging_bytes);
+                image.DownloadMemory(fresh, entry.copies);
+                runtime.Finish();
+                if (std::memcmp(fresh.mapped_span.data(), entry.map.mapped_span.data(),
+                                entry.staging_bytes) != 0) {
+                    if (++collect_stats.mismatches <= 8) {
+                        LOG_WARNING(HW_GPU,
+                                    "Collector download differs from a waited one: {:#x} {}x{} "
+                                    "format {}, {} frames after it was recorded",
+                                    image.gpu_addr, image.info.size.width,
+                                    image.info.size.height, static_cast<u32>(image.info.format),
+                                    frame_tick - entry.frame);
+                    }
+                }
+            }
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            ++collect_stats.landed;
+            NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
+            if (entry.lost_path != 0) {
+                ++lost_stats.wb_landed[entry.lost_path];
+                lost_stats.wb_landed_bytes[entry.lost_path] += image.guest_size_bytes;
+            }
+            collect_stats.landed_under += landed_under ? 1 : 0;
+            collect_stats.land_frames += frame_tick - entry.frame;
+            unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
+            const ImageId image_id = entry.image_id;
+            DropCollectDownload(i);
+            // As the waiting path, a few frames later.
+            image.flags &= ~ImageFlagBits::GpuModified;
+            ClearStaleImage(image);
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        }
+    }
 }
 
 template <class P>
@@ -372,8 +668,21 @@ void TextureCache<P>::UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delt
 
 template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
-    if (!tc_skip_stale || False(image.flags & ImageFlagBits::GpuModified) ||
-        True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    const bool keep = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                       "FRITCHII_LOST_KEEP", 1) > 0;
+    // FRITCHII_LOST_KEEP: the CPU wrote it since the GPU did (all of it dirty: its next use would
+    // upload the guest bytes over the GPU's). Nothing GPU-only is lost; marked, the CPU's bytes
+    // were skipped as stale and the next image there showed zeros.
+    if (keep && True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty() &&
+        image.dirty_ranges.empty()) {
+        ++lost_stats.stale_cpu_skipped;
+        return;
+    }
+    RecordStaleDrop(image); // the lost contents counter's attribution
+    if (!TcSkipStale() || True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
         image.guest_size_bytes == 0) {
         return;
     }
@@ -387,6 +696,26 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
     if (stale_bits.size() * 64 < end) {
         stale_bits.resize((end + 63) / 64);
     }
+    // FRITCHII_LOST_KEEP: pages a newer image's write-back landed on hold bytes newer than this
+    // image's (the refused write-backs: OoT draws HUD masks of several sizes at one address, the
+    // newest landed first, the older one's drop marked it all stale and the next one there was
+    // zero). Left unmarked, as pages shared with other data are.
+    boost::container::small_vector<std::pair<u64, u64>, 8> newer_pages;
+    if (keep && recent_writeback_newest > image.modification_tick) {
+        for (const RecentWriteback& w : recent_writebacks) {
+            if (w.size != 0 && w.modification > image.modification_tick &&
+                w.cpu_addr < image.cpu_addr + image.guest_size_bytes &&
+                image.cpu_addr < w.cpu_addr + w.size) {
+                newer_pages.emplace_back(w.cpu_addr >> STALE_PAGE_BITS,
+                                         (w.cpu_addr + w.size + page_size - 1) >> STALE_PAGE_BITS);
+            }
+        }
+    }
+    const auto newer = [&newer_pages](u64 page) {
+        return std::ranges::any_of(newer_pages, [page](const std::pair<u64, u64>& range) {
+            return range.first <= page && page < range.second;
+        });
+    };
     // Tracked from here on so CPU writes reach WriteMemory. Marking before the image's own
     // tracking goes keeps the pages' write protection from switching off and on again.
     u64 run_begin = 0;
@@ -394,6 +723,12 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
     for (u64 page = first; page < end; ++page) {
         u64& word = stale_bits[page / 64];
         const u64 bit = u64{1} << (page % 64);
+        if (!newer_pages.empty() && (word & bit) == 0 && newer(page)) {
+            ++lost_stats.stale_pages_kept;
+            UpdateStaleTracking(run_begin, run_pages, 1);
+            run_pages = 0;
+            continue;
+        }
         if ((word & bit) != 0) {
             UpdateStaleTracking(run_begin, run_pages, 1);
             run_pages = 0;
@@ -499,6 +834,399 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 }
 
 template <class P>
+bool TextureCache<P>::IsAnyStale(DAddr addr, size_t size) const {
+    if (stale_page_count == 0 || size == 0) {
+        return false;
+    }
+    const u64 first = addr >> STALE_PAGE_BITS;
+    const u64 end = (std::min<u64>)((addr + size + (u64{1} << STALE_PAGE_BITS) - 1) >>
+                                        STALE_PAGE_BITS,
+                                    stale_bits.size() * 64);
+    for (u64 page = first; page < end;) {
+        const u64 word = stale_bits[page / 64];
+        if (page % 64 == 0 && page + 64 <= end) {
+            if (word != 0) {
+                return true;
+            }
+            page += 64;
+            continue;
+        }
+        if (((word >> (page % 64)) & 1) != 0) {
+            return true;
+        }
+        ++page;
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
+    if (image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Sparse)) {
+        return;
+    }
+    // DeleteImage marks again what its caller just marked: one entry per drop.
+    if (stale_drop_count != 0) {
+        const StaleDrop& last = stale_drops[(stale_drop_next + StaleDropRing - 1) % StaleDropRing];
+        if (last.cpu_addr == image.cpu_addr && last.size == image.guest_size_bytes &&
+            last.frame == frame_tick) {
+            return;
+        }
+    }
+    stale_drops[stale_drop_next] = StaleDrop{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .gpu_addr = image.gpu_addr,
+        .frame = frame_tick,
+        .format = static_cast<u32>(image.info.format),
+        .width = image.info.size.width,
+        .height = image.info.size.height,
+        .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
+        .guard = image.relocation_guard_noted,
+        .why = image.lost_drop_why,
+        .shape_key = RelocationShapeKey(image.info),
+    };
+    stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
+    stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
+}
+
+template <class P>
+auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) const -> const StaleDrop* {
+    // A join copied its overlaps into the new image before deleting them: another drop there,
+    // if any, is the one that lost data.
+    const StaleDrop* join = nullptr;
+    for (size_t i = 0; i < stale_drop_count; ++i) {
+        const StaleDrop& drop =
+            stale_drops[(stale_drop_next + StaleDropRing - 1 - i) % StaleDropRing];
+        if (drop.cpu_addr < addr + size && addr < drop.cpu_addr + drop.size) {
+            if (drop.reason != static_cast<u8>(DeleteReason::Join)) {
+                return &drop;
+            }
+            join = join != nullptr ? join : &drop;
+        }
+    }
+    return join;
+}
+
+template <class P>
+void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, bool invalidate) {
+    LostContentStats& s = lost_stats;
+    if (invalidate) {
+        // Overwritten whole (a full clear, a copy over all of it): nothing lost shows.
+        ++s.overwritten;
+        image.lost_contents = 0;
+        return;
+    }
+    if (is_modification) {
+        image.lost_contents |= LostDrawn;
+        return;
+    }
+    const u8 bits = image.lost_contents;
+    image.lost_contents = 0; // counted once
+    ++((bits & LostDrawn) != 0 ? s.sampled_drawn : s.sampled_undrawn);
+    s.sampled_bytes += image.guest_size_bytes;
+    const StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
+    const size_t reason = drop == nullptr                         ? 9
+                          : drop->reason == LostReasonRelocate     ? 8
+                          : (std::min<size_t>)(drop->reason, 7);
+    ++s.sampled_by_reason[reason];
+    if (drop != nullptr && (drop->guard & (GuardSampled | GuardLoaded)) != 0) {
+        ++s.sampled_guarded;
+    }
+    // A relocation moved the image away while its old address was still read: that shape and
+    // address never relocate again (as the sampled guard does when it sees the read in time).
+    if (drop != nullptr && reason == 8 &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                         "FRITCHII_LOST_WRITEBACK", 1024) > 0) {
+        relocation_guarded_addresses[drop->gpu_addr] |= GuardSampled;
+        relocation_shapes[drop->shape_key].guard |= GuardSampled;
+        ++s.relocation_guards;
+        if (RelocationMemory::Enabled()) {
+            RelocationMemory::Note(drop->shape_key, GuardSampled);
+        }
+    }
+    const u8 why = drop != nullptr
+                       ? (std::min)(drop->why, static_cast<u8>(LostWhyCount - 1))
+                       : static_cast<u8>(LostWhyNone);
+    ++s.sampled_by_why[why];
+    // FRITCHII_LOST_KEEP: this memory is read after going cold; the next drop over it is written
+    // back whatever its size (relocation has its guards instead).
+    if (reason != 8 && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                        "FRITCHII_LOST_KEEP", 1) > 0) {
+        LearnLostRead(image.cpu_addr, image.guest_size_bytes);
+    }
+    // The first 40 of the session, then 2 per 10 s window (the flashes a tester reports come
+    // late in long sessions).
+    if (s.logged < 40 || s.window_logged < 2) {
+        ++s.logged;
+        ++s.window_logged;
+        static constexpr std::array<const char*, 10> names{
+            "other",       "garbage collect", "cold sweep",       "unmap",      "join",
+            "slot retire", "unmap sweep",     "superseded sweep", "relocation", "not recorded"};
+        static constexpr std::array<const char*, LostWhyCount> whys{
+            "no write-back on that path", "over the size cap", "refused (newer write-back)",
+            "not downloadable", "write-back off", "over the keep budget", "refused at landing"};
+        LOG_WARNING(HW_GPU,
+                    "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
+                    "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
+                    "frames ago, guard {:#x}, {})",
+                    static_cast<u32>(image.info.format), image.info.size.width,
+                    image.info.size.height, image.info.resources.levels, image.gpu_addr,
+                    image.guest_size_bytes >> 10,
+                    (bits & LostSkipped) != 0 ? "upload skipped as stale" : "stale guest bytes uploaded",
+                    (bits & LostZeroed) != 0 ? ", cleared to zero" : "",
+                    (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
+                    names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
+                    drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why]);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::OverlapsLostRead(DAddr addr, u64 size) const {
+    for (size_t i = 0; i < lost_read_count; ++i) {
+        const LostReadRange& range = lost_read_ranges[i];
+        if (range.begin < addr + size && addr < range.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::LearnLostRead(DAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    for (size_t i = 0; i < lost_read_count; ++i) {
+        const LostReadRange& range = lost_read_ranges[i];
+        if (range.begin <= addr && addr + size <= range.end) {
+            return; // known
+        }
+    }
+    lost_read_ranges[lost_read_next] = LostReadRange{addr, addr + size};
+    lost_read_next = (lost_read_next + 1) % LostReadRing;
+    lost_read_count = (std::min)(lost_read_count + 1, LostReadRing);
+    ++lost_stats.learned_new;
+}
+
+template <class P>
+bool TextureCache<P>::TakeLostKeepBudget(u64 bytes, bool learned, int keep) {
+    // N MiB a second (1 = 32), up to a second's worth saved. 32 MiB/s is ~1/20 of what
+    // FRITCHII_LOST_WRITEBACK=1 wrote back in the market (-3 fps there), and only memory with a
+    // reason is in it.
+    const u64 rate = u64{keep > 1 ? (std::min)(static_cast<u32>(keep), 4096U) : 32U} << 20;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (lost_keep_refill_ns == 0) {
+        lost_keep_tokens = rate;
+        lost_keep_refill_ns = now;
+    } else if (now > lost_keep_refill_ns) {
+        // At most 2^32 * 10^9 < 2^62.
+        const u64 elapsed = (std::min<u64>)(now - lost_keep_refill_ns, 1'000'000'000);
+        const u64 refill = rate * elapsed / 1'000'000'000;
+        if (refill != 0) {
+            lost_keep_tokens = (std::min)(rate, lost_keep_tokens + refill);
+            lost_keep_refill_ns = now; // else the remainder keeps adding up
+        }
+    }
+    // Guarded images (read in a later frame, not yet seen lost) leave half to learned memory.
+    const u64 floor = learned ? 0 : rate / 2;
+    if (lost_keep_tokens < floor + bytes) {
+        return false;
+    }
+    lost_keep_tokens -= bytes;
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::LogLostContents() {
+    LostContentStats& s = lost_stats;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    const u64 sampled = s.sampled_undrawn + s.sampled_drawn;
+    u64 wb_any = 0;
+    for (size_t i = 0; i < LostPathCount; ++i) {
+        wb_any += s.wb_queued[i] + s.wb_landed[i] + s.wb_refused[i] + s.wb_kept[i] +
+                  s.wb_over_cap[i];
+    }
+    if (s.made_skipped + s.made_uploaded + sampled + wb_any + s.stale_cpu_skipped +
+            s.stale_pages_kept + s.wb_cpu_written !=
+        0) {
+        const auto& r = s.sampled_by_reason;
+        // queued/landed (MiB) refused R kept K over cap C, per path.
+        std::string wb;
+        static constexpr std::array<const char*, LostPathCount> paths{
+            "", "collector", "cold sweep", "superseded sweep", "slot retire"};
+        for (size_t i = 1; i < LostPathCount; ++i) {
+            wb += fmt::format("{}{} {}/{} ({:.1f} MiB) refused {} kept {} over cap {} (written "
+                              "back all the same: learned {}, guarded {}; over budget {})",
+                              i == 1 ? "" : "; ", paths[i], s.wb_queued[i], s.wb_landed[i],
+                              static_cast<double>(s.wb_landed_bytes[i]) / (1024.0 * 1024.0),
+                              s.wb_refused[i], s.wb_kept[i], s.wb_over_cap[i], s.wb_learned[i],
+                              s.wb_guarded[i], s.wb_over_budget[i]);
+        }
+        // FRITCHII_LOST_KEEP: why the sampled ones' drops had no write-back (over cap, refused
+        // and over budget are the ones it works on: they must stay near 0 with it on).
+        const auto& y = s.sampled_by_why;
+        wb += fmt::format(
+            "; FRITCHII_LOST_KEEP={}: sampled ones' drops without a write-back because: no "
+            "write-back on that path {}, over cap {}, refused {}, not downloadable {}, off {}, "
+            "over budget {}, refused at landing {}; learned ranges {} (+{}), pages kept from "
+            "stale under newer write-backs {}, CPU-written images not marked stale {} (not "
+            "written back {})",
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                             "FRITCHII_LOST_KEEP", 1),
+            y[LostWhyNone], y[LostWhyOverCap], y[LostWhyRefused], y[LostWhyNoCopy], y[LostWhyOff],
+            y[LostWhyBudget], y[LostWhyLanding], lost_read_count, s.learned_new,
+            s.stale_pages_kept, s.stale_cpu_skipped, s.wb_cpu_written);
+        LOG_INFO(HW_GPU,
+                 "Lost contents in 10 s (FRITCHII_STALE_ZERO={}, FRITCHII_LOST_WRITEBACK={}): "
+                 "images made over memory whose GPU data was dropped: {} upload skipped ({} "
+                 "cleared to zero), {} uploaded stale guest bytes; {} overwritten whole first; "
+                 "SAMPLED with lost contents: {} ({} not drawn into, {} drawn over; {} KiB; {} "
+                 "were read in a later frame before the drop) by drop: collector {}, cold sweep "
+                 "{}, superseded sweep {}, slot retire {}, join {}, relocation {}, unmap {}/{}, "
+                 "other {}, not recorded {}; relocation guards {}; write-backs queued/landed: {}",
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero,
+                                                  "FRITCHII_STALE_ZERO", 1),
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                  "FRITCHII_LOST_WRITEBACK", 1024),
+                 s.made_skipped, s.made_zeroed, s.made_uploaded, s.overwritten, sampled,
+                 s.sampled_undrawn, s.sampled_drawn, s.sampled_bytes >> 10, s.sampled_guarded,
+                 r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.relocation_guards,
+                 wb);
+    }
+    const u64 last = s.last_log_ns;
+    const u64 logged = s.logged;
+    s = {};
+    s.last_log_ns = last;
+    s.logged = logged;
+}
+
+template <class P>
+auto TextureCache<P>::QueueLostWriteback(ImageId image_id, Image& image, u8 path)
+    -> LostWriteback {
+    // 1 (default): every image; N > 1: only images up to N KiB (larger ones dropped as before).
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                      "FRITCHII_LOST_WRITEBACK", 1024);
+    const int keep = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                      "FRITCHII_LOST_KEEP", 1);
+    if (False(image.flags & ImageFlagBits::GpuModified) ||
+        True(image.flags & ImageFlagBits::CollectPending)) {
+        return LostWriteback::Drop;
+    }
+    LostContentStats& s = lost_stats;
+    // FRITCHII_LOST_KEEP: the CPU wrote all of it since the GPU did: the guest bytes are the
+    // newer ones (MarkStale leaves them unmarked), and a write-back would land the GPU's older
+    // bytes over them.
+    if (keep > 0 && True(image.flags & ImageFlagBits::CpuModified) &&
+        image.dirty_layers.empty() && image.dirty_ranges.empty()) {
+        ++s.wb_cpu_written;
+        return LostWriteback::Drop;
+    }
+    if (mode <= 0) {
+        image.lost_drop_why = LostWhyOff;
+        return LostWriteback::Drop;
+    }
+    if (!IsDownloadable(image)) {
+        image.lost_drop_why = LostWhyNoCopy;
+        return LostWriteback::Drop;
+    }
+    if constexpr (!requires { runtime.CurrentTick(); }) {
+        image.lost_drop_why = LostWhyOff;
+        return LostWriteback::Drop; // no queue (OpenGL)
+    } else {
+        // Bytes a newer image already wrote back: landing this one would put older bytes there.
+        // (Before the size cap: a refused image costs no budget.)
+        const bool over_cap =
+            mode > 1 && image.guest_size_bytes > u64{static_cast<u32>(mode)} * 1024;
+        if (!over_cap || keep > 0) {
+            if (NewerWritebackOver(image)) {
+                ++s.wb_refused[path];
+                image.lost_drop_why = LostWhyRefused;
+                return LostWriteback::Drop;
+            }
+        }
+        // FRITCHII_LOST_KEEP: over the cap, but memory read after an earlier loss there
+        // (learned) or an image read in a later frame than its write (guarded) is written back
+        // all the same, within the byte budget.
+        u64 budget_taken = 0;
+        if (over_cap) {
+            ++s.wb_over_cap[path];
+            const bool learned =
+                keep > 0 && OverlapsLostRead(image.cpu_addr, image.guest_size_bytes);
+            const bool guarded =
+                keep > 0 && (image.relocation_guard_noted &
+                             (GuardSampled | GuardLoaded | GuardCpuRead)) != 0;
+            if (!learned && !guarded) {
+                image.lost_drop_why = LostWhyOverCap;
+                return LostWriteback::Drop;
+            }
+            if (!TakeLostKeepBudget(image.guest_size_bytes, learned, keep)) {
+                ++s.wb_over_budget[path];
+                image.lost_drop_why = LostWhyBudget;
+                return LostWriteback::Drop;
+            }
+            budget_taken = image.guest_size_bytes;
+            ++(learned ? s.wb_learned[path] : s.wb_guarded[path]);
+        }
+        if (!QueueCollectDownload(image_id)) {
+            lost_keep_tokens += budget_taken; // not spent
+            ++s.wb_kept[path];
+            return LostWriteback::Keep;
+        }
+        collect_downloads.back().lost_path = path;
+        ++s.wb_queued[path];
+        return LostWriteback::Queued;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteWriteback(const ImageBase& image) {
+    recent_writebacks[recent_writeback_next] = RecentWriteback{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .modification = image.modification_tick,
+    };
+    recent_writeback_next = (recent_writeback_next + 1) % RecentWritebackRing;
+    // Only grows: an entry the ring dropped leaves it high, which costs MarkStale a scan.
+    recent_writeback_newest = (std::max)(recent_writeback_newest, image.modification_tick);
+}
+
+template <class P>
+bool TextureCache<P>::NewerWritebackOver(const ImageBase& image) const {
+    for (const RecentWriteback& w : recent_writebacks) {
+        if (w.size != 0 && w.modification > image.modification_tick &&
+            w.cpu_addr < image.cpu_addr + image.guest_size_bytes &&
+            image.cpu_addr < w.cpu_addr + w.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+u64 TextureCache<P>::UncountedDeviceBytes() const {
+    // The same subtractions TickFrame makes from the driver's usage.
+    u64 bytes = std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(),
+                                gpu_sentenced_bytes) +
+                collect_download_memory;
+    if constexpr (requires { runtime.PendingImageFreeBytes(); }) {
+        bytes += runtime.PendingImageFreeBytes();
+    }
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        bytes += runtime.PooledImageBytes();
+    }
+    return bytes;
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
@@ -511,19 +1239,28 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
         const u64 budget = runtime.GetDeviceMemoryBudget();
         max_critical = (std::max)(max_critical, budget / 8 * 5);
-        // Kizuna: on an 8 GB card the budget is not steady: other programs and four monitors took
-        // 2 GB of it in the middle of a game (7379 -> 5141 MiB, 5532 MiB at the crash), so a cache
-        // that fills 5 GiB is over the new budget before it can shrink. 4.5 GiB leaves that room;
-        // EDEN_NX2_TC_CEILING_MIB below lowers it further.
-        if (budget != 0 && budget < 9_GiB) {
-            max_critical = (std::min)(max_critical, u64{4608_MiB});
-        }
         // Cards with 10 GiB or more of budget: 5/8 left ~7.3 GiB on a 12 GB RX 6700 XT, under what
         // Ocarina's Kokiri Forest keeps alive, so every aggressive pass evicted its CostlyLoad ASTC
         // textures (a 6144x6144 5x5 one, 31 MiB) and the game re-created them ~128 frames later:
         // a 24 ms texture stall every ~3 s. Keep 2.5 GiB of the budget for everything else instead.
         if (budget >= 10_GiB) {
             max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        } else if (budget > 2_GiB && VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+            // FRITCHII_SMALL_CARD (part Fit): the budget check in TickFrame subtracts everything
+            // the usage leaves out, so its result needs no fixed cap; the cap only kept textures
+            // from the room the uncounted image pool and in-flight frees then took.
+            max_critical = (std::max)(max_critical, budget - SmallCardMargin(budget));
+        } else if (budget > 4_GiB &&
+                   VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_critical_fit,
+                                                    "FRITCHII_VRAM_CRITICAL_FIT") != 0) {
+            // FRITCHII_VRAM_CRITICAL_FIT (live, default 0; with FRITCHII_VRAM_POOL_FIT): an 8 GB
+            // card (budget ~7.1 GiB with Windows and other programs) stopped at the fixed 5 GiB
+            // and its last ~2 GiB of budget went to the image pool and margins while OoT's market
+            // (~5.1-5.3 GiB in the cache's view on a 16 GB card) evicted and re-made textures.
+            // Here the cap is the budget less the cache's margin (1/8 of it, at most 1 GiB) and
+            // 512 MiB for deleted images still in flight; the fitted pool yields the rest.
+            const u64 margin = (std::min)(budget / 8, u64{1_GiB});
+            max_critical = (std::max)(max_critical, budget - margin - 512_MiB);
         }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
@@ -551,9 +1288,478 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = std::strtoull(value, nullptr, 10) << 20;
         }
     }
+    // FRITCHII_VRAM_BUDGET_MODE: these are the base thresholds; the live budget cap only ever
+    // lowers them, and goes when the room under the budget is back.
+    base_expected_memory = expected_memory;
+    base_critical_memory = critical_memory;
+    base_minimum_memory = minimum_memory;
+    ApplyBudgetCap();
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ApplyBudgetCap() {
+    if (base_critical_memory == 0) {
+        return;
+    }
+    critical_memory = base_critical_memory;
+    expected_memory = base_expected_memory;
+    minimum_memory = base_minimum_memory;
+    if (budget_cap >= critical_memory) {
+        return;
+    }
+    // The cap keeps the base thresholds' distance (1.5 GiB with Fritchii's ceiling) between
+    // expected and critical, at least 256 MiB and at most half the cap.
+    const u64 gap = base_critical_memory - (std::min)(base_critical_memory, base_expected_memory);
+    critical_memory = budget_cap;
+    expected_memory = (std::min)(
+        expected_memory,
+        critical_memory - (std::min)(critical_memory / 2, (std::max)(gap, u64{256_MiB})));
+    minimum_memory =
+        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+}
+
+template <class P>
+void TextureCache<P>::BudgetControl() {
+    // FRITCHII_VRAM_BUDGET_MODE (live; 0 fixed, 1 vk = default, 2 os). The thresholds above follow
+    // the budget only as far as Fritchii's ceiling (EDEN_NX2_TC_CEILING_MIB, 7680) and the 5/8 cap
+    // allow, and they count the cache's view of the usage: the image pool, deleted images still in
+    // flight, the unused space in the allocators' blocks and whatever the driver holds outside
+    // them are left out. A 16 GB RX 9070 XT at 4K (zortos tester, 2026-11-16) kept the cache's
+    // critical at 7,680 MiB while the driver's count for the process reached the budget, the
+    // driver lowered the budget to it and moved ~10 GB to system RAM (freezes of 15-16 s; a 1365^2
+    // image create took 11.9 s). With a 5-7 GiB hog on the card the budget fell to ~11.6 GB and
+    // nothing followed it.
+    //
+    // Here the driver's own count of the main heap (all of this process's memory in it) is held
+    // under the budget less a headroom: once a second, past it the cache's critical memory comes
+    // down by the excess (at most 1 GiB a second, never under half the budget), with room again it
+    // goes back up (256 MiB a second) until the base thresholds rule again. While the cap binds
+    // (budget_pressure) the collector deletes past critical as with FRITCHII_TC_COLLECT_OVER, the
+    // image pool fits the room (FRITCHII_VRAM_POOL_FIT), kept blocks go back, and images made past
+    // critical first delete clean idle ones (FRITCHII_TC_CRITICAL_ENFORCE). Nothing changes while
+    // the usage stays under the budget less the headroom: an RTX 4080 at 1080p sits ~7 GB under it.
+    // os also counts what other processes hold on the adapter (PDH, sampled on a thread of its
+    // own): Windows' budget for the process in front assumes it can push the others out, which a
+    // program that keeps using its memory defeats (the tester's VRAM hog).
+    if constexpr (requires(u64 value) { runtime.MainHeapNumbers(value, value, value); }) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - budget_control_time < std::chrono::seconds{1}) {
+            return;
+        }
+        budget_control_time = now;
+        const int mode = VideoCore::Nx2Debug::VramBudgetMode();
+        u64 size{};
+        u64 usage{};
+        u64 vk_budget{};
+        if (!runtime.MainHeapNumbers(size, usage, vk_budget) || vk_budget == 0) {
+            return;
+        }
+        BudgetSeen& seen = budget_seen;
+        seen.heap_size = size;
+        seen.usage = usage;
+        seen.vk_budget = vk_budget;
+        seen.os_budget = 0;
+        seen.others = 0;
+        u64 budget = vk_budget;
+        if (mode == 2) {
+            if (const std::optional<u64> others = runtime.OtherProcessesVideoMemory()) {
+                seen.others = *others;
+                seen.os_budget = size - (std::min)(size, *others);
+                budget = (std::min)(budget, seen.os_budget);
+            }
+        }
+        const int headroom_mib = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_vram_headroom_mib, "FRITCHII_VRAM_HEADROOM_MIB", 0);
+        // Auto: 1/16 of the budget, 256 MiB to 1 GiB (~950 MiB on a 16 GB card, ~450 on 8 GB).
+        const u64 headroom = headroom_mib > 0
+                                 ? u64{static_cast<u32>(headroom_mib)} << 20
+                                 : std::clamp(budget / 16, u64{256_MiB}, u64{1_GiB});
+        const u64 target = budget - (std::min)(budget, headroom);
+        seen.budget = budget;
+        seen.headroom = headroom;
+        seen.peak_usage = (std::max)(seen.peak_usage, usage);
+        seen.lowest_budget = (std::min)(seen.lowest_budget, budget);
+        seen.over_seconds += usage > target ? 1 : 0;
+        seen.spill_seconds += usage > budget ? 1 : 0;
+        if (mode != seen.mode) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control: FRITCHII_VRAM_BUDGET_MODE={} (0 fixed, 1 vk, 2 os), "
+                     "headroom {} MiB; main heap {} MiB, driver budget {} MiB, usage {} MiB",
+                     mode, headroom >> 20, size >> 20, vk_budget >> 20, usage >> 20);
+            seen.mode = mode;
+        }
+        const bool was_pressure = budget_pressure;
+        const u64 old_cap = budget_cap;
+        if (mode == 0) {
+            budget_cap = ~0ULL;
+        } else if (usage > target) {
+            const u64 over = usage - target;
+            const u64 from = (std::min)(budget_cap, total_used_memory);
+            budget_cap = (std::max)(from - (std::min)(from, (std::min)(over, u64{1_GiB})),
+                                    budget / 2);
+        } else if (budget_cap != ~0ULL) {
+            // A dead band of half the headroom, so the cap does not chase the usage up and down.
+            const u64 room = target - usage;
+            if (room > headroom / 2) {
+                budget_cap += (std::min)(room - headroom / 2, u64{256_MiB});
+            }
+        }
+        if (budget_cap >= base_critical_memory) {
+            budget_cap = ~0ULL;
+        }
+        // The pressure also holds while the usage is past the target with the cap at its floor
+        // or above the base (a 16 GB card: half the budget is over Fritchii's 7,680 MiB ceiling,
+        // so the 4K session's spill came with the cache already past a critical it could not
+        // hold): the collector's extra deletes, the fitted pool and the evictions before creates
+        // then act on the base thresholds. It ends half a headroom under the target.
+        const bool over_target = mode != 0 && usage > target;
+        const bool well_under = usage + headroom / 2 <= target;
+        budget_pressure =
+            budget_cap != ~0ULL || over_target || (budget_pressure && mode != 0 && !well_under);
+        if constexpr (requires { runtime.SetBudgetPressure(true); }) {
+            runtime.SetBudgetPressure(budget_pressure);
+        }
+        ApplyBudgetCap();
+        const u64 change = budget_cap > old_cap ? budget_cap - old_cap : old_cap - budget_cap;
+        if (budget_pressure != was_pressure ||
+            (budget_cap != ~0ULL && old_cap != ~0ULL && change >= 256_MiB) ||
+            ((budget_cap == ~0ULL) != (old_cap == ~0ULL))) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control ({}): driver usage {} MiB of budget {} MiB (vk {} MiB, "
+                     "os {} MiB, other processes {} MiB), headroom {} MiB: {}; texture cache "
+                     "{} MiB, expected {} MiB, critical {} MiB (base {} MiB)",
+                     mode == 2 ? "os" : (mode == 1 ? "vk" : "fixed"), usage >> 20, budget >> 20,
+                     vk_budget >> 20, seen.os_budget >> 20, seen.others >> 20, headroom >> 20,
+                     !budget_pressure ? "pressure off, cap off"
+                     : budget_cap == ~0ULL
+                         ? "pressure on, no cap under the base thresholds"
+                         : (old_cap == ~0ULL ? "pressure on, cap on" : "pressure on, cap moved"),
+                     total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                     base_critical_memory >> 20);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
+    // FRITCHII_TC_CRITICAL_ENFORCE (live; 0 off, 1 = default: while the budget cap binds, 2: past
+    // critical at any time). The collector runs once a frame and deletes a bounded number of
+    // images; an area load makes dozens in one frame, each on top of a card already at its budget
+    // (the 11.9 s image create above was the driver making room). Before such an image is made,
+    // clean images (no GPU writes, so no download and no wait) idle for 10+ frames are deleted
+    // until the cache is back under critical with room for it: at most 32 a pass and 256 a frame,
+    // looking at most 512 of the oldest. Images used in the last 10 frames are never taken (what
+    // the draw being set up prepared was touched in this frame), nor bound render targets.
+    // Deleting here is what a join does in the middle of a lookup already (has_deleted_images:
+    // every caller of InsertImage looks up again or gives up the operation).
+    const int enforce = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_tc_critical_enforce, "FRITCHII_TC_CRITICAL_ENFORCE", 1);
+    if (enforce <= 0 || (enforce == 1 && !budget_pressure) ||
+        total_used_memory + incoming <= critical_memory) [[likely]] {
+        return;
+    }
+    static const u64 min_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    const u64 idle_frames = (std::max)({u64{10}, min_age, thrash_floor});
+    constexpr u32 MaxPerFrame = 256;
+    constexpr size_t MaxPerPass = 32;
+    constexpr size_t MaxLooked = 512;
+    if (create_enforce_frame != frame_tick) {
+        create_enforce_frame = frame_tick;
+        create_enforce_frame_deletes = 0;
+    }
+    auto& stats = create_enforce_stats;
+    if (create_enforce_frame_deletes >= MaxPerFrame) {
+        ++stats.capped;
+        return;
+    }
+    if (frame_tick <= idle_frames) {
+        return;
+    }
+    // FRITCHII_TC_THRASH_GUARD: with the cache over critical for good, every image made walked
+    // the idle list again for nothing (26,000 passes in 10 s, 0 images deleted).
+    const bool skip_empty = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                                             "FRITCHII_TC_THRASH_GUARD", 1) > 0;
+    if (skip_empty && create_enforce_empty_frame == frame_tick) {
+        return;
+    }
+    ++stats.passes;
+    // Render targets bound now are kept whatever their age: RescaleRenderTargets binds a target it
+    // found and keeps its id while it looks up the next one (which may get here), and touches
+    // them only after.
+    std::array<ImageId, NUM_RT + 1> bound{};
+    const auto bound_image = [this](ImageViewId view_id) {
+        return view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}
+                   ? slot_image_views[view_id].image_id
+                   : ImageId{};
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        bound[index] = bound_image(render_targets.color_buffer_ids[index]);
+    }
+    bound[NUM_RT] = bound_image(render_targets.depth_buffer_id);
+    auto& candidates = create_enforce_candidates;
+    candidates.clear();
+    size_t looked = 0;
+    lru_cache.ForEachItemBelow(frame_tick - idle_frames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::CollectPending |
+                                 ImageFlagBits::GpuModified | ImageFlagBits::BadOverlap)) &&
+            std::ranges::find(bound, image_id) == bound.end()) {
+            candidates.push_back(image_id);
+        }
+        return candidates.size() >= MaxPerPass || ++looked >= MaxLooked;
+    });
+    if (candidates.empty() && looked < MaxLooked) {
+        create_enforce_empty_frame = frame_tick;
+    }
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
+    for (const ImageId image_id : candidates) {
+        if (total_used_memory + incoming <= critical_memory ||
+            create_enforce_frame_deletes >= MaxPerFrame) {
+            break;
+        }
+        auto& image = slot_images[image_id];
+        const u64 before = total_used_memory;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        ++stats.deleted;
+        ++create_enforce_frame_deletes;
+        stats.freed += before - (std::min)(before, total_used_memory);
+    }
+    if (total_used_memory + incoming > critical_memory) {
+        ++stats.short_of;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteThrashDelete(const Image& image) {
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                         "FRITCHII_TC_THRASH_GUARD", 1) <= 0) {
+        return;
+    }
+    if (thrash_ghosts.empty()) {
+        thrash_ghosts.resize(ThrashGhostSlots);
+    }
+    const u64 shape = RelocationShapeKey(image.info);
+    const bool pressured = delete_reason == DeleteReason::GarbageCollect &&
+                           (budget_pressure || total_used_memory >= critical_memory);
+    thrash_ghosts[ThrashSlot(image.gpu_addr, shape)] = ThrashGhost{
+        .gpu_addr = image.gpu_addr,
+        .shape = shape,
+        .last_use = image.last_use_tick,
+        .kib = static_cast<u32>(ImageMemoryBytes(image) >> 10),
+        .cause = static_cast<u8>(pressured ? ThrashCausePressured
+                                           : static_cast<size_t>(delete_reason)),
+        .costly = True(image.flags & ImageFlagBits::CostlyLoad),
+    };
+}
+
+template <class P>
+void TextureCache<P>::NoteThrashMade(const ImageInfo& info, GPUVAddr gpu_addr) {
+    ++thrash_stats.made;
+    if (thrash_ghosts.empty()) {
+        return;
+    }
+    const u64 shape = RelocationShapeKey(info);
+    ThrashGhost& ghost = thrash_ghosts[ThrashSlot(gpu_addr, shape)];
+    if (ghost.gpu_addr != gpu_addr || ghost.shape != shape) {
+        return;
+    }
+    const u64 interval = frame_tick - (std::min)(frame_tick, ghost.last_use);
+    const size_t cause = ghost.cause;
+    const bool costly = ghost.costly;
+    const u32 kib = ghost.kib;
+    ghost = ThrashGhost{};
+    // Back after half a minute or more is a scene coming back, not a loop.
+    if (interval > 1800) {
+        return;
+    }
+    auto& stats = thrash_stats;
+    ++stats.remade[cause];
+    stats.remade_kib += kib;
+    stats.remade_costly += costly ? 1 : 0;
+    stats.interval_sum += interval;
+    if (cause == ThrashCausePressured && interval <= ThrashMaxFloor) {
+        size_t bucket = 0;
+        while (bucket + 1 < ThrashBuckets && interval > (u64{4} << bucket)) {
+            ++bucket;
+        }
+        ++thrash_window[bucket];
+    }
+}
+
+template <class P>
+void TextureCache<P>::TickThrashGuard() {
+    // FRITCHII_TC_THRASH_GUARD (live; 0 off, 1 = default, 2 counts only). The collector works from
+    // the driver's usage, which on a small card holds far more than images: Castle Town on a
+    // simulated 4 GB card (budget 3,328 MiB) had 4,100-4,900 MiB in the cache's view with 1,500 in
+    // images, against a critical of 2,100-2,400. Deleting every image could not reach it, so the
+    // collector stayed 1 GiB+ over, where it takes up to 1,064 images a frame unused for just 3
+    // frames, ASTC included. Textures the game comes back to every few frames were deleted and
+    // made again 55-60 times a frame (normal: under 1), each an image, its memory and an ASTC
+    // decode on the GPU, 44 fps with 20 fps lows against 75.
+    //
+    // Deleted images are remembered by address and shape. When the game asks for one again soon
+    // after the collector took it under pressure, the time since its last use says how long it
+    // should have stayed: while 8+ a second come back, the collector and the evictions before
+    // creates leave alone what was used within 1.25x the 90th percentile of those gaps. Only
+    // keeping images longer: what they hold is what a big card keeps anyway. Bounds: 600
+    // frames, and live images at 3/4 of the budget, where the floor halves (past that, memory
+    // comes first). It only acts under pressure, so cards with room never get one.
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                                      "FRITCHII_TC_THRASH_GUARD", 1);
+    if (mode <= 0) {
+        thrash_floor = 0;
+        thrash_window = {};
+        thrash_stats = {};
+        if (!thrash_ghosts.empty()) {
+            thrash_ghosts = std::vector<ThrashGhost>{};
+        }
+        return;
+    }
+    constexpr u64 CheckFrames = 60;
+    constexpr u32 MinRemakes = 8;
+    if (frame_tick % CheckFrames == 0) {
+        const bool pressure = budget_pressure || total_used_memory >= critical_memory;
+        thrash_calm_frames = pressure ? 0 : thrash_calm_frames + CheckFrames;
+        const u32 remakes = std::accumulate(thrash_window.begin(), thrash_window.end(), u32{0});
+        u64 wanted = 0;
+        if (remakes >= MinRemakes) {
+            u32 seen = 0;
+            for (size_t bucket = 0; bucket < ThrashBuckets; ++bucket) {
+                seen += thrash_window[bucket];
+                if (seen * 10 >= remakes * 9) {
+                    const u64 gap = u64{4} << bucket;
+                    wanted = (std::min)(gap + gap / 4 + 2, ThrashMaxFloor);
+                    break;
+                }
+            }
+        }
+        thrash_window = {};
+        u64 floor = thrash_floor;
+        if (mode == 1 && wanted > floor) {
+            floor = wanted;
+            ++thrash_stats.raised;
+        } else if (mode != 1) {
+            floor = 0;
+        } else if (thrash_calm_frames >= 600 && floor != 0) {
+            // Inert without pressure; going down slowly it is ready for the next spell.
+            floor -= floor / 8 + 1;
+        }
+        if (floor != 0) {
+            u64 bytes = 0;
+            for (const auto [image_id, image] : slot_images) {
+                if (False(image->flags & ImageFlagBits::Unbacked)) {
+                    bytes += ImageMemoryBytes(*image);
+                }
+            }
+            thrash_image_bytes = bytes;
+            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                const u64 budget = runtime.GetDeviceMemoryBudget();
+                if (budget != 0 && bytes > budget / 4 * 3) {
+                    floor /= 2;
+                    ++thrash_stats.capped;
+                }
+            }
+        }
+        thrash_floor = floor;
+    }
+    if (frame_tick % 600 != 0) {
+        return;
+    }
+    auto& s = thrash_stats;
+    const u64 remade = std::accumulate(s.remade.begin(), s.remade.end(), u64{0});
+    if (remade != 0 || thrash_floor != 0 || s.capped != 0) {
+        const auto at = [&s](DeleteReason reason) { return s.remade[static_cast<size_t>(reason)]; };
+        LOG_INFO(HW_GPU,
+                 "Image churn (FRITCHII_TC_THRASH_GUARD={}) last 600 frames: {} images made, {} "
+                 "made again after a delete ({} MiB, {} costly to load, {:.1f} frames after their "
+                 "last use); deleted by: collector under pressure {}, collector {}, cold sweep "
+                 "{}, superseded sweep {}, slot retire {}, join {}, unmap {}, unmap sweep {}, "
+                 "other {}; collector age floor {} frames (raised {} times, halved {} times at "
+                 "3/4 of the budget), live images {} MiB",
+                 mode, s.made, remade, s.remade_kib >> 10, s.remade_costly,
+                 remade != 0 ? static_cast<double>(s.interval_sum) / static_cast<double>(remade)
+                             : 0.0,
+                 s.remade[ThrashCausePressured], at(DeleteReason::GarbageCollect),
+                 at(DeleteReason::ColdSweep), at(DeleteReason::SupersededSweep),
+                 at(DeleteReason::SlotRetire), at(DeleteReason::Join), at(DeleteReason::Unmap),
+                 at(DeleteReason::UnmapSweep), at(DeleteReason::Other), thrash_floor, s.raised,
+                 s.capped, thrash_image_bytes >> 20);
+    }
+    s = {};
+}
+
+template <class P>
+void TextureCache<P>::LogVramOwners() {
+    // FRITCHII_VRAM_OWNERS (live, seconds between lines, default 10, 0 = off): who holds device
+    // memory, next to the budget. A walk of the live images (a few thousand) every 10 s.
+    if constexpr (requires { runtime.VramOwnersText(u64{}, u64{}); }) {
+        const int seconds = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_owners,
+                                                             "FRITCHII_VRAM_OWNERS", 10);
+        if (seconds <= 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (vram_owners_time == std::chrono::steady_clock::time_point{}) {
+            vram_owners_time = now;
+            return;
+        }
+        if (now - vram_owners_time < std::chrono::seconds{seconds}) {
+            return;
+        }
+        vram_owners_time = now;
+        u64 image_bytes{};
+        u64 gpu_written_bytes{};
+        size_t images{};
+        size_t unbacked{};
+        for (const auto [image_id, image] : slot_images) {
+            ++images;
+            if (True(image->flags & ImageFlagBits::Unbacked)) {
+                ++unbacked;
+                continue;
+            }
+            const u64 bytes = ImageMemoryBytes(*image);
+            image_bytes += bytes;
+            if (True(image->flags & ImageFlagBits::GpuModified)) {
+                gpu_written_bytes += bytes;
+            }
+        }
+        const u64 deleted = std::accumulate(sentenced_image_bytes.begin(),
+                                            sentenced_image_bytes.end(), gpu_sentenced_bytes);
+        BudgetSeen& seen = budget_seen;
+        auto& enforce = create_enforce_stats;
+        LOG_INFO(HW_GPU,
+                 "VRAM owners: {}; texture cache {} images ({} MiB GPU-written, {} unbacked), "
+                 "its view {} MiB, expected {} MiB, critical {} MiB (base {} MiB{}); budget mode {} "
+                 "(0 fixed, 1 vk, 2 os), budget {} MiB (vk {} MiB, os {} MiB, other processes {} "
+                 "MiB), headroom {} MiB, last {} s: peak usage {} MiB, lowest budget {} MiB, {} s "
+                 "over budget less headroom, {} s over the budget; evictions before creates {} "
+                 "passes, {} images, {} MiB, {} short, {} at the frame cap",
+                 runtime.VramOwnersText(image_bytes, deleted), images, gpu_written_bytes >> 20,
+                 unbacked, total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                 base_critical_memory >> 20, budget_pressure ? ", budget cap on" : "",
+                 seen.mode, seen.budget >> 20, seen.vk_budget >> 20, seen.os_budget >> 20,
+                 seen.others >> 20, seen.headroom >> 20, seconds, seen.peak_usage >> 20,
+                 seen.lowest_budget == ~0ULL ? 0 : seen.lowest_budget >> 20, seen.over_seconds,
+                 seen.spill_seconds, enforce.passes, enforce.deleted, enforce.freed >> 20,
+                 enforce.short_of, enforce.capped);
+        seen.peak_usage = 0;
+        seen.lowest_budget = ~0ULL;
+        seen.over_seconds = 0;
+        seen.spill_seconds = 0;
+        enforce = {};
     }
 }
 
@@ -566,8 +1772,28 @@ void TextureCache<P>::TickFrame() {
             scratch->release();
         }
     }
+    LogZeroUploads();
+    LogLostContents();
+    if (depth_native_stats.window != 0) {
+        // FRITCHII_SCALE_DEPTH_MAX: depth images kept native, at most one line per 10 s.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - depth_native_stats.last_log >= std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU,
+                     "Scale depth max (FRITCHII_SCALE_DEPTH_MAX={}): {} depth images kept at "
+                     "native size in the last 10 s, {} this session",
+                     VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scale_depth_max,
+                                                      "FRITCHII_SCALE_DEPTH_MAX", 8192),
+                     depth_native_stats.window, depth_native_stats.total);
+            depth_native_stats.window = 0;
+            depth_native_stats.last_log = now;
+        }
+    }
+    // EXP121: before the usage is read below, so landed images leave the queued bytes.
+    if (!collect_downloads.empty()) {
+        LandCollectDownloads();
+    }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
-        // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
+        // Switch 2 titles (native tiling) stream far more texture data than the original thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
         // sat in aggressive mode evicting decoded ASTC (and decoding it again). Total use is
         // measured from the driver, so collect only near the device budget instead.
@@ -582,7 +1808,7 @@ void TextureCache<P>::TickFrame() {
         }
         // Follow the driver's budget (re-read now and then): it shrinks when other programs use
         // VRAM (another game: 7.0 -> 6.4 GB), and collecting only past it means the driver pages
-        // textures out. It is also the room to use: Eden's device memory figure is capped near
+        // textures out. It is also the room to use: the emulator's device memory figure is capped near
         // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
         // unused. Both thresholds stay under it with a margin (1/8 of it, at most 1 GiB): past it
         // allocations fail and images end up unbacked (garbage textures), and Windows shrinks the
@@ -597,76 +1823,23 @@ void TextureCache<P>::TickFrame() {
                     const u32 events = runtime.MemoryPressureEvents();
                     if (events != seen_pressure_events) {
                         seen_pressure_events = events;
-                        last_memory_failure_frame = frame_tick;
-                        pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
+                        // FRITCHII_SMALL_CARD (part Fit): at most 1/8 of the budget. An RTX
+                        // 2080 (budget ~7 GiB) loading Castle Town had ~60 refused images in
+                        // 0.5 s: the margin climbed to 3 GiB, critical fell to ~3.6 GiB and the
+                        // collector evicted and downloaded the scene it was drawing (read-backs
+                        // of 50-120 ms for seconds). Fit already keeps the uncounted memory out.
+                        u64 pressure_cap = 3_GiB;
+                        if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                                pressure_cap = (std::max)(runtime.GetDeviceMemoryBudget() / 8,
+                                                          u64{512_MiB});
+                            }
+                        }
+                        pressure_margin = (std::min)(pressure_margin + 512_MiB, pressure_cap);
                         pressure_quiet_frames = 0;
                         budget_check_frames = 0; // thresholds are recomputed below
                         LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
                                     pressure_margin >> 20);
-                        // Kizuna: what the cache holds when memory runs out (first 4 times), to
-                        // see what to shrink: totals by kind and the largest images.
-                        static u32 census_logged{};
-                        if (census_logged++ < 4) {
-                            u64 all_bytes{};
-                            u64 written_bytes{};
-                            u64 big_bytes{};
-                            size_t images{};
-                            size_t big_images{};
-                            std::vector<std::pair<u64, const Image*>> largest;
-                            std::map<u32, std::pair<u64, u32>> by_format;
-                            for (const auto [image_id, image] : slot_images) {
-                                const u64 bytes = GetScaledImageSizeBytes(*image);
-                                all_bytes += bytes;
-                                ++images;
-                                if (True(image->flags & ImageFlagBits::GpuModified)) {
-                                    written_bytes += bytes;
-                                }
-                                if (bytes >= 8_MiB) {
-                                    big_bytes += bytes;
-                                    ++big_images;
-                                }
-                                largest.emplace_back(bytes, image);
-                                auto& format = by_format[static_cast<u32>(image->info.format)];
-                                format.first += bytes;
-                                ++format.second;
-                            }
-                            LOG_WARNING(HW_GPU,
-                                        "Memory census: {} images {} MiB ({} MiB GPU-written, {} "
-                                        "images of 8 MiB or more hold {} MiB), device usage {} MiB "
-                                        "(expected {} MiB, critical {} MiB)",
-                                        images, all_bytes >> 20, written_bytes >> 20, big_images,
-                                        big_bytes >> 20, total_used_memory >> 20,
-                                        expected_memory >> 20, critical_memory >> 20);
-                            const size_t top = (std::min<size_t>)(8, largest.size());
-                            std::partial_sort(largest.begin(), largest.begin() + top, largest.end(),
-                                              [](const auto& a, const auto& b) {
-                                                  return a.first > b.first;
-                                              });
-                            for (size_t i = 0; i < top; ++i) {
-                                const Image& image = *largest[i].second;
-                                LOG_WARNING(HW_GPU,
-                                            "  largest {} MiB: {}x{}x{} layers {} levels {} "
-                                            "format {} made {} frames ago, flags {:#x}",
-                                            largest[i].first >> 20, image.info.size.width,
-                                            image.info.size.height, image.info.size.depth,
-                                            image.info.resources.layers, image.info.resources.levels,
-                                            static_cast<u32>(image.info.format),
-                                            frame_tick > image.allocation_tick
-                                                ? frame_tick - image.allocation_tick
-                                                : u64{0},
-                                            static_cast<u32>(image.flags));
-                            }
-                            std::vector<std::pair<u64, u32>> formats;
-                            for (const auto& [format, total] : by_format) {
-                                formats.emplace_back(total.first, format);
-                            }
-                            std::sort(formats.rbegin(), formats.rend());
-                            for (size_t i = 0; i < (std::min<size_t>)(6, formats.size()); ++i) {
-                                LOG_WARNING(HW_GPU, "  format {}: {} MiB in {} images",
-                                            formats[i].second, formats[i].first >> 20,
-                                            by_format[formats[i].second].second);
-                            }
-                        }
                     } else if (pressure_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
                         pressure_margin -= (std::min)(pressure_margin, 128_MiB);
                         budget_check_frames = 0;
@@ -677,11 +1850,7 @@ void TextureCache<P>::TickFrame() {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
-                    // Kizuna: 1/6 of the budget (at most 1.25 GiB) instead of 1/8 (1 GiB). The
-                    // usage compared here is the whole device's, buffers and blocks included, and
-                    // on an 8 GB card shared with a browser and four monitors (budget 5.1 GB) the
-                    // old margin let it sit at 5135 of 5141 MiB until an image did not fit.
-                    const u64 margin = (std::min)(budget / 6, 1280_MiB);
+                    const u64 margin = (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -694,9 +1863,30 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    critical_memory =
-                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
-                    // zortos293/Lichii#1210: the device's budget is not all the room there is.
+                    // FRITCHII_SMALL_CARD (part Fit): what the usage leaves out (the image pool,
+                    // deleted images still in flight, collector downloads) is memory the driver
+                    // counts. Kept out of the thresholds, the cache filled to critical and those
+                    // went on top: up to ~1.2 GiB past the 1/8 margin at the market (pool 1 GiB),
+                    // over the budget of an 8 GB card at 1440p and of every 6 GB card. Reserved
+                    // like the slack: at once when it grows, 16 MiB a check when it shrinks.
+                    // The margin then only covers growth between checks and the budget
+                    // shrinking: 1/16 of the budget, at most 512 MiB.
+                    u64 critical_margin = margin;
+                    if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                        const u64 held = UncountedDeviceBytes();
+                        held_margin = held >= held_margin
+                                          ? held
+                                          : held_margin - (std::min)(held_margin - held, 16_MiB);
+                        critical_margin = SmallCardMargin(budget) + held_margin;
+                        pressure_margin = (std::min)(
+                            pressure_margin, (std::max)(budget / 8, u64{512_MiB}));
+                    } else {
+                        held_margin = 0;
+                    }
+                    critical_memory = budget - (std::min)(critical_margin + pressure_margin +
+                                                              slack_margin,
+                                                          budget / 2);
+                    // Ported fix: the device's budget is not all the room there is.
                     // Windows charges device memory to the system's commit limit, so the cache
                     // may also hold no more than the device memory in use plus the commit still
                     // free, less 2 GiB (HostCriticalMemory; an OoT out-of-memory crash on a PC
@@ -709,6 +1899,11 @@ void TextureCache<P>::TickFrame() {
                     critical_memory = (std::min)(critical_memory, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
+                    // FRITCHII_KEEP_BLOCKS: the kept blocks get what the live usage leaves under
+                    // the critical use and half the room above it.
+                    if constexpr (requires { runtime.LimitKeptBlocks(u64{}, u64{}); }) {
+                        runtime.LimitKeptBlocks(budget, critical_memory);
+                    }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the overrides: the value before them is above
                     // the 5/8-of-budget cap on large cards, so every check looked like a change
@@ -724,8 +1919,12 @@ void TextureCache<P>::TickFrame() {
                                  expected_memory >> 20, critical_memory >> 20,
                                  minimum_memory >> 20);
                         LOG_INFO(HW_GPU,
-                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
-                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} "
+                                 "MiB, uncounted {} MiB (small card profile {})",
+                                 (critical_margin - held_margin) >> 20, pressure_margin >> 20,
+                                 slack_margin >> 20, held_margin >> 20,
+                                 VideoCore::SmallCard::On(VideoCore::SmallCard::Fit) ? "on"
+                                                                                     : "off");
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
                                      *commit_room >> 20,
@@ -746,8 +1945,37 @@ void TextureCache<P>::TickFrame() {
             if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
                 gpu_sentenced_images.front().image.ReleaseToPool();
             }
+            // EDEN_NX2_ASYNC_IMAGE_FREE: what is left of it is destroyed on the runtime's free
+            // thread (moved out here; pop_front then destroys an empty image), not here.
+            if constexpr (requires(Image& image) { runtime.FreeImageLater(image); }) {
+                runtime.FreeImageLater(gpu_sentenced_images.front().image);
+            }
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
+        }
+        // Fritchii's free guard: images deleted with a download queued. The download records
+        // may still hold them (then the landing destroys them, the GPU being past this tick).
+        while (!retained_image_keepers.empty() &&
+               runtime.IsFree(retained_image_keepers.front().tick)) {
+            retained_image_keepers.pop_front();
+        }
+        if (frame_tick % 600 == 0) {
+            const u64 total = free_guard.retained_held + free_guard.landed_early +
+                              free_guard.freed_early + free_guard.unswizzle_dropped;
+            if (total != free_guard.logged_total) {
+                free_guard.logged_total = total;
+                LOG_INFO(HW_GPU,
+                         "Free guard (session): {} images deleted with a download queued held "
+                         "until the GPU passed their delete ({} of those downloads landed "
+                         "before it: freed in use without the guard), {} held now, {} destroyed "
+                         "early anyway (must be 0); {} async unswizzles dropped with their image",
+                         free_guard.retained_held, free_guard.landed_early,
+                         retained_image_keepers.size(), free_guard.freed_early,
+                         free_guard.unswizzle_dropped);
+            }
+        }
+        if constexpr (requires { runtime.SubmitImageFrees(); }) {
+            runtime.SubmitImageFrees();
         }
     }
     // If we can obtain the memory info, use it instead of the estimate.
@@ -760,38 +1988,29 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        // EXP121: images whose download is queued are as good as deleted.
+        total_used_memory -= (std::min)(total_used_memory, collect_download_memory);
+        // EDEN_NX2_ASYNC_IMAGE_FREE: deleted images handed to the free thread and not destroyed
+        // yet are still counted by the driver; left out, so the collector sees what it saw when
+        // they were destroyed above. Read after the usage: a free in between leaves the usage
+        // counted high, never low.
+        if constexpr (requires { runtime.PendingImageFreeBytes(); }) {
+            total_used_memory -= (std::min)(total_used_memory, runtime.PendingImageFreeBytes());
+        }
         // EXP42's pooled images are deleted images too: the pool caps and ages them itself.
         if constexpr (requires { runtime.PooledImageBytes(); }) {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
-            // Kizuna: past the critical threshold even without the pool, its idle images are
-            // memory the next allocation needs: give them back to the driver now.
-            if constexpr (requires { runtime.ReleaseImagePool(); }) {
-                if (total_used_memory >= critical_memory && runtime.PooledImageBytes() != 0) {
-                    runtime.ReleaseImagePool();
-                }
-            }
-        }
-        // Kizuna: the allocator keeps a block of device memory for buffers, which it gives back
-        // when one does not fit (a buffer that fits nowhere ended build 6). With a gigabyte of
-        // room under the critical threshold it is taken again, a few seconds apart.
-        if constexpr (requires { runtime.RestoreMemoryReserve(); }) {
-            if (native_thresholds_applied && frame_tick % 120 == 0 &&
-                total_used_memory + 1_GiB < critical_memory) {
-                runtime.RestoreMemoryReserve();
-            }
         }
     }
-    // EDEN_NX2_MEM_TRACE=1 (from zortos293/Lichii#951): every 2 s, what the cache holds next to
+    // FRITCHII_VRAM_BUDGET_MODE / FRITCHII_VRAM_OWNERS: once a second / every 10 s, with the
+    // usage just read (the collector below already sees a moved cap).
+    BudgetControl();
+    LogVramOwners();
+    // EDEN_NX2_MEM_TRACE=1 (ported): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
-    // Kizuna: on by default, every 10 s (EDEN_NX2_MEM_TRACE=0 turns it off, any other value
-    // brings back the 2 s period): the cache's share of the device memory, next to what the
-    // process and the driver report, is what tells where the video memory goes.
-    static const char* const mem_trace_env = std::getenv("EDEN_NX2_MEM_TRACE");
-    static const bool mem_trace = mem_trace_env == nullptr || mem_trace_env[0] != '0';
-    static const auto mem_trace_period =
-        std::chrono::seconds{mem_trace_env != nullptr ? 2 : 10};
+    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
     if (const auto now = std::chrono::steady_clock::now();
-        mem_trace && now - mem_trace_time >= mem_trace_period) {
+        mem_trace && now - mem_trace_time >= std::chrono::seconds{2}) {
         mem_trace_time = now;
         u64 image_bytes{};
         u64 gpu_written_bytes{};
@@ -904,7 +2123,55 @@ void TextureCache<P>::TickFrame() {
             async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    // EXP121's counts, and the collector downloads that still wait for the GPU.
+    if (frame_tick % 600 == 0 && (log_tc || VideoCore::Nx2Debug::Experiment(121) != 0)) {
+        auto& s = collect_stats;
+        if (s.waits != 0 || s.made != 0 || !collect_downloads.empty()) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: collector downloads {} waited, {} queued, "
+                     "{} landed ({:.1f} frames after), dropped {} used again / {} written again "
+                     "/ {} deleted, fell back {} cap / {} out of memory, {} mismatches, {} queued "
+                     "now ({} MiB staging); written again: {} by a newer overlap, {} by the CPU; "
+                     "{} landed under a GPU-only overlap (FRITCHII_COLLECT_LAND_UNDER)",
+                     s.waits, s.made, s.landed,
+                     s.landed != 0 ? static_cast<double>(s.land_frames) / s.landed : 0.0,
+                     s.dropped_used, s.dropped_written, s.dropped_deleted, s.fallback_cap,
+                     s.fallback_oom, s.mismatches, collect_downloads.size(),
+                     collect_download_staging >> 20, s.dropped_under, s.dropped_cpu,
+                     s.landed_under);
+        }
+        s = {};
+    }
+    // FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE: what they did, every 600 frames.
+    if (frame_tick % 600 == 0) {
+        auto& s = collect_port_stats;
+        const int over = VideoCore::Nx2Debug::g_tc_collect_over.load(std::memory_order_relaxed);
+        const int evictable =
+            VideoCore::Nx2Debug::g_tc_collect_evictable.load(std::memory_order_relaxed);
+        if (over > 0 || evictable > 0) {
+            LOG_INFO(HW_GPU,
+                     "Collector ports (FRITCHII_TC_COLLECT_OVER={} FRITCHII_TC_COLLECT_EVICTABLE={}) "
+                     "last 600 frames: {} passes past critical (+{} deletes allowed, {} at 1 GiB+ "
+                     "over, peak {} MiB over), {} images deleted past critical; {} skipped as not "
+                     "deletable; device memory {} MiB (critical {} MiB)",
+                     (std::max)(over, 0), (std::max)(evictable, 0), s.over_passes, s.over_extra,
+                     s.over_young, s.over_peak >> 20, s.deleted_aggressive, s.skipped,
+                     total_used_memory >> 20, critical_memory >> 20);
+        }
+        s = {};
+    }
+    unmap_stats.held_byte_frames += unmapped_live_bytes;
+    unmap_stats.held_peak = (std::max)(unmap_stats.held_peak, unmapped_live_bytes);
+    if (frame_tick % 600 == 0) {
+        if (log_tc || SweepUnmappedMode() != 0) {
+            LogUnmapStats();
+        }
+        unmap_stats = {};
+    }
+    SweepUnmapped();
+    SweepSuperseded();
     SweepColdImages();
+    TickThrashGuard();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
     bool out_of_memory = false;
@@ -912,9 +2179,6 @@ void TextureCache<P>::TickFrame() {
         const u32 failed = runtime.FailedImages();
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
-        if (out_of_memory) {
-            last_memory_failure_frame = frame_tick;
-        }
     }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
@@ -926,7 +2190,7 @@ void TextureCache<P>::TickFrame() {
             channel_storage[c].graphics_image_table.Invalidate();
             channel_storage[c].compute_image_table.Invalidate();
         }
-        // Texture memos of their null views would skip that read (EXP32, zortos293/Lichii#717).
+        // Texture memos of their null views would skip that read (EXP32).
         ++texture_memo_epoch;
     }
     sentenced_images.Tick();
@@ -949,6 +2213,24 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    if (const int lru_switch = VideoCore::Nx2Debug::Experiment(90); lru_switch != 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (nx2_lru_touch_report == std::chrono::steady_clock::time_point{}) {
+            nx2_lru_touch_report = now;
+        } else if (now - nx2_lru_touch_report >= std::chrono::seconds{5}) {
+            const u64 all = nx2_lru_touches + nx2_lru_touches_skipped;
+            LOG_INFO(HW_GPU,
+                     "Image LRU touch (EXP90={}) in 5 s: {} touched, {} skipped ({:.1f}% of {})",
+                     lru_switch, nx2_lru_touches, nx2_lru_touches_skipped,
+                     all != 0 ? 100.0 * static_cast<double>(nx2_lru_touches_skipped) /
+                                    static_cast<double>(all)
+                              : 0.0,
+                     all);
+            nx2_lru_touch_report = now;
+            nx2_lru_touches = 0;
+            nx2_lru_touches_skipped = 0;
+        }
+    }
     // Prepared render targets skip the LRU touch of their images: keep them to one frame.
     ++bindings_epoch;
     if (VideoCore::Nx2Debug::Experiment(31) != 0 && frame_tick % 600 == 0) {
@@ -972,6 +2254,54 @@ void TextureCache<P>::TickFrame() {
                  relocation_shapes.size());
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
+    }
+    clear_exact_unchecked += clear_exact_pending.size();
+    clear_exact_pending.clear();
+    if ((clear_exact_used != 0 || clear_exact_missed != 0 || no_pool_marked != 0) &&
+        frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Clear to exact size (EXP68={}) last 600 frames: {} depth clears sent to the "
+                 "scissor's width, {} confirmed by the next bind, {} missed, {} not bound again "
+                 "that frame; {} addresses off; {} images kept out of the pool",
+                 VideoCore::Nx2Debug::Experiment(68), clear_exact_used, clear_exact_confirmed,
+                 clear_exact_missed, clear_exact_unchecked, clear_exact_unsafe.size(),
+                 no_pool_marked);
+        clear_exact_used = clear_exact_confirmed = clear_exact_missed = clear_exact_unchecked = 0;
+        no_pool_marked = 0;
+    }
+    if (depth_census_on) [[unlikely]] {
+        CensusTickFrame();
+    }
+    if ((pad_depth_lookups != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Host pad (EXP67={}) last 600 frames: {} new depth targets, {} padded, {} at an "
+                 "address without a resize yet, {} refused (lookup kind, rescaling, shape, "
+                 "sampled address); {} found by a texture lookup; {} varying addresses, {} stopped",
+                 VideoCore::Nx2Debug::Experiment(67), pad_depth_lookups, pad_made,
+                 pad_not_varying, pad_skipped_other, pad_sampled, pad_slots.size(),
+                 pad_unsafe_slots.size());
+        pad_made = pad_sampled = pad_depth_lookups = pad_not_varying = pad_skipped_other = 0;
+    }
+    if (slot_clears != 0 && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Slot retire (EXP64={}) last 600 frames: {} cleared targets over same-address "
+                 "images, {} retired; kept: {} guarded (sampled or CPU-read later), {} busy "
+                 "(bound, download queued), {} of an excluded kind, {} written this frame; {} made "
+                 "again within 16 frames of a retire",
+                 VideoCore::Nx2Debug::Experiment(64), slot_clears, slot_retired, slot_kept_guard,
+                 slot_kept_busy, slot_kept_kind, slot_kept_same_frame, slot_remade);
+        slot_clears = slot_retired = slot_kept_guard = slot_kept_busy = slot_kept_kind =
+            slot_kept_same_frame = slot_remade = 0;
+        std::string flags_text;
+        for (u32 bit = 0; bit < 32; ++bit) {
+            if (slot_kept_flag[bit] != 0) {
+                flags_text += fmt::format(" flag bit {}: {};", bit, slot_kept_flag[bit]);
+            }
+        }
+        LOG_INFO(HW_GPU, "Slot retire (EXP64) excluded kinds:{} not GPU-written or unregistered: {}; "
+                 "scaled or aliased: {}", flags_text, slot_kept_not_gpu, slot_kept_aliased);
+        slot_kept_flag.fill(0);
+        slot_kept_not_gpu = slot_kept_aliased = 0;
     }
     TickRenderClock();
     TickRelocationTombstones();
@@ -1048,22 +2378,122 @@ bool TextureCache<P>::ColdSuperseded(ImageId image_id, const ImageBase& image) {
 }
 
 template <class P>
-void TextureCache<P>::SweepColdImages() {
-    const u64 cold_frames = TcColdFrames();
-    if (cold_frames == 0) {
+bool TextureCache<P>::CoveredByNewerWrites(ImageId image_id, ImageBase& image) {
+    // FRITCHII_COVERED_RETIRE. Newer: written by the GPU after this image's last write
+    // (modification_tick is one counter for the whole cache) and touched no earlier than this
+    // image last was, so nothing read this image after those writes landed over it. Such
+    // images together reach every byte: the memory holds none of this image's contents any
+    // more, on the console as here, and a read of it (a CPU read flushes the GPU-written
+    // images there) gets the newer bytes either way.
+    const auto start = std::chrono::steady_clock::now();
+    image.covered_check_frame = frame_tick;
+    ++covered_stats.checked;
+    if (image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Sparse)) {
+        return false;
+    }
+    const DAddr begin = image.cpu_addr;
+    const DAddr end = begin + image.guest_size_bytes;
+    const u64 touched = lru_cache.Tick(image.lru_index);
+    const u64 written = image.modification_tick;
+    covered_ranges.clear();
+    ForEachImageInRegion(begin, image.guest_size_bytes, [&](ImageId other_id, Image& other) {
+        if (other_id == image_id || False(other.flags & ImageFlagBits::Registered) ||
+            True(other.flags & ImageFlagBits::Sparse) || other.modification_tick <= written ||
+            lru_cache.Tick(other.lru_index) < touched) {
+            return;
+        }
+        const DAddr other_begin = (std::max)(static_cast<DAddr>(other.cpu_addr), begin);
+        const DAddr other_end =
+            (std::min)(static_cast<DAddr>(other.cpu_addr + other.guest_size_bytes), end);
+        if (other_begin < other_end) {
+            covered_ranges.emplace_back(other_begin, other_end);
+        }
+    });
+    std::ranges::sort(covered_ranges);
+    DAddr reach = begin;
+    for (const auto& [range_begin, range_end] : covered_ranges) {
+        if (range_begin > reach) {
+            break;
+        }
+        reach = (std::max)(reach, range_end);
+        if (reach >= end) {
+            break;
+        }
+    }
+    covered_stats.check_ns += NsSince(start);
+    return reach >= end;
+}
+
+template <class P>
+void TextureCache<P>::RetireCovered(ImageId image_id, Image& image) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::ColdSweep};
+    covered_stats.deleted_bytes += ImageMemoryBytes(image);
+    if (covered_swept.size() >= 65536) {
+        covered_swept.clear(); // the oldest are the least likely to be read again
+    }
+    covered_swept[image.gpu_addr] = frame_tick;
+    // As the collector deletes a bad overlap: no download.
+    MarkStale(image); // before UntrackImage (see MarkStale)
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    UnregisterImage(image_id);
+    DeleteImage(image_id);
+}
+
+template <class P>
+void TextureCache<P>::SweepSuperseded() {
+    // FRITCHII_SWEEP_SUPERSEDED=N (live, frames, 0 = off; 1 = 60): a GPU-written image untouched
+    // for N frames whose memory a newer image of another shape (touched since) also covers: the
+    // game reused that memory for another layout, so nothing reads the old contents (a CPU read
+    // there goes to the newer image). EXP58 does this for the cold sweep's chain images after 60
+    // frames; this looks at every GPU-written image, every min(N, 30) frames. Skitchii runs 3:
+    // OoT's Castle Town guard house at 3440x1440 moves ~20 render targets a frame while the
+    // camera turns, and 60 frames of dead copies took driver usage to 13-15 GB on a 12 GB card
+    // (orbit 16-24 -> 42-51 fps; 2 lost fps standing). Deleted without a download, as the
+    // collector would, so their VkImages go back to the EXP42 pool in time for the next set.
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_sweep_superseded,
+                                                       "FRITCHII_SWEEP_SUPERSEDED");
+    auto& s = superseded_stats;
+    if (frame_tick % 600 == 0 && (value > 0 || s.passes != 0)) {
+        LOG_INFO(HW_GPU,
+                 "Superseded sweep (FRITCHII_SWEEP_SUPERSEDED={}) last 600 frames: {} passes, {} "
+                 "GPU-written images looked at, {} deleted ({} MiB), {} kept as bound or "
+                 "downloading, {:.2f} ms spent; {} sampled again where one was deleted",
+                 (std::max)(value, 0), s.passes, s.looked, s.deleted, s.deleted_bytes >> 20,
+                 s.kept_busy, static_cast<double>(s.sweep_ns) / 1e6, s.sampled_after);
+        s = {};
+        if (value <= 0) {
+            superseded_swept.clear();
+        }
+    }
+    if (value <= 0) {
         return;
     }
-    static const bool sweep_guarded = [] {
-        const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
-        return value != nullptr && value[0] == '1';
-    }();
-    constexpr u32 MaxPerFrame = 16;
-    constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
+    const u64 frames = value == 1 ? u64{60} : static_cast<u64>(value);
+    if (frame_tick < frames || frame_tick % (std::min)(frames, u64{30}) != 0) {
+        return;
+    }
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::SupersededSweep};
+    const auto start = std::chrono::steady_clock::now();
     constexpr ImageFlagBits excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
-        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
-        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
-        ImageFlagBits::CostlyLoad;
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::IsDecoding |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::Remapped |
+        ImageFlagBits::CollectPending;
+    std::vector<ImageId> dead;
+    lru_cache.ForEachItemBelow(frame_tick - frames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            False(image.flags & ImageFlagBits::Registered) || True(image.flags & excluded)) {
+            return false;
+        }
+        ++s.looked;
+        if (ColdSuperseded(image_id, image)) {
+            dead.push_back(image_id);
+        }
+        return false;
+    });
     const auto queued = [](ImageId image_id, const auto& downloads) {
         return std::ranges::any_of(downloads, [image_id](const auto& download) {
             return download.is_swizzle && download.object_id == image_id;
@@ -1076,6 +2506,89 @@ void TextureCache<P>::SweepColdImages() {
                        render_targets.color_buffer_ids.end();
         });
     };
+    for (const ImageId image_id : dead) {
+        Image& image = slot_images[image_id];
+        if (bound(image) || queued(image_id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads,
+                                [&](const auto& downloads) { return queued(image_id, downloads); })) {
+            ++s.kept_busy;
+            continue;
+        }
+        // FRITCHII_LOST_WRITEBACK: written back first (the landing deletes it), or kept for a
+        // later pass while the queue is full.
+        const LostWriteback writeback = QueueLostWriteback(image_id, image, LostPathSuperseded);
+        if (writeback == LostWriteback::Keep) {
+            ++s.kept_busy;
+            continue;
+        }
+        s.deleted_bytes += ImageMemoryBytes(image);
+        if (superseded_swept.size() >= 65536) {
+            superseded_swept.clear(); // the oldest are the least likely to be read again
+        }
+        superseded_swept[image.gpu_addr] = frame_tick;
+        if (writeback == LostWriteback::Queued) {
+            ++s.deleted;
+            continue;
+        }
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+        ++s.deleted;
+    }
+    ++s.passes;
+    s.sweep_ns += NsSince(start);
+}
+
+template <class P>
+void TextureCache<P>::SweepColdImages() {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::ColdSweep};
+    const u64 cold_frames = TcColdFrames();
+    if (cold_frames == 0) {
+        return;
+    }
+    static const bool sweep_guarded = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
+        return value != nullptr && value[0] == '1';
+    }();
+    // FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16): images deleted a frame at most. zortos
+    // #1571 retires up to 512 a frame: in the guard house 7,858 dead targets built up within
+    // seconds there. The cap line below says whether 16 is ever reached here.
+    const int cap_value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_max,
+                                                           "FRITCHII_COLD_SWEEP_MAX");
+    const u32 MaxPerFrame = cap_value > 0 ? static_cast<u32>(cap_value) : 16;
+    constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
+        ImageFlagBits::CostlyLoad | ImageFlagBits::CollectPending;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    // FRITCHII_COVERED_RETIRE=N: a watched GPU-written image untouched for N frames whose memory
+    // newer GPU writes cover whole goes now, guarded or not (the guards keep contents a later
+    // frame may read; covered ones have none left). Checked once per new overlap, under caps of
+    // their own: the pot room makes ~30 targets a frame.
+    const int covered_value = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_covered_retire, "FRITCHII_COVERED_RETIRE");
+    const u64 covered_frames = covered_value > 0 ? static_cast<u64>(covered_value) : 0;
+    constexpr u32 MaxCoveredChecks = 64;
+    constexpr u32 MaxCoveredDeletes = 64;
+    u32 covered_checks = 0;
+    u32 covered_deleted = 0;
+    bool covered_capped = false;
     u32 deleted = 0;
     size_t index = 0;
     while (index < cold_watch.size()) {
@@ -1095,6 +2608,33 @@ void TextureCache<P>::SweepColdImages() {
             True(image.flags & excluded)) {
             drop();
             continue;
+        }
+        if (covered_frames != 0 && True(image.flags & ImageFlagBits::GpuModified) &&
+            False(image.flags & ImageFlagBits::CollectPending) &&
+            image.covered_overlap_frame > image.covered_check_frame &&
+            frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames) {
+            if (covered_checks >= MaxCoveredChecks || covered_deleted >= MaxCoveredDeletes) {
+                covered_capped = true; // looked at in a later frame
+            } else {
+                ++covered_checks;
+                if (CoveredByNewerWrites(image_id, image)) {
+                    if (queued(image_id, uncommitted_downloads) ||
+                        std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                            return queued(image_id, downloads);
+                        }) ||
+                        bound(image)) {
+                        ++covered_stats.busy;
+                        image.covered_check_frame = image.covered_overlap_frame - 1; // again
+                        ++index;
+                        continue;
+                    }
+                    ++covered_deleted;
+                    ++covered_stats.sweep_deleted;
+                    RetireCovered(image_id, image);
+                    drop();
+                    continue;
+                }
+            }
         }
         if (False(image.flags & ImageFlagBits::BadOverlap)) {
             // The newest image of a chain has one overlap; the next drift makes it bad.
@@ -1173,6 +2713,25 @@ void TextureCache<P>::SweepColdImages() {
             continue;
         }
         if (deleted >= MaxPerFrame) {
+            if (covered_frames == 0) {
+                break;
+            }
+            ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
+            continue;
+        }
+        // FRITCHII_LOST_WRITEBACK (default 1): written back to guest memory first, and deleted
+        // when that lands. Dropped, an image made there later (the dialogue box's text read
+        // again after the UI was hidden: OoT draws it once) had no contents (#1310).
+        switch (QueueLostWriteback(image_id, image, LostPathCold)) {
+        case LostWriteback::Queued:
+            ++deleted;
+            cold_superseded += superseded ? 1 : 0;
+            drop(); // the landing deletes it; used again first, it stays
+            continue;
+        case LostWriteback::Keep:
+            ++index; // the queue is full: a later frame
+            continue;
+        case LostWriteback::Drop:
             break;
         }
         // As the collector deletes an image it does not download.
@@ -1187,15 +2746,42 @@ void TextureCache<P>::SweepColdImages() {
         drop();
     }
     cold_deleted += deleted;
+    cold_cap_frames += deleted >= MaxPerFrame ? 1 : 0;
+    covered_stats.capped_frames += covered_capped ? 1 : 0;
     if (frame_tick % 600 == 0) {
+        auto& c = covered_stats;
+        if (covered_frames != 0 || c.checked != 0) {
+            LOG_INFO(HW_GPU,
+                     "Covered retire (FRITCHII_COVERED_RETIRE={}) last 600 frames: {} checked "
+                     "({:.2f} ms), deleted {} by the cold sweep, {} by the collector without a "
+                     "download, {} queued downloads dropped as covered ({} MiB in all); {} kept "
+                     "as busy, caps reached in {} frames; {} sampled again where one was "
+                     "deleted (must stay near 0)",
+                     covered_frames, c.checked, static_cast<double>(c.check_ns) / 1e6,
+                     c.sweep_deleted, c.collect_deleted, c.landing_deleted,
+                     c.deleted_bytes >> 20, c.busy, c.capped_frames, c.sampled_after);
+        }
+        c = {};
+        if (covered_frames == 0) {
+            covered_swept.clear();
+        }
+    }
+    if (frame_tick % 600 == 0 && (cold_cap_frames != 0 || cap_value > 0)) {
+        LOG_INFO(HW_GPU,
+                 "Cold sweep cap (FRITCHII_COLD_SWEEP_MAX={}) last 600 frames: {} a frame at "
+                 "most, reached in {} frames, {} watched now",
+                 (std::max)(cap_value, 0), MaxPerFrame, cold_cap_frames, cold_watch.size());
+    }
+    if (frame_tick % 600 == 0) {
+        cold_cap_frames = 0;
         LOG_INFO(HW_GPU,
                  "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}{}) last 600 frames: {} chain images "
                  "deleted ({} of them guarded but superseded, EXP58), {} kept as GPU-written and "
                  "guarded, {} kept as read later; {} watched; {} images, device memory {} MiB "
-                 "(expected {} MiB)",
+                 "(expected {} MiB); EXP77 shapes guarded after a sweep: {} so far",
                  cold_frames, sweep_guarded ? ", guarded too" : "", cold_deleted, cold_superseded,
                  cold_kept_guarded, cold_kept_read, cold_watch.size(), slot_images.size(),
-                 total_used_memory >> 20, expected_memory >> 20);
+                 total_used_memory >> 20, expected_memory >> 20, nx2_sweep_guards);
         cold_deleted = cold_kept_guarded = cold_kept_read = cold_superseded = 0;
         // The image families made in those frames, most made first (fable52_answer_13 sec. 6).
         std::vector<std::pair<std::pair<u32, u32>, const MadeShapes*>> families;
@@ -1373,8 +2959,18 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         if (blacklist) {
             has_blacklisted = false;
         }
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS only: an element repeating the one
+        // before (a handle table holding one shadow map in many elements, say) is the same view:
+        // visiting it again only prepares it again. Not once this pass has deleted image views
+        // (scaling an image down below does): that view may have gone with them.
+        const bool reuse_repeats{VideoCore::Nx2Debug::LightTableArrays()};
+        const ImageViewInOut* previous{};
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            view.id = reuse_repeats && previous != nullptr && previous->index == view.index &&
+                              !has_deleted_images
+                          ? previous->id
+                          : VisitImageView(view.index, compute);
+            previous = &view;
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -1535,7 +3131,7 @@ template <class P>
 bool TextureCache<P>::TakeTextureMemoEntry(u32 tic_handle, u32 tsc_handle, ImageViewId view,
                                            SamplerId sampler, TextureMemoEntry& entry) const {
     // The entry must be in the table as this draw read it, and still give the resolved id
-    // (as zortos293/Lichii#717's RecordBinding checks).
+    // (as the original RecordBinding checks).
     const auto read_entry = [](const auto& table, u32 index, auto id) {
         return !table.invalidated && index / 64 < table.read_descriptors.size() &&
                index < table.descriptors.size() &&
@@ -1627,7 +3223,141 @@ void TextureCache<P>::TouchTextureMemoView(ImageViewId view) noexcept {
     }
     ImageBase& image = slot_images[image_view.image_id];
     CheckCrossFrameUse(image, false, false); // as PrepareImage(id, false, false) would
-    lru_cache.Touch(image.lru_index, frame_tick);
+    TouchImageLru(image);
+}
+
+template <class P>
+typename TextureCache<P>::TexBankPage* TextureCache<P>::TexBankWatch(DAddr page,
+                                                                    bool& created) {
+    if (const auto it = tex_bank_pages.find(page); it != tex_bank_pages.end()) {
+        created = false;
+        return &it->second;
+    }
+    created = true;
+    // A bound on the trapped pages (handle words and pool entries of the draws seen lately).
+    if (tex_bank_pages.size() >= 4096) {
+        TexBankReset();
+    }
+    // Trapped from now on. Not before: the entry's first look moves its generation (recheck).
+    device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, 1);
+    TexBankPage& entry = tex_bank_pages[page];
+    entry.page = page;
+    return &entry;
+}
+
+template <class P>
+void TextureCache<P>::TexBankReset() {
+    if (tex_bank_pages.empty()) {
+        return;
+    }
+    for (const auto& [page, entry] : tex_bank_pages) {
+        device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, -1);
+    }
+    tex_bank_pages.clear();
+    ++tex_bank_epoch;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareTexBankViews(std::span<const ImageViewId> views) {
+    has_deleted_images = false;
+    for (const ImageViewId view : views) {
+        if (view != NULL_IMAGE_VIEW_ID) {
+            PrepareImageView(view, false, false);
+        }
+    }
+    return !has_deleted_images;
+}
+
+template <class P>
+DrawTemplateContext TextureCache<P>::GraphicsTextureContext(u64 owner) const noexcept {
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    return {
+        .owner = owner,
+        .memory = reinterpret_cast<uintptr_t>(gpu_memory),
+        .image_table = reinterpret_cast<uintptr_t>(&image_table),
+        .tic_address = image_table.current_gpu_addr,
+        .tsc_address = sampler_table.current_gpu_addr,
+        .tic_limit = image_table.current_limit,
+        .tsc_limit = sampler_table.current_limit,
+        .via_header_index =
+            maxwell3d->regs.sampler_binding ==
+                    Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding
+                ? 1U
+                : 0U,
+        .native_tiling = gpu_memory->UsesNativeTiling() ? 1U : 0U,
+    };
+}
+
+template <class P>
+bool TextureCache<P>::KeepTemplateTextures(std::span<const u32> handles,
+                                           std::span<const ImageViewInOut> views,
+                                           std::span<const SamplerId> samplers,
+                                           std::vector<DrawTemplateTexture>& textures) {
+    textures.clear();
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    if (image_table.invalidated || sampler_table.invalidated || handles.size() != views.size() ||
+        handles.size() != samplers.size()) {
+        return false;
+    }
+    const bool via_header_index = maxwell3d->regs.sampler_binding ==
+                                  Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
+    const bool native_tiling = gpu_memory->UsesNativeTiling();
+    const auto host_of = [&](GPUVAddr address, size_t size) -> const u8* {
+        if ((address & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
+            return nullptr;
+        }
+        return gpu_memory->GetPointer(address);
+    };
+    for (size_t i = 0; i < handles.size(); ++i) {
+        const auto [view_index, sampler_index] =
+            Tegra::Texture::TexturePair(handles[i], via_header_index);
+        const u32 tic_index = Tegra::Texture::TextureHeaderIndex(
+            view_index, image_table.current_limit, native_tiling);
+        // A null view can stand for an image that failed to allocate, which the next read of the
+        // descriptor after TickFrame's collection makes again: a template would keep it null.
+        if (!views[i].id || views[i].id == NULL_IMAGE_VIEW_ID || !samplers[i] ||
+            tic_index > image_table.current_limit ||
+            sampler_index > sampler_table.current_limit) {
+            return false;
+        }
+        const DrawTemplateTexture& texture = textures.emplace_back(DrawTemplateTexture{
+            .tic_host = host_of(image_table.current_gpu_addr + tic_index * sizeof(TICEntry),
+                                sizeof(TICEntry)),
+            .tsc_host = host_of(sampler_table.current_gpu_addr + sampler_index * sizeof(TSCEntry),
+                                sizeof(TSCEntry)),
+            .tic = image_table.descriptors[tic_index],
+            .tsc = sampler_table.descriptors[sampler_index],
+            .view = views[i].id,
+            .view_generation = ImageViewGeneration(views[i].id),
+            .sampler = samplers[i],
+        });
+        if (texture.tic_host == nullptr || texture.tsc_host == nullptr ||
+            std::memcmp(texture.tic_host, &texture.tic, sizeof(texture.tic)) != 0 ||
+            std::memcmp(texture.tsc_host, &texture.tsc, sizeof(texture.tsc)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareTemplateViews(std::span<const ImageViewInOut> views) {
+    has_deleted_images = false;
+    for (const ImageViewInOut& view : views) {
+        PrepareImageView(view.id, false, false);
+    }
+    return !has_deleted_images;
+}
+
+template <class P>
+std::optional<DAddr> TextureCache<P>::TexBankDevicePage(GPUVAddr gpu_addr) const {
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device_addr) {
+        return std::nullopt;
+    }
+    return Common::AlignDown(*device_addr, Core::DEVICE_PAGESIZE);
 }
 
 template <class P>
@@ -1719,12 +3449,15 @@ bool TextureCache<P>::RescaleRenderTargets() {
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
-
-        if (has_deleted_images) {
-            // A lookup above deleted images (the collector after a failed render target, or an
-            // overlap): the ids saved so far may name them. The loop runs again with every
-            // render target dirty.
-            continue;
+        // EXP117 (live, 0 = off): a square depth target with no colour target is a shadow map.
+        // Scaling it does not sharpen the picture; it multiplies the map's memory by the square of
+        // the scale (OoT's 12288x12288 sun shadow map: 648 MiB at 1.5x). A full-screen depth
+        // prepass is not square, so it still scales.
+        if (can_rescale && tmp_depth_image != CORRUPT_ID &&
+            VideoCore::Nx2Debug::Experiment(117) != 0 &&
+            std::ranges::all_of(tmp_color_images, [](ImageId id) { return id == CORRUPT_ID; })) {
+            const Extent3D& size = slot_images[tmp_depth_image].info.size;
+            can_rescale = size.width != size.height;
         }
 
         if (can_rescale) {
@@ -1776,6 +3509,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
 
 template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+    VideoCommon::OneFollower::RenderOwned("TextureCache::UpdateRenderTargets");
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
         bool& flag;
@@ -1784,9 +3518,25 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    // EDEN_NX2_DEPTH_CENSUS: the depth target bound once this update is done, on every path out.
+    struct CensusScope {
+        TextureCache& cache;
+        bool is_clear;
+        ~CensusScope() {
+            if (cache.depth_census_on) [[unlikely]] {
+                cache.CensusNoteRenderTargets(is_clear);
+            }
+        }
+    } census_scope{*this, is_clear};
     auto& flags = maxwell3d->dirty.flags;
+    if (render_targets_out_of_memory) [[unlikely]] {
+        // A target had no memory at the last update: look every target up again, even if
+        // something cleared the dirty flags since.
+        flags[Dirty::RenderTargets] = true;
+        flags[Dirty::RenderTargetControl] = true;
+    }
     if (!flags[Dirty::RenderTargets]) {
-        // EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): bit 1 = skip the loop below while it
+        // EDEN_NX2_EXP31 (RT_FAST): bit 1 = skip the loop below while it
         // would change nothing, bit 2 = run it anyway and check that it changed nothing.
         const int rt_fast = VideoCore::Nx2Debug::Experiment(31);
         bool verify = false;
@@ -1875,6 +3625,23 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
+    }
+
+    // CheezyEmu a08015f893: a target that got no memory (FindRenderTargetView gives the null
+    // view only when its image could not be allocated; unused slots are ImageViewId{}). Its
+    // draws and clears are skipped, and every target is looked up again at the next one, by
+    // when the collector may have freed some. Never set while allocations succeed.
+    render_targets_out_of_memory =
+        render_targets.depth_buffer_id == NULL_IMAGE_VIEW_ID ||
+        std::ranges::any_of(render_targets.color_buffer_ids,
+                            [](ImageViewId id) { return id == NULL_IMAGE_VIEW_ID; });
+    if (render_targets_out_of_memory) [[unlikely]] {
+        flags[Dirty::RenderTargets] = true;
+        flags[Dirty::RenderTargetControl] = true; // forces every target's lookup
+        static u32 logged{};
+        if (logged++ < 8) {
+            LOG_ERROR(HW_GPU, "A render target has no memory: draws into it are skipped");
+        }
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
@@ -2075,9 +3842,12 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+    // EDEN_NX2_TEX_BANK_GEN: InvalidateRegion may reach only this cache.
+    Core::g_watch_write_pages.Mark(cpu_addr, size);
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         ++bindings_epoch;
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -2118,6 +3888,7 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+    const Common::WriteRing::SiteScope write_site{"texture download (DownloadMemory)", true};
     if (!relocation_tombstones.empty()) {
         CheckTombstoneCpuRead(cpu_addr, size); // EXP43=4
     }
@@ -2130,11 +3901,43 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             (image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
         }
+        unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
         image.flags &= ~ImageFlagBits::GpuModified;
         images.push_back(image_id);
     });
     if (images.empty()) {
         return;
+    }
+    // EDEN_NX2_FLUSH_AREA_LOG=1: image downloads that wait for the GPU (first ones, then a count
+    // every 10 s).
+    static const bool image_flush_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
+    if (image_flush_log) {
+        static int logged = 0;
+        static u64 count = 0, bytes = 0;
+        static auto last = std::chrono::steady_clock::now();
+        for (const ImageId id : images) {
+            const ImageBase& image = slot_images[id];
+            ++count;
+            bytes += image.unswizzled_size_bytes;
+            if (logged < 32) {
+                ++logged;
+                LOG_INFO(HW_GPU,
+                         "Image flush: read [{:#x} +{:#x}) downloads image cpu={:#x} gpu={:#x} "
+                         "format={} {}x{}x{} levels={} layers={}",
+                         cpu_addr, size, image.cpu_addr, image.gpu_addr,
+                         static_cast<u32>(image.info.format), image.info.size.width,
+                         image.info.size.height, image.info.size.depth,
+                         image.info.resources.levels, image.info.resources.layers);
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::seconds(10)) {
+            LOG_INFO(HW_GPU, "Image flush: {} image downloads, {} KiB in 10 s", count,
+                     bytes / 1024);
+            count = 0;
+            bytes = 0;
+            last = now;
+        }
     }
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
@@ -2159,6 +3962,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
+            DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ClearStaleImage(image);
@@ -2173,6 +3977,9 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         }
         auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
         auto copies = FullDownloadCopies(image.info);
+        if (depth_census_on) [[unlikely]] {
+            CensusNoteRead(image, false);
+        }
         image.DownloadMemory(map, copies);
         pending_bytes += image.unswizzled_size_bytes;
         pending.push_back(Pending{image_id, map, std::move(copies)});
@@ -2204,6 +4011,19 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
             image_view.flags |= ImageViewFlagBits::PreemtiveDownload;
         }
         area->preemtive &= image.info.forced_flushed;
+        // EDEN_NX2_FLUSH_AREA_LOG=1: which CPU reads turn an image into a per-bind download.
+        static const bool flush_area_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
+        static int flush_area_logged = 0;
+        if (flush_area_log && !image.info.forced_flushed && flush_area_logged < 64) {
+            ++flush_area_logged;
+            LOG_INFO(HW_GPU,
+                     "Flush area: CPU read [{:#x} +{:#x}) marks image cpu={:#x}..{:#x} gpu={:#x} "
+                     "format={} {}x{}x{} levels={} layers={} pitch_linear={}",
+                     cpu_addr, size, image.cpu_addr, image.cpu_addr_end, image.gpu_addr,
+                     static_cast<u32>(image.info.format), image.info.size.width,
+                     image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                     image.info.resources.layers, image.info.type == ImageType::Linear);
+        }
         image.info.forced_flushed = true;
         if ((image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
@@ -2213,7 +4033,36 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
 }
 
 template <class P>
+void TextureCache<P>::LogGpuModifiedImagesInRegion(DAddr cpu_addr, u64 size) {
+    // The images GetFlushArea's lambda acted on: same walk, same test, under the same hold.
+    ForEachImageInRegion(cpu_addr, size, [&](ImageId, ImageBase& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            return;
+        }
+        LOG_ERROR(HW_GPU,
+                  "EXP100 verify: read [{:#x} +{:#x}) found GPU-modified image cpu={:#x}..{:#x} "
+                  "size={:#x} gpu={:#x} flags={:#x} nx2_gpu_counted={} counted={:#x} +{:#x}",
+                  cpu_addr, size, image.cpu_addr, image.cpu_addr_end, image.guest_size_bytes,
+                  image.gpu_addr, static_cast<u32>(image.flags & ~ImageFlagBits::Picked),
+                  image.nx2_gpu_counted,
+                  image.nx2_counted_addr, image.nx2_counted_size);
+    });
+}
+
+template <class P>
 void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::Unmap};
+    // EDEN_NX2_TEX_BANK_GEN: a watched page leaving its mapping drops every watch (their trap
+    // counts go back while the pages are still mapped; memos of the old epoch miss).
+    if (!tex_bank_pages.empty()) {
+        const DAddr first = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
+        for (const auto& [page, entry] : tex_bank_pages) {
+            if (page >= first && page < cpu_addr + size) {
+                TexBankReset();
+                break;
+            }
+        }
+    }
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
@@ -2232,6 +4081,11 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (VideoCommon::Nx2FastDrawCount::g_on && !deleted_images.empty()) [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Map);
+    }
+    unmap_stats.unmaps_hit += deleted_images.empty() ? 0 : 1;
+    unmap_stats.images_hit += deleted_images.size();
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         ++bindings_epoch;
@@ -2246,6 +4100,171 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
             continue;
         }
         image.flags |= ImageFlagBits::Remapped;
+        ++nx2_flagged_remapped;
+        NoteUnmapped(id, image);
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteUnmapped(ImageId image_id, Image& image) {
+    image.unmapped_tick = frame_tick + 1;
+    image.unmapped_bytes = ImageMemoryBytes(image);
+    image.unmapped_index = static_cast<u32>(unmapped_images.size());
+    image.unmapped_verify = 0;
+    unmapped_images.push_back(image_id);
+    unmapped_live_bytes += image.unmapped_bytes;
+    ++unmapped_live_images;
+    ++unmap_stats.flagged;
+}
+
+template <class P>
+void TextureCache<P>::LogUnmapStats() {
+    auto& s = unmap_stats;
+    const auto at = [](const auto& counts, DeleteReason reason) {
+        return counts[static_cast<size_t>(reason)];
+    };
+    const auto others = [&](const auto& counts) {
+        return at(counts, DeleteReason::Other) + at(counts, DeleteReason::ColdSweep) +
+               at(counts, DeleteReason::SlotRetire) + at(counts, DeleteReason::SupersededSweep);
+    };
+    const u64 collector_unused = at(s.died_unused, DeleteReason::GarbageCollect);
+    const double per_death = collector_unused != 0 ? static_cast<double>(collector_unused) : 1.0;
+    LOG_INFO(HW_GPU,
+             "Texture cache last 600 frames: GPU memory unmaps {} hit {} images, {} newly flagged "
+             "remapped; flagged images found again {}, uploaded into {}, downloaded {}; deleted "
+             "while flagged (of them unused since the unmap): collector {} ({}, {:.1f} frames "
+             "after it, {} KiB each), join {} ({}), unmap {} ({}), other {} ({}); flagged now {} "
+             "images {} MiB, held {} MiB on average, {} MiB peak",
+             s.unmaps_hit, s.images_hit, s.flagged, s.refound, s.reuploaded, s.downloads,
+             at(s.died, DeleteReason::GarbageCollect), collector_unused,
+             static_cast<double>(s.collector_unused_frames) / per_death,
+             static_cast<u64>(static_cast<double>(s.collector_unused_bytes) / per_death) >> 10,
+             at(s.died, DeleteReason::Join), at(s.died_unused, DeleteReason::Join),
+             at(s.died, DeleteReason::Unmap), at(s.died_unused, DeleteReason::Unmap),
+             others(s.died), others(s.died_unused), unmapped_live_images,
+             unmapped_live_bytes >> 20, (s.held_byte_frames / 600) >> 20, s.held_peak >> 20);
+    const int mode = SweepUnmappedMode();
+    if (mode == 0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Texture cache last 600 frames: unmapped sweep (EDEN_NX2_SWEEP_UNMAPPED={}) deleted "
+             "{} ({} MiB), {} looked at; would delete {} ({} MiB), of those later found again {}, "
+             "uploaded into {} ({} GPU-written before the unmap), presented {}, written whole {}, "
+             "deleted unused by another path {}",
+             mode, s.swept, s.swept_bytes >> 20, s.sweep_scanned, s.would_sweep,
+             s.would_sweep_bytes >> 20, s.would_refound, s.would_reuploaded,
+             s.would_reuploaded_gpu, s.would_presented, s.would_overwritten, s.would_died_unused);
+}
+
+template <class P>
+void TextureCache<P>::ForgetUnmapped(ImageId image_id, ImageBase& image) {
+    unmapped_live_bytes -= (std::min)(unmapped_live_bytes, image.unmapped_bytes);
+    unmapped_live_images -= unmapped_live_images != 0 ? 1 : 0;
+    const u32 index = image.unmapped_index;
+    if (index < unmapped_images.size() && unmapped_images[index] == image_id) {
+        const ImageId last = unmapped_images.back();
+        unmapped_images[index] = last;
+        slot_images[last].unmapped_index = index;
+        unmapped_images.pop_back();
+    }
+    image.unmapped_tick = 0;
+    image.unmapped_bytes = 0;
+    image.unmapped_index = ~0U;
+    image.unmapped_verify = 0;
+}
+
+template <class P>
+void TextureCache<P>::NotePresented(ImageId image_id) {
+    if (std::ranges::find(presented_images, image_id) == presented_images.end()) {
+        presented_images[presented_next] = image_id;
+        presented_next = (presented_next + 1) % static_cast<u32>(presented_images.size());
+    }
+    ImageBase& image = slot_images[image_id];
+    if (image.unmapped_verify == 1) {
+        ++unmap_stats.would_presented;
+        image.unmapped_verify = 2;
+    }
+}
+
+template <class P>
+void TextureCache<P>::SweepUnmapped() {
+    // UnmapGPUMemory flags the images in an unmapped GPU range Remapped and CpuModified. Lookups
+    // skip them (FindImage unless EXP76 & 1 keeps one at the same address and shape, FindDMAImage,
+    // joins, which delete them without a download when a new image covers their memory), so most
+    // of them sit until the collector's age limit (50 frames, 10 near the budget). Ocarina of
+    // Time at 3440x1440 unmaps and maps its render targets again every frame or two while the
+    // camera turns in the Castle Town guard house; the dead sets overflowed 12 GB cards.
+    //
+    // Deleted here, 2 frames after their last use and without a download, only when nothing can
+    // still need their contents, so the result is what the collector does later:
+    // - CpuModified still set: nothing uploaded into it or wrote it whole since the unmap (a
+    //   cached descriptor or a render target binding can still reach it; that upload clears the
+    //   flag). Such an image is never downloaded (IsSafeGpuCopy), by the collector or a guest
+    //   read, and its next use would upload guest memory again, as a new image does. The GPU
+    //   data from before the unmap is already given up when the unmap set the flag.
+    // - No aliases: SynchronizeAliases copies from an alias without preparing it.
+    // - Not among the last images shown: presenting reads an image without preparing it.
+    // - Not a bound render target, no download queued, no decode in flight, not sparse or
+    //   unbacked (their own handling), and EXP121 has not taken it.
+    // MarkStale and untracking as the collector does for an image it does not download.
+    const int mode = SweepUnmappedMode();
+    if (mode == 0 || unmapped_images.empty()) {
+        return;
+    }
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::UnmapSweep};
+    constexpr u64 IdleFrames = 2;
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::IsDecoding |
+        ImageFlagBits::CollectPending;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    const auto download_queued = [&](ImageId image_id) {
+        return queued(image_id, uncommitted_downloads) ||
+               std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                   return queued(image_id, downloads);
+               });
+    };
+    for (size_t index = 0; index < unmapped_images.size();) {
+        ++unmap_stats.sweep_scanned;
+        const ImageId image_id = unmapped_images[index];
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Remapped) ||
+            False(image.flags & ImageFlagBits::Registered) ||
+            False(image.flags & ImageFlagBits::CpuModified) || True(image.flags & excluded) ||
+            !image.aliased_images.empty() || image.unmapped_verify != 0 ||
+            frame_tick - lru_cache.Tick(image.lru_index) < IdleFrames || bound(image) ||
+            std::ranges::find(presented_images, image_id) != presented_images.end() ||
+            download_queued(image_id)) {
+            ++index;
+            continue;
+        }
+        if (mode == 2) {
+            image.unmapped_verify = 1;
+            ++unmap_stats.would_sweep;
+            unmap_stats.would_sweep_bytes += image.unmapped_bytes;
+            ++index;
+            continue;
+        }
+        ++unmap_stats.swept;
+        unmap_stats.swept_bytes += image.unmapped_bytes;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id); // takes it out of the list: the last entry moves to this index
     }
 }
 
@@ -2255,7 +4274,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
     // A deferred clear parked before this copy has to land before it: realizing it afterwards
     // starts its clear pass after the copy and wipes what the copy wrote. That is what made
-    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // Ocarina of Time draw its terrain layer over the scene: the game clears the
     // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
     // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
     // second frame. Texture cache copies bypass render passes and keep stream order here.
@@ -2593,6 +4612,7 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
             info.z_source = static_cast<u8>(SwizzleSource::B);
             info.w_source = static_cast<u8>(SwizzleSource::OneFloat);
         }
+        NotePresented(image_id);
         return std::make_pair(&slot_image_views[FindOrEmplaceImageView(image_id, info)],
                               slot_images[image_id].IsRescaled());
     };
@@ -2672,6 +4692,9 @@ void TextureCache<P>::CommitAsyncFlushes() {
                 if (download_info.is_swizzle) {
                     Image& image = download_info.GetImage(slot_images);
                     const auto copies = FullDownloadCopies(image.info);
+                    if (depth_census_on) [[unlikely]] {
+                        CensusNoteRead(image, false);
+                    }
                     image.DownloadMemory(download_map, copies);
                     download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
                 }
@@ -2688,6 +4711,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
 
 template <class P>
 void TextureCache<P>::PopAsyncFlushes() {
+    const Common::WriteRing::SiteScope write_site{"texture download landing (PopAsyncFlushes)", true};
     if (committed_downloads.empty()) {
         return;
     }
@@ -2704,16 +4728,42 @@ void TextureCache<P>::PopAsyncFlushes() {
             auto& download_buffer = download_map[download_info.async_buffer_id];
             if (download_info.is_swizzle) {
                 const ImageBase& image = download_info.GetImage(slot_images);
+                if constexpr (requires { runtime.IsFree(u64{}); }) {
+                    // Fritchii's free guard: the old code destroyed a retired image when its
+                    // download landed (the pop below). Counted when the GPU is not known past
+                    // its delete yet; retained_image_keepers holds it now.
+                    if (download_info.retired_image && !runtime.IsFree(download_info.retired_tick)) {
+                        // The pop below drops this reference: the last one destroys the image.
+                        if (download_info.retired_image.use_count() == 1) {
+                            ++free_guard.freed_early;
+                        }
+                        if (free_guard.landed_early++ < 8) {
+                            LOG_WARNING(HW_GPU,
+                                        "Free guard: image {:#x} ({}x{}) deleted with a download "
+                                        "queued; the download landed before the GPU passed the "
+                                        "delete (tick {}), kept until it does",
+                                        image.gpu_addr, image.info.size.width,
+                                        image.info.size.height, download_info.retired_tick);
+                        }
+                    }
+                }
                 const auto copies = FullDownloadCopies(image.info);
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
                 ClearStaleImage(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                if (!collect_downloads.empty()) {
+                    if (const auto cpu_addr = gpu_memory->GpuToCpuAddress(buffer_info.address)) {
+                        DropCollectDownloadsIn(*cpu_addr, buffer_info.size);
+                    }
+                }
+                MemReadLog::GuestWrite(*gpu_memory, buffer_info.address, buffer_info.size);
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
                 ClearStaleGpu(buffer_info.address, buffer_info.size);
@@ -2745,6 +4795,9 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             Image& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
+            if (depth_census_on) [[unlikely]] {
+                CensusNoteRead(image, false);
+            }
             image.DownloadMemory(download_map, copies);
             download_map.offset += image.unswizzled_size_bytes;
         }
@@ -2758,6 +4811,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
+            DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;
@@ -2871,10 +4925,14 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
                                               size_t buffer_offset,
                                               std::span<const VideoCommon::BufferImageCopy> copies,
                                               GPUVAddr address, size_t size) {
+    if (depth_census_on) [[unlikely]] {
+        CensusNoteRead(*image, true);
+    }
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         const BufferDownload new_buffer_download{address, size};
         auto slot = slot_buffer_downloads.insert(new_buffer_download);
         const PendingDownload new_download{false, uncommitted_async_buffers.size(), slot};
+        async_flush_work_noted.store(true, std::memory_order_relaxed);
         uncommitted_downloads.emplace_back(new_download);
         auto download_map = runtime.DownloadStagingBuffer(size, true);
         uncommitted_async_buffers.emplace_back(download_map);
@@ -2898,9 +4956,38 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    // FRITCHII_ONEF_INVAL_E: pages E wrote after R's place, in an invalidation it ran without
+    // R (must be 0): the image takes that write as WriteMemory would have at its place, once
+    // this upload is done, so its next use uploads again.
+    const DAddr onef_addr = image.cpu_addr;
+    const size_t onef_size = image.guest_size_bytes;
+    const bool onef_ahead =
+        VideoCommon::OneFollower::WrittenAheadOfRender(onef_addr, onef_size);
+    SCOPE_EXIT {
+        if (onef_ahead) {
+            WriteMemory(onef_addr, onef_size);
+        }
+    };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
+    if (image.unmapped_tick != 0) {
+        ++unmap_stats.reuploaded; // still Remapped: reached through a cached descriptor or binding
+        if (image.unmapped_verify == 1) {
+            ++unmap_stats.would_reuploaded;
+            unmap_stats.would_reuploaded_gpu += True(image.flags & ImageFlagBits::GpuModified);
+            image.unmapped_verify = 2;
+        }
+    }
     image.flags &= ~ImageFlagBits::CpuModified;
+    // EXP76 & 2: the hash of the last whole upload, cleared here so any other way this refresh
+    // changes the texels (layers, sparse pieces, the stale skip) leaves no hash behind.
+    const u64 last_hash_lo = image.nx2_content_hash_lo;
+    const u64 last_hash_hi = image.nx2_content_hash_hi;
+    if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) {
+        ForgetContent(image_id, image, false);
+    }
+    image.nx2_content_hash_lo = 0;
+    image.nx2_content_hash_hi = 0;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -2909,17 +4996,32 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
     // Pages the buffer cache wrote on the GPU may hold data written back since: upload those.
-    if (tc_skip_stale && image.dirty_layers.empty() &&
+    if (TcSkipStale() && image.dirty_layers.empty() &&
         False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         IsAllStale(image.cpu_addr, image.guest_size_bytes)) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
             ++tc_stale_skips;
             tc_stale_skip_bytes += image.guest_size_bytes;
-            runtime.TransitionImageLayout(image);
+            ++lost_stats.made_skipped;
+            image.lost_contents = LostSkipped;
+            // FRITCHII_STALE_ZERO (live, default 1): zero instead of undefined. A new image's
+            // memory often held another image (the EXP42 pool hands out deleted targets'
+            // VkImages): where the game samples before drawing it whole, that image's texels
+            // showed (other text over a dialogue box, zortos293/Lichii #1310).
+            if (ClearLostToZero(image)) {
+                ++lost_stats.made_zeroed;
+                image.lost_contents |= LostZeroed;
+            } else {
+                runtime.TransitionImageLayout(image);
+            }
             return;
         }
         ++tc_stale_gpu_written;
+    } else if (stale_page_count != 0 && IsAnyStale(image.cpu_addr, image.guest_size_bytes)) {
+        // The upload below brings guest bytes older than the dropped image's GPU writes.
+        ++lost_stats.made_uploaded;
+        image.lost_contents = LostUploaded;
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
@@ -2947,6 +5049,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
+    // EXP76 & 2: a whole upload whose guest bytes hash as they did at this image's last whole
+    // upload already has its texels (the image was tracked again above, before the bytes are
+    // read, so a CPU write after this marks it again). Never for GPU-written images.
+    const int keep_mode = VideoCore::Nx2Debug::Experiment(76);
+    constexpr u32 HashMinBytes = 64 * 1024;
+    const bool hashable = (keep_mode & 2) != 0 && image.guest_size_bytes >= HashMinBytes &&
+                          False(image.flags & ImageFlagBits::GpuModified);
+    if (hashable && (last_hash_lo | last_hash_hi) != 0) {
+        ++nx2_upload_hash_checks;
+        const u128 hash = GuestContentHash(image);
+        if (hash[0] == last_hash_lo && (hash[1] | 1) == last_hash_hi &&
+            False(image.flags & ImageFlagBits::CpuModified)) {
+            ++nx2_upload_skips;
+            nx2_upload_skip_bytes += image.guest_size_bytes;
+            image.nx2_content_hash_lo = last_hash_lo;
+            image.nx2_content_hash_hi = last_hash_hi;
+            if ((keep_mode & 4) != 0) {
+                nx2_content_index[ContentKey{ContentShape(image.info), last_hash_lo,
+                                             last_hash_hi}] = image_id;
+            }
+            return;
+        }
+    }
+
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
         return;
@@ -2976,13 +5102,31 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // Page faults of the whole process meanwhile: ~256 per MiB when the guest memory was paged
     // out (cold-hinted) or the staging memory is new.
     const u64 faults_begin = upload_trace ? Common::GetProcessPageFaults() : 0;
-    if (!UploadInChunks(image)) {
+    if (TryZeroUpload(image)) {
+        // FRITCHII_ZERO_UPLOAD: cleared on the GPU, what the upload of these bytes writes.
+    } else if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
         }
+        // FRITCHII_HITCH_SPLIT: the CPU side of texture uploads in the hitch line.
+        const Common::Nx2Hitch::SplitScope hitch_timed{Common::Nx2Hitch::Cause::TextureUpload,
+                                                       MapSizeBytes(image)};
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
+    }
+    // EXP76 & 2: the bytes just uploaded, hashed after the upload read them. A CPU write since
+    // the image was tracked marked it CpuModified again: then no hash (the next refresh uploads).
+    if (hashable && False(image.flags & ImageFlagBits::CpuModified)) {
+        const u128 hash = GuestContentHash(image);
+        if (False(image.flags & ImageFlagBits::CpuModified)) {
+            image.nx2_content_hash_lo = hash[0];
+            image.nx2_content_hash_hi = hash[1] | 1; // never 0/0
+            if ((keep_mode & 4) != 0) {
+                nx2_content_index[ContentKey{ContentShape(image.info), image.nx2_content_hash_lo,
+                                             image.nx2_content_hash_hi}] = image_id;
+            }
+        }
     }
     if (upload_trace) [[unlikely]] {
         using Ms = std::chrono::duration<double, std::milli>;
@@ -3017,6 +5161,168 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
+}
+
+/// FRITCHII_ZERO_UPLOAD: bytes looked at until the first non-zero one (all of them when zero).
+[[nodiscard]] inline size_t ZeroPrefixBytes(std::span<const u8> bytes) noexcept {
+    const u8* const data = bytes.data();
+    const size_t size = bytes.size();
+    // 4 KiB at a time: OR-ing words vectorizes; a block with data stops the walk.
+    constexpr size_t Block = 4096;
+    size_t offset = 0;
+    for (; offset + Block <= size; offset += Block) {
+        u64 bits = 0;
+        for (size_t i = 0; i < Block; i += sizeof(u64)) {
+            u64 word;
+            std::memcpy(&word, data + offset + i, sizeof(word));
+            bits |= word;
+        }
+        if (bits != 0) {
+            return offset;
+        }
+    }
+    for (; offset < size; ++offset) {
+        if (data[offset] != 0) {
+            return offset;
+        }
+    }
+    return size;
+}
+
+template <class P>
+bool TextureCache<P>::TryZeroUpload(Image& image) {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_zero_upload,
+                                                      "FRITCHII_ZERO_UPLOAD");
+    if (mode <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(); }) {
+        return false;
+    } else {
+        // Only where zero guest bytes upload as zero texels in every level and layer and the
+        // upload covers the whole host image: plain (not converted, not GPU-decoded), uncompressed
+        // single-sample images whose host image is the guest image (not scaled, padded or
+        // sparse), not a buffer.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::AcceleratedUpload | ImageFlagBits::Converted |
+            ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+            ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding |
+            ImageFlagBits::ZeroFilled | ImageFlagBits::UnwrittenSparse | ImageFlagBits::Rescaled |
+            ImageFlagBits::HostPadded | ImageFlagBits::ScaleLimited;
+        constexpr u64 MinBytes = 256_KiB;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 || image.host_level_offset != 0 ||
+            image.guest_size_bytes < MinBytes ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        // A slice of a deep block-linear 3D texture spans 16x its texels in guest memory: looking
+        // at all of it costs more than the upload's own read.
+        if (u64{image.guest_size_bytes} > 2 * u64{image.unswizzled_size_bytes}) {
+            ++zero_upload.sparse_skipped;
+            return false;
+        }
+        const u64 start = Common::Nx2Hitch::NowNs();
+        // The bytes the upload would read (GpuGuestMemory, unmapped pages as zeros), in pieces so
+        // a range that is not contiguous copies at most one piece.
+        constexpr size_t Piece = 4_MiB;
+        const size_t total = image.guest_size_bytes;
+        size_t looked = 0;
+        bool zero = true;
+        for (size_t offset = 0; offset < total; offset += Piece) {
+            const size_t size = (std::min)(Piece, total - offset);
+            Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
+                *gpu_memory, image.gpu_addr + offset, size, &swizzle_data_buffer);
+            const size_t prefix = ZeroPrefixBytes(std::span<const u8>(bytes.data(), size));
+            looked += prefix;
+            if (prefix != size) {
+                zero = false;
+                break;
+            }
+        }
+        const u64 ns = Common::Nx2Hitch::NowNs() - start;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ZeroUpload, ns, looked);
+        if (!zero) {
+            ++zero_upload.data_images;
+            zero_upload.data_bytes += looked;
+            zero_upload.data_ns += ns;
+            return false;
+        }
+        ++zero_upload.zero_images;
+        zero_upload.zero_bytes += total;
+        zero_upload.zero_ns += ns;
+        if (total >= 4_MiB && zero_upload.logged < 40) {
+            ++zero_upload.logged;
+            LOG_INFO(HW_GPU,
+                     "Zero upload (FRITCHII_ZERO_UPLOAD={}): format {} type {} {}x{}x{} levels {} "
+                     "layers {} at {:#x}, {} KiB guest all zero, {} (checked in {:.2f} ms)",
+                     mode, static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.levels, image.info.resources.layers, image.gpu_addr,
+                     total >> 10, mode == 1 ? "cleared on the GPU" : "uploaded (count only)",
+                     static_cast<double>(ns) / 1e6);
+        }
+        if (mode != 1) {
+            return false; // 2: count only, the upload runs as before
+        }
+        image.ClearToZero();
+        return true;
+    }
+}
+
+template <class P>
+bool TextureCache<P>::ClearLostToZero(Image& image) {
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero, "FRITCHII_STALE_ZERO",
+                                         1) <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(true); }) {
+        return false;
+    } else {
+        // Formats a transfer clear can write (uncompressed, not converted), single-sample.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::Converted | ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+            ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        image.ClearToZero(true); // the image in use, scaled or not
+        return true;
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogZeroUploads() {
+    ZeroUploadStats& s = zero_upload;
+    const s64 now = static_cast<s64>(Common::Nx2Hitch::NowNs());
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    if (s.zero_images + s.data_images + s.sparse_skipped != 0) {
+        const int mode = VideoCore::Nx2Debug::g_zero_upload.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Zero uploads in 10 s (FRITCHII_ZERO_UPLOAD={}): {} uploads all zero ({} MiB "
+                 "guest, checked in {:.1f} ms), {}; {} had data ({} MiB looked at before the first "
+                 "non-zero byte, {:.1f} ms); {} not checked (3D slices, guest footprint over 2x)",
+                 mode, s.zero_images, s.zero_bytes >> 20, static_cast<double>(s.zero_ns) / 1e6,
+                 mode == 1 ? "cleared on the GPU" : "uploaded as before (count only)",
+                 s.data_images, s.data_bytes >> 20, static_cast<double>(s.data_ns) / 1e6,
+                 s.sparse_skipped);
+    }
+    s.zero_images = s.zero_bytes = s.zero_ns = 0;
+    s.data_images = s.data_bytes = s.data_ns = 0;
+    s.sparse_skipped = 0;
 }
 
 template <class P>
@@ -3065,7 +5371,7 @@ bool TextureCache<P>::UploadsByLayer(const ImageBase& image) const noexcept {
                image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
                image.guest_size_bytes >= LayerUploadMinSize &&
                False(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
-                                    ImageFlagBits::Remapped | ImageFlagBits::HostResized));
+                                    ImageFlagBits::Remapped));
     } else {
         return false;
     }
@@ -3233,6 +5539,18 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        // At most 32 MiB of layers per staging buffer, as UploadInChunks: all of a sparse array's
+        // bound layers at once took a 128 MiB one that an 8 GB laptop had no memory for.
+        constexpr u64 ChunkBytes = 32_MiB;
+        const size_t chunk_layers = static_cast<size_t>(
+            (std::max<u64>)(1, ChunkBytes / (std::max<u64>)(image.info.layer_stride, 1)));
+        if (layers.size() > chunk_layers) {
+            for (size_t first = 0; first < layers.size(); first += chunk_layers) {
+                UploadLayers(image, layers.subspan(first, (std::min)(chunk_layers,
+                                                                     layers.size() - first)));
+            }
+            return;
+        }
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
             ImageInfo layer_info = image.info;
@@ -3364,11 +5682,76 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
-    const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
+    ImageId image_id = FindImage(info, image_gpu_addr, RelaxedOptions{});
+    if (!image_id) {
+        image_id = InsertImage(info, image_gpu_addr, RelaxedOptions{});
+        // EXP77 (live; fable52_answer_keeptex_2 2b): the game samples memory where the cold
+        // sweep just took a GPU-written target: that shape's contents are read in later frames,
+        // so the sweep keeps it from now on (GuardSampled), as if the target had been sampled.
+        if (image_id && !nx2_swept_shapes.empty()) [[unlikely]] {
+            if (const auto swept = nx2_swept_shapes.find(image_gpu_addr);
+                swept != nx2_swept_shapes.end()) {
+                RelocationShape& shape = relocation_shapes[swept->second];
+                if ((shape.guard & GuardSampled) == 0) {
+                    shape.guard |= GuardSampled;
+                    ++nx2_sweep_guards;
+                }
+                relocation_guarded_addresses[image_gpu_addr] |= GuardSampled;
+                nx2_swept_shapes.erase(swept);
+            }
+        }
+        // FRITCHII_SWEEP_SUPERSEDED: a texture made where the sweep deleted an image means the
+        // game read that memory again (its contents came from guest memory, not the GPU's).
+        if (image_id && !superseded_swept.empty()) [[unlikely]] {
+            if (const auto swept = superseded_swept.find(image_gpu_addr);
+                swept != superseded_swept.end()) {
+                ++superseded_stats.sampled_after;
+                superseded_swept.erase(swept);
+            }
+        }
+        // FRITCHII_COVERED_RETIRE: the same for images retired as covered.
+        if (image_id && !covered_swept.empty()) [[unlikely]] {
+            if (const auto swept = covered_swept.find(image_gpu_addr);
+                swept != covered_swept.end()) {
+                ++covered_stats.sampled_after;
+                if (covered_sampled_logged < 20) {
+                    ++covered_sampled_logged;
+                    const ImageBase& made = slot_images[image_id];
+                    LOG_WARNING(HW_GPU,
+                                "Covered retire: format {} {}x{} at {:#x} sampled {} frames after "
+                                "an image there was retired as covered",
+                                static_cast<u32>(made.info.format), made.info.size.width,
+                                made.info.size.height, image_gpu_addr,
+                                frame_tick - swept->second);
+                }
+                covered_swept.erase(swept);
+            }
+        }
+        if (image_id) {
+            NoteNewSampledImage(image_id, image_gpu_addr);
+            if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
+                NoteContentLookup(image_id);
+            }
+        }
+    }
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::HostPadded)) [[unlikely]] {
+        // EXP67: sampled with normalized coordinates over the padded host image this time;
+        // its address is never padded again.
+        ++pad_sampled;
+        pad_unsafe_slots.insert(image.gpu_addr);
+        if (pad_logged < 20) {
+            ++pad_logged;
+            LOG_WARNING(HW_GPU,
+                        "Host pad (EXP67): format {} {}x{} at {:#x} is sampled as a texture; "
+                        "its address is no longer padded",
+                        static_cast<u32>(image.info.format), image.info.size.width,
+                        image.info.size.height, image.gpu_addr);
+        }
+    }
     const SubresourceBase base = image.TryFindBase(config.Address()).value();
     ASSERT(base.level == 0);
     const ImageViewInfo view_info(config, base.layer);
@@ -3401,9 +5784,44 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     const bool flexible_formats = True(options & RelaxedOptions::Format);
     ImageId image_id{};
     boost::container::small_vector<ImageId, 8> image_ids;
+    const int keep_mode = VideoCore::Nx2Debug::Experiment(76);
     const auto lambda = [&](ImageId existing_image_id, ImageBase& existing_image) {
         if (True(existing_image.flags & ImageFlagBits::Remapped)) {
-            return false;
+            // EXP76 & 1 (fable52_answer_keeptex 2a): the game remapped the range and the same
+            // texture is asked for at the same GPU and device address: keep the image instead of
+            // making it again. It stays CpuModified, so its contents are uploaded from guest
+            // memory as for a new image (or skipped by EXP76 & 2 when the bytes are unchanged).
+            const ImageInfo& old = existing_image.info;
+            constexpr ImageFlagBits not_kept =
+                ImageFlagBits::GpuModified | ImageFlagBits::Alias | ImageFlagBits::BadOverlap |
+                ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
+            if ((keep_mode & 1) == 0 || existing_image.gpu_addr != gpu_addr ||
+                existing_image.cpu_addr != *cpu_addr || True(existing_image.flags & not_kept) ||
+                !existing_image.aliased_images.empty() || old.type != info.type ||
+                old.format != info.format || old.size.width != info.size.width ||
+                old.size.height != info.size.height || old.size.depth != info.size.depth ||
+                old.resources.levels != info.resources.levels ||
+                old.resources.layers != info.resources.layers ||
+                old.num_samples != info.num_samples || old.block.width != info.block.width ||
+                old.block.height != info.block.height || old.block.depth != info.block.depth ||
+                old.layer_stride != info.layer_stride || old.pitch != info.pitch ||
+                old.tile_width_spacing != info.tile_width_spacing) {
+                return false;
+            }
+            existing_image.flags &= ~ImageFlagBits::Remapped;
+            existing_image.flags |= ImageFlagBits::CpuModified;
+            ++bindings_epoch;
+            ++nx2_kept_after_remap;
+            if (existing_image.unmapped_tick != 0) {
+                ++unmap_stats.refound;
+                unmap_stats.would_refound += existing_image.unmapped_verify == 1 ? 1 : 0;
+                ForgetUnmapped(existing_image_id, existing_image);
+            }
+            image_id = existing_image_id;
+            image_ids.clear();
+            image_ids.push_back(existing_image_id);
+            return true;
         }
         if (info.type == ImageType::Linear || existing_image.info.type == ImageType::Linear)
             [[unlikely]] {
@@ -3443,6 +5861,59 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // FRITCHII_SCALED_EXTENT_CAP (default 1): past the device's limits the scaled image is
+        // invalid. OoT's 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over
+        // AMD's 16384, and drawing into it hangs the GPU (device loss entering Castle Town on
+        // AMD). Before the cached IsRescalable answer, so a scale changed in game is checked too.
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scaled_extent_cap,
+                                             "FRITCHII_SCALED_EXTENT_CAP", 1) != 0 &&
+            !ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            if (False(image.flags & ImageFlagBits::ScaleLimited)) {
+                image.flags |= ImageFlagBits::ScaleLimited;
+                LOG_INFO(HW_GPU,
+                         "Image {}x{} (format {}, {} samples) stays at native size: scaled it "
+                         "would be {}x{}, past the device's limit of {} "
+                         "(FRITCHII_SCALED_EXTENT_CAP)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         runtime.GetMaxScaledExtent());
+            }
+            return false;
+        }
+    }
+    // FRITCHII_SCALE_DEPTH_MAX (default 8192, 0 off): a depth/stencil image whose scaled width or
+    // height would pass N stays at native size. OoT's 12288x12288 D16 sun shadow map (288 MiB
+    // native, made on every Castle Town load) is 648 MiB at 1.5x and 1.15 GiB at 2x on NVIDIA
+    // (32768 limit, so the extent cap above keeps scaling it), and 450 MiB at 1.25x on AMD.
+    // A shadow map that size gains nothing visible from scaling; its memory is what tips a card
+    // over the budget. Same native path as the extent cap: the render target set of that pass
+    // stays native, samplers, copies and blits handle a native image next to scaled ones as for
+    // any image that is not rescaleable. Like the cap, checked before the cached answer.
+    if (const int depth_max = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_scale_depth_max, "FRITCHII_SCALE_DEPTH_MAX", 8192);
+        depth_max > 0 && GetFormatType(image.info.format) != SurfaceType::ColorTexture &&
+        !ScaledImageFits(image.info, Settings::values.resolution_info,
+                         static_cast<u32>(depth_max))) {
+        if (False(image.flags & ImageFlagBits::DepthNative)) {
+            image.flags |= ImageFlagBits::DepthNative;
+            ++depth_native_stats.window;
+            if (const u64 n = ++depth_native_stats.total; n <= 16) {
+                LOG_INFO(HW_GPU,
+                         "Depth image {}x{} (format {}, {} samples) stays at native size: scaled "
+                         "it would be {}x{}, past {} (FRITCHII_SCALE_DEPTH_MAX, {} so far)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         depth_max, n);
+            }
+        }
+        return false;
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
@@ -3468,6 +5939,8 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
     ++bindings_epoch;
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
+    ++scale_epoch; // ScaleEpoch: draw templates (EXP87) keep rescaling words
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -3489,6 +5962,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
+        BumpImageViewGeneration(image_view_id);
         Churn::Add(Churn::ImageViewsDestroyed);
     }
     image.image_view_ids.clear();
@@ -3760,7 +6234,11 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
-    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
+    // FRITCHII_TC_CRITICAL_ENFORCE: room first when the cache is past critical and the budget is
+    // short (the guest size stands in for the host image's).
+    const auto guest_size = CalculateGuestSizeInBytes(info);
+    EnforceCriticalAtCreate(guest_size);
+    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, guest_size);
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
         virtual_invalid_space += Common::AlignUp(CalculateGuestSizeInBytes(info), 32);
@@ -3790,7 +6268,222 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 }
 
 template <class P>
+u64 TextureCache<P>::ContentShape(const ImageInfo& info) noexcept {
+    u64 shape = static_cast<u64>(info.format);
+    const auto mix = [&shape](u64 value) { shape = (shape ^ value) * 0x100000001B3ULL; };
+    mix(static_cast<u64>(info.type));
+    mix(info.size.width);
+    mix(info.size.height);
+    mix(info.size.depth);
+    mix(static_cast<u64>(info.resources.levels));
+    mix(static_cast<u64>(info.resources.layers));
+    mix(info.num_samples);
+    mix(info.block.width);
+    mix(info.block.height);
+    mix(info.block.depth);
+    mix(info.layer_stride);
+    mix(info.pitch);
+    mix(info.tile_width_spacing);
+    return shape;
+}
+
+template <class P>
+void TextureCache<P>::ForgetContent(ImageId image_id, const ImageBase& image, bool deleted) {
+    if ((image.nx2_content_hash_lo | image.nx2_content_hash_hi) == 0) {
+        return;
+    }
+    const ContentKey key{ContentShape(image.info), image.nx2_content_hash_lo,
+                         image.nx2_content_hash_hi};
+    if (const auto it = nx2_content_index.find(key);
+        it != nx2_content_index.end() && it->second == image_id) {
+        nx2_content_index.erase(it);
+    }
+    if (!deleted || True(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    // Measure only: as if the host image were kept, within 512 MiB, oldest out.
+    constexpr u64 KeptBudget = u64{512} << 20;
+    if (nx2_content_kept.emplace(key, image.guest_size_bytes).second) {
+        nx2_content_kept_order.emplace_back(key, image.guest_size_bytes);
+        nx2_content_kept_bytes += image.guest_size_bytes;
+    }
+    while (nx2_content_kept_bytes > KeptBudget && !nx2_content_kept_order.empty()) {
+        const auto [old_key, bytes] = nx2_content_kept_order.front();
+        nx2_content_kept_order.pop_front();
+        if (nx2_content_kept.erase(old_key) != 0) {
+            nx2_content_kept_bytes -= bytes;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteContentLookup(ImageId image_id) {
+    const ImageBase& image = slot_images[image_id];
+    constexpr u32 HashMinBytes = 64 * 1024;
+    if (image.guest_size_bytes < HashMinBytes ||
+        True(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Sparse |
+                            ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                            ImageFlagBits::Unbacked))) {
+        return;
+    }
+    const u128 hash = GuestContentHash(image);
+    // As RefreshContents stores it (bit 0 of the high word set).
+    const ContentKey key{ContentShape(image.info), hash[0], hash[1] | 1};
+    size_t which = 3;
+    if (const auto it = nx2_content_index.find(key);
+        it != nx2_content_index.end() && it->second != image_id &&
+        slot_images.contains(it->second)) {
+        const ImageBase& twin = slot_images[it->second];
+        const bool same = twin.nx2_content_hash_lo == key.lo && twin.nx2_content_hash_hi == key.hi &&
+                          False(twin.flags & ImageFlagBits::GpuModified);
+        if (same) {
+            const bool idle = twin.lru_index == SIZE_MAX ||
+                              lru_cache.Tick(twin.lru_index) + 1 < frame_tick;
+            which = idle ? 0 : 1;
+        }
+    }
+    if (which == 3 && nx2_content_kept.contains(key)) {
+        which = 2;
+    }
+    ++nx2_content_cases[which];
+    nx2_content_case_bytes[which] += image.guest_size_bytes;
+}
+
+template <class P>
+u128 TextureCache<P>::GuestContentHash(const ImageBase& image) {
+    const size_t size = image.guest_size_bytes;
+    const auto start = std::chrono::steady_clock::now();
+    u128 hash;
+    if (const u8* const span = gpu_memory->GetSpan(image.gpu_addr, size); span != nullptr) {
+        hash = Common::CityHash128(reinterpret_cast<const char*>(span), size);
+    } else {
+        nx2_hash_scratch.resize(size);
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, nx2_hash_scratch.data(), size);
+        hash = Common::CityHash128(reinterpret_cast<const char*>(nx2_hash_scratch.data()), size);
+    }
+    nx2_content_hash_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+    nx2_content_hashed_bytes += size;
+    return hash;
+}
+
+template <class P>
+void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
+    if (!ImageHashLogEnabled()) [[likely]] {
+        return;
+    }
+    // What deleted the previous image at this address (bit 7: the GPU had written it).
+    if (const auto it = nx2_deleted_reasons.find(gpu_addr); it != nx2_deleted_reasons.end()) {
+        const size_t reason = it->second & 0x7f;
+        const size_t gpu_written = (it->second & 0x80) != 0 ? 1 : 0;
+        ++nx2_remade_after[reason * 2 + gpu_written];
+        nx2_deleted_reasons.erase(it);
+    } else {
+        ++nx2_remade_unknown;
+    }
+    struct Seen {
+        u32 count = 0;
+        u32 width = 0;
+        u32 height = 0;
+        u32 format = 0;
+    };
+    static std::unordered_map<u64, Seen> seen;
+    static u64 made = 0;
+    static u64 made_again = 0;
+    static u64 bytes_again = 0;
+    static auto last_log = std::chrono::steady_clock::now();
+    const ImageBase& image = slot_images[image_id];
+    // Up to the first 256 KiB of the guest bytes, with the shape: enough to tell the same
+    // texture made again from a new one.
+    const size_t size =
+        (std::min)(static_cast<size_t>(image.guest_size_bytes), size_t{256} << 10);
+    std::vector<u8> bytes(size);
+    gpu_memory->ReadBlockUnsafe(gpu_addr, bytes.data(), size);
+    u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), size);
+    hash ^= (u64{image.info.size.width} << 32 | image.info.size.height) * 0x9E3779B97F4A7C15ULL;
+    hash ^= static_cast<u64>(image.info.format) << 56;
+    Seen& entry = seen[hash];
+    ++made;
+    if (entry.count++ > 0) {
+        ++made_again;
+        bytes_again += image.guest_size_bytes;
+    }
+    entry.width = image.info.size.width;
+    entry.height = image.info.size.height;
+    entry.format = static_cast<u32>(image.info.format);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log < std::chrono::seconds{10}) {
+        return;
+    }
+    last_log = now;
+    std::vector<std::pair<u64, Seen>> top(seen.begin(), seen.end());
+    const size_t keep = (std::min)(top.size(), size_t{8});
+    std::partial_sort(top.begin(), top.begin() + keep, top.end(),
+                      [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    std::string text;
+    for (size_t i = 0; i < keep && top[i].second.count > 1; ++i) {
+        text += fmt::format(" {}x{} fmt {} x{};", top[i].second.width, top[i].second.height,
+                            top[i].second.format, top[i].second.count);
+    }
+    LOG_INFO(HW_GPU,
+             "New sampled images (EDEN_NX2_IMAGE_HASH_LOG) last 10 s: {} made, {} with bytes made "
+             "before ({} KiB); {} different so far; most made:{}",
+             made, made_again, bytes_again >> 10, seen.size(), text.empty() ? " none twice" : text);
+    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire, unmap sweep,
+    // superseded sweep.
+    static constexpr std::array<const char*, static_cast<size_t>(DeleteReason::Count)> names{
+        "other",       "garbage collect", "cold sweep", "unmap", "join", "slot retire",
+        "unmap sweep", "superseded sweep"};
+    std::string deletes;
+    std::string remade;
+    for (size_t r = 0; r < names.size(); ++r) {
+        deletes += fmt::format(" {} {};", names[r], nx2_deletes[r]);
+        remade += fmt::format(" {} {}/{};", names[r], nx2_remade_after[r * 2],
+                              nx2_remade_after[r * 2 + 1]);
+    }
+    LOG_INFO(HW_GPU,
+             "Images deleted last 10 s by:{} | new sampled images whose previous image at that "
+             "address was deleted by (not GPU-written/GPU-written):{} no earlier image there {}",
+             deletes, remade, nx2_remade_unknown);
+    LOG_INFO(HW_GPU,
+             "Remaps (EXP76={}) last 10 s: {} images flagged remapped, {} kept in place; whole "
+             "uploads: {} hash checks, {} skipped as unchanged ({} KiB)",
+             VideoCore::Nx2Debug::Experiment(76), nx2_flagged_remapped, nx2_kept_after_remap,
+             nx2_upload_hash_checks, nx2_upload_skips, nx2_upload_skip_bytes >> 10);
+    const double hash_ms = static_cast<double>(nx2_content_hash_ns) / 1e6;
+    LOG_INFO(HW_GPU,
+             "Content reuse (EXP76 & 4, measure only) last 10 s: new sampled images that a live "
+             "idle twin would serve {} ({} KiB), a live busy twin {} ({} KiB), a kept image {} "
+             "({} KiB), nothing {} ({} KiB); hashed {} MiB in {:.1f} ms ({:.1f} GB/s); index {} "
+             "live, {} kept ({} MiB)",
+             nx2_content_cases[0], nx2_content_case_bytes[0] >> 10, nx2_content_cases[1],
+             nx2_content_case_bytes[1] >> 10, nx2_content_cases[2],
+             nx2_content_case_bytes[2] >> 10, nx2_content_cases[3],
+             nx2_content_case_bytes[3] >> 10, nx2_content_hashed_bytes >> 20, hash_ms,
+             hash_ms > 0 ? static_cast<double>(nx2_content_hashed_bytes) / 1e6 / hash_ms : 0.0,
+             nx2_content_index.size(), nx2_content_kept.size(), nx2_content_kept_bytes >> 20);
+    nx2_content_cases = {};
+    nx2_content_case_bytes = {};
+    nx2_content_hash_ns = 0;
+    nx2_content_hashed_bytes = 0;
+    nx2_flagged_remapped = 0;
+    nx2_kept_after_remap = 0;
+    nx2_upload_hash_checks = 0;
+    nx2_upload_skips = 0;
+    nx2_upload_skip_bytes = 0;
+    nx2_deletes = {};
+    nx2_remade_after = {};
+    nx2_remade_unknown = 0;
+    made = 0;
+    made_again = 0;
+    bytes_again = 0;
+}
+
+template <class P>
 ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::Join};
     ImageInfo new_info = info;
     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
     const bool broken_views = runtime.HasBrokenTextureViewFormats();
@@ -4058,6 +6751,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         ImageBase& other = slot_images[other_id];
                         other.overlapping_images.push_back(old_id);
                         moved.overlapping_images.push_back(other_id);
+                        other.covered_overlap_frame = frame_tick + 1; // FRITCHII_COVERED_RETIRE
                         if (other.info.resources.levels == 1 && other.info.block.depth == 0 &&
                             other.overlapping_images.size() > 1) {
                             other.flags |= ImageFlagBits::BadOverlap;
@@ -4090,10 +6784,108 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    if (!clearing_render_targets && slot_retired_any) {
+        const u64 shape = RelocationShapeKey(new_info);
+        const u64 frame = RenderFrame();
+        for (const SlotRetired& retired : slot_recent) {
+            if (retired.gpu_addr == gpu_addr && retired.shape == shape &&
+                frame - retired.render_frame <= 16) {
+                ++slot_remade;
+                if (slot_remade_logged < 20) {
+                    ++slot_remade_logged;
+                    LOG_WARNING(HW_GPU,
+                                "Slot retire (EXP64): format {} {}x{} at {:#x} made again {} "
+                                "frames after it was retired (its contents were wanted)",
+                                static_cast<u32>(new_info.format), new_info.size.width,
+                                new_info.size.height, gpu_addr, frame - retired.render_frame);
+                }
+                break;
+            }
+        }
+    }
+    // EXP67 (live, bucket in pixels, 0 = off): a depth render target at an address whose target
+    // changes dims (OoT's per-NPC depth targets, sized by screen bounds every frame) gets a host
+    // image rounded up to the bucket, so the image pool hands the next frame's target the same
+    // VkImage instead of a new create and a 0.2-1.3 ms depth bind (IMAGE_ALLOC_TIMING).
+    const auto pad_type = VideoCore::Surface::GetFormatType(new_info.format);
+    const bool pad_depth = pad_type == VideoCore::Surface::SurfaceType::Depth ||
+                           pad_type == VideoCore::Surface::SurfaceType::Stencil ||
+                           pad_type == VideoCore::Surface::SurfaceType::DepthStencil;
+    const int pad_bucket = VideoCore::Nx2Debug::Experiment(67);
+    // Not is_rescaling: it is true whenever a depth target is bound, at 1x too (RescaleRenderTargets
+    // counts depth as rescaled), which refused every target in the first test.
+    const bool pad_native_scale = Settings::values.resolution_info.up_scale == 1 &&
+                                  Settings::values.resolution_info.down_shift == 0;
+    if (pad_bucket > 0 && pad_depth) {
+        ++pad_depth_lookups;
+        if (!render_target_lookup || !pad_native_scale || !RelocationShaped(new_info) ||
+            new_info.num_samples != 1 || pad_unsafe_slots.contains(gpu_addr)) {
+            ++pad_skipped_other;
+        }
+    }
+    if (const int bucket = pad_bucket;
+        bucket > 0 && pad_depth && render_target_lookup && pad_native_scale &&
+        RelocationShaped(new_info) && new_info.num_samples == 1 &&
+        !pad_unsafe_slots.contains(gpu_addr)) {
+        {
+            bool varying = pad_slots.contains(gpu_addr);
+            if (!varying) {
+                for (const ImageId overlap_id : join_bad_overlap_ids) {
+                    const ImageBase& overlap = slot_images[overlap_id];
+                    if (overlap.gpu_addr == gpu_addr && overlap.info.format == new_info.format &&
+                        (overlap.info.size.width != new_info.size.width ||
+                         overlap.info.size.height != new_info.size.height)) {
+                        varying = true;
+                        pad_slots.insert(gpu_addr);
+                        break;
+                    }
+                }
+            }
+            if (varying) {
+                const u32 b = static_cast<u32>(bucket);
+                const u32 width = (new_info.size.width + b - 1) / b * b;
+                const u32 height = (new_info.size.height + b - 1) / b * b;
+                if constexpr (requires(Runtime& r) { r.SetNextHostPad(0U, 0U); }) {
+                    runtime.SetNextHostPad(width, height);
+                    ++pad_made;
+                }
+            } else {
+                ++pad_not_varying;
+            }
+        }
+    }
+    // EXP64 (fable_answer_npcdips 3): the cleared target's same-address predecessors go now.
+    if (clearing_render_targets && !join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
+        join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
+        join_ignore_textures.empty() && VideoCore::Nx2Debug::Experiment(64) != 0) {
+        const auto& regs = maxwell3d->regs;
+        const auto& surface = regs.clear_surface;
+        const bool depth_cleared = regs.zeta_enable && regs.zeta.Address() == gpu_addr &&
+                                   (surface.Z || surface.S);
+        const bool colour_cleared = (surface.R || surface.G || surface.B || surface.A) &&
+                                    surface.RT < NUM_RT && regs.rt[surface.RT].Address() == gpu_addr;
+        if (depth_cleared || colour_cleared) {
+            RetireSlotPredecessors(new_info, gpu_addr);
+        }
+    }
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
+    if (depth_census_on && !render_target_lookup) [[unlikely]] {
+        // EDEN_NX2_DEPTH_CENSUS: a texture lookup's image takes census targets in.
+        const auto mark = [this](ImageId id) {
+            if (const auto it = census_live.find(id); it != census_live.end()) {
+                it->second.via_texture = true;
+            }
+        };
+        for (const auto& copy : join_copies_to_do) {
+            mark(copy.id);
+        }
+        std::ranges::for_each(join_left_aliased_ids, mark);
+        std::ranges::for_each(join_right_aliased_ids, mark);
+    }
     NoteMadeShape(new_info);
+    NoteThrashMade(new_info, gpu_addr);
     if constexpr (requires(const Image& image) { image.FromPool(); }) {
         rt_stats.pooled_images += slot_images[new_image_id].FromPool() ? 1 : 0;
         Churn::Add(Churn::ImagesPooled, slot_images[new_image_id].FromPool() ? 1 : 0);
@@ -4109,11 +6901,45 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                           new_info.size.width, new_info.size.height, new_info.size.depth, gpu_addr,
                           static_cast<u32>(new_info.format));
             }
-            join_out_of_memory = true;
             return ImageId{};
         }
     }
     Image& new_image = slot_images[new_image_id];
+    if ((VideoCore::Nx2Debug::Experiment(68) & 4) != 0 && RelocationShaped(new_info)) {
+        // EXP68 bit 4 (fable52_answer_npcdips 2, item 3): same address and format, other dims
+        // among the overlaps: a size-varying slot. Its images skip the pool.
+        const auto other_dims = [&](ImageId id) {
+            const ImageBase& other = slot_images[id];
+            return other.gpu_addr == gpu_addr && other.info.format == new_info.format &&
+                   (other.info.size.width != new_info.size.width ||
+                    other.info.size.height != new_info.size.height);
+        };
+        bool varying = false;
+        for (const auto* ids : {&join_bad_overlap_ids}) {
+            for (const ImageId id : *ids) {
+                if (other_dims(id)) {
+                    varying = true;
+                    slot_images[id].flags |= ImageFlagBits::NoPool;
+                }
+            }
+        }
+        for (const ImageId id : join_left_aliased_ids) {
+            if (other_dims(id)) {
+                varying = true;
+                slot_images[id].flags |= ImageFlagBits::NoPool;
+            }
+        }
+        for (const ImageId id : join_right_aliased_ids) {
+            if (other_dims(id)) {
+                varying = true;
+                slot_images[id].flags |= ImageFlagBits::NoPool;
+            }
+        }
+        if (varying) {
+            new_image.flags |= ImageFlagBits::NoPool;
+            ++no_pool_marked;
+        }
+    }
     ++bindings_epoch;
 
     new_image.allocation_tick = frame_tick;
@@ -4221,10 +7047,75 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         return false;
     };
+    // Whether the copies from overlaps the GPU wrote each write a part of the image and together
+    // all of it, for the layered and mipmapped 2D images overwritten_by_copies leaves out (ported):
+    // Mario Kart World renders each layer of its shadow map and colour
+    // arrays as a target of its own, then samples the array, and the upload under those copies
+    // took 13-31 ms an array. Only at 1x, where the copies below are unscaled.
+    const auto overwritten_by_layer_copies = [&] {
+        constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                          ImageFlagBits::SparseTiles |
+                                          ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
+        if (can_rescale || new_info.num_samples != 1 ||
+            True(new_image.flags & (unusual | ImageFlagBits::Converted |
+                                    ImageFlagBits::AsynchronousDecode))) {
+            return false;
+        }
+        std::vector<u8> written(
+            static_cast<size_t>(new_info.resources.levels * new_info.resources.layers));
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const Image& overlap = slot_images[copy.id];
+            if (copy.is_alias || False(overlap.flags & ImageFlagBits::GpuModified) ||
+                overlap.info.num_samples != 1) {
+                continue;
+            }
+            const std::optional<SubresourceBase> base = new_image.TryFindBase(overlap.gpu_addr);
+            if (!base) {
+                continue;
+            }
+            MarkSubresourcesWrittenWhole(new_image, overlap,
+                                         MakeShrinkImageCopies(new_info, overlap.info, *base, 1, 0),
+                                         written);
+        }
+        return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
+    };
+    // EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, 0 = off, the default; ported from its
+    // texture_cache.h nup_skip_depth_upload): a new depth/stencil image starts without
+    // the upload from guest memory. Guest memory never receives the GPU's depth (no write-back),
+    // so the upload only copies stale bytes; Ocarina of Time makes ~2.5 such targets a frame
+    // (shadow cascades sized anew each frame, 259x259 ... 888x888 D32). Not exact: what the
+    // image holds where the game neither clears nor draws is undefined instead of stale guest
+    // bytes (the original names shadow popping with it), so it comes after the exact
+    // rules: a clear the target follows through IsFullClear (EXP56) and copies that write it
+    // whole (EXP8 bit 2) decide first.
+    // Bit 1 = a render target lookup's new target with nothing to join (no older image to copy).
+    // Bit 2 = a new image whose every join copy comes from a GPU-written image (sampled shadow
+    // maps made for a descriptor shaped unlike the target); texels the copies miss are undefined.
+    // 3 = as the original shipped.
+    const auto depth_noupload = [&] {
+        const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_rt_depth_noupload,
+                                                          "EDEN_NX2_RT_DEPTH_NOUPLOAD");
+        if (mode == 0) {
+            return false;
+        }
+        const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+        if (type != VideoCore::Surface::SurfaceType::Depth &&
+            type != VideoCore::Surface::SurfaceType::Stencil &&
+            type != VideoCore::Surface::SurfaceType::DepthStencil) {
+            return false;
+        }
+        if (join_copies_to_do.empty()) {
+            return (mode & 1) != 0 && render_target_lookup;
+        }
+        return (mode & 2) != 0 && std::ranges::all_of(join_copies_to_do, [this](const JoinCopy& copy) {
+                   return True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+               });
+    };
     const bool clear_skip = overwritten_by_clear();
     // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
-    const bool copy_skip =
-        !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 && overwritten_by_copies();
+    const bool copy_skip = !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 &&
+                           (overwritten_by_copies() || overwritten_by_layer_copies());
+    const bool depth_skip = !clear_skip && !copy_skip && depth_noupload();
     if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 1_MiB)
         [[unlikely]] {
         // Why a large new image was (or was not) uploaded from guest memory.
@@ -4245,10 +7136,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         new_info.size.height, new_info.size.depth, new_info.resources.levels,
                         new_info.resources.layers, new_image.gpu_addr, join_copies_to_do.size(),
                         aliases, gpu_written, join_bad_overlap_ids.size(),
-                        clearing_render_targets, overwritten_by_copies(),
-                        clear_skip  ? "skipped (clear)"
-                        : copy_skip ? "skipped (copies)"
-                                    : "done",
+                        clearing_render_targets,
+                        overwritten_by_copies() || overwritten_by_layer_copies(),
+                        clear_skip   ? "skipped (clear)"
+                        : copy_skip  ? "skipped (copies)"
+                        : depth_skip ? "skipped (depth)"
+                                     : "done",
                         clear_skip || clear_refusal[0] == '\0' ? "" : ", clear refused: ",
                         clear_skip ? "" : clear_refusal);
         }
@@ -4258,8 +7151,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
-    } else if (copy_skip) {
-        // As RefreshContents leaves it, with the contents the copies write.
+    } else if (copy_skip || depth_skip) {
+        // As RefreshContents leaves it, with the contents the copies write (depth_skip: and
+        // undefined elsewhere; also when a partial clear creates it, PrepareImage would upload it).
         new_image.flags &= ~ImageFlagBits::CpuModified;
         TrackImage(new_image, new_image_id);
         runtime.TransitionImageLayout(new_image);
@@ -4307,6 +7201,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
         new_image.overlapping_images.push_back(aliased_id);
+        aliased.covered_overlap_frame = frame_tick + 1; // FRITCHII_COVERED_RETIRE: check again
         if (aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
             aliased.overlapping_images.size() > 1) {
             aliased.flags |= ImageFlagBits::BadOverlap;
@@ -4340,9 +7235,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
-        if (True(overlap.flags & ImageFlagBits::GpuModified) &&
-            False((overlap.flags | new_image.flags) & ImageFlagBits::HostResized)) {
+        if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             new_image.flags |= ImageFlagBits::GpuModified;
+            CountGpuModified(new_image); // EXP100 (a no-op until RegisterImage below counts it)
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
@@ -4363,6 +7258,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     rt_stats.delete_ns += NsSince(joined_delete_start);
 
+    if (depth_census_on && render_target_lookup &&
+        new_info.format == VideoCore::Surface::PixelFormat::D32_FLOAT) [[unlikely]] {
+        CensusNoteMade(new_image_id, new_info, gpu_addr);
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }
@@ -4515,8 +7414,8 @@ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr ba
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
-    const auto& new_image = slot_images[dst_id];
-    lru_cache.Touch(new_image.lru_index, frame_tick);
+    auto& new_image = slot_images[dst_id];
+    TouchImageLru(new_image);
     return std::make_pair(base->level, base->layer);
 }
 
@@ -4530,6 +7429,186 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
         pair->second = slot_samplers.insert(runtime, config);
     }
     return pair->second;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteMade(ImageId image_id, const ImageInfo& info, GPUVAddr gpu_addr) {
+    const size_t n = census_this_frame.size();
+    ++census.made;
+    if (info.size.width == 384 && info.size.height == 384) {
+        ++census.at_floor;
+    }
+    if (n < census_last_frame.size()) {
+        const CensusMade& prev = census_last_frame[n];
+        ++(prev.gpu_addr == gpu_addr ? census.same_address : census.moved);
+        const u32 dw = prev.width > info.size.width ? prev.width - info.size.width
+                                                    : info.size.width - prev.width;
+        const u32 dh = prev.height > info.size.height ? prev.height - info.size.height
+                                                      : info.size.height - prev.height;
+        const u32 side = (std::max)(dw, dh);
+        ++census.side_change[side == 0 ? 0 : side <= 8 ? 1 : side <= 64 ? 2 : 3];
+    } else {
+        ++census.no_predecessor;
+    }
+    census_this_frame.push_back({gpu_addr, info.size.width, info.size.height});
+    census_live[image_id] = CensusTarget{.gpu_addr = gpu_addr, .frame = frame_tick};
+    census_by_addr[gpu_addr] = image_id;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteRenderTargets(bool is_clear) {
+    const ImageViewId view_id = render_targets.depth_buffer_id;
+    if (view_id == NULL_IMAGE_VIEW_ID || view_id == ImageViewId{}) {
+        return;
+    }
+    const auto it = census_live.find(slot_image_views[view_id].image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    CensusTarget& target = it->second;
+    if (is_clear) {
+        target.cleared |= regs.clear_surface.Z != 0 || regs.clear_surface.S != 0;
+    } else {
+        target.drawn = true;
+        target.drawn_writes |= regs.depth_test_enable != 0 && regs.depth_write_enabled != 0;
+    }
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteSampled(ImageViewId view_id, const TSCEntry* sampler,
+                                        u8 shader_use, bool shader_dref) {
+    if (view_id == NULL_IMAGE_VIEW_ID || view_id == ImageViewId{}) {
+        return;
+    }
+    const auto it = census_live.find(slot_image_views[view_id].image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    CensusTarget& target = it->second;
+    target.shader_use |= shader_use;
+    if (target.sampled_same || target.sampled_later) {
+        return;
+    }
+    (target.frame == frame_tick ? target.sampled_same : target.sampled_later) = true;
+    census.shader_dref += shader_dref ? 1 : 0;
+    if (sampler == nullptr) {
+        ++census.no_sampler;
+        return;
+    }
+    using Tegra::Texture::WrapMode;
+    const auto kind = [](WrapMode mode) {
+        switch (mode) {
+        case WrapMode::Wrap:
+        case WrapMode::Mirror:
+            return 0;
+        case WrapMode::Border:
+        case WrapMode::MirrorOnceBorder:
+            return 2;
+        default:
+            return 1; // clamp to edge, clamp, the mirror-once clamps
+        }
+    };
+    const int u = kind(sampler->wrap_u);
+    const int v = kind(sampler->wrap_v);
+    ++census.address_mode[u == v ? u : 3];
+    census.compare_on += sampler->depth_compare_enabled != 0 ? 1 : 0;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteRead(const ImageBase& image, bool dma) {
+    const auto by_addr = census_by_addr.find(image.gpu_addr);
+    if (by_addr == census_by_addr.end() || &slot_images[by_addr->second] != &image) {
+        return;
+    }
+    const auto it = census_live.find(by_addr->second);
+    if (it != census_live.end()) {
+        (dma ? it->second.dma_read : it->second.cpu_read) = true;
+    }
+}
+
+template <class P>
+void TextureCache<P>::CensusFinish(ImageId image_id, bool deleted) {
+    const auto it = census_live.find(image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    const CensusTarget& t = it->second;
+    ++census.done;
+    census.deleted += deleted ? 1 : 0;
+    if (t.cleared && t.drawn) {
+        ++census.cleared_and_drawn;
+    } else if (t.cleared) {
+        ++census.cleared_only;
+    } else if (t.drawn) {
+        ++census.drawn_only;
+    } else {
+        ++census.neither;
+    }
+    census.drawn_writes += t.drawn_writes ? 1 : 0;
+    census.via_texture += t.via_texture ? 1 : 0;
+    census.cpu_read += t.cpu_read ? 1 : 0;
+    census.dma_read += t.dma_read ? 1 : 0;
+    if (t.sampled_same || t.sampled_later) {
+        ++(t.sampled_same ? census.sampled_same : census.sampled_later);
+        using Desc = Shader::TextureDescriptor;
+        if ((t.shader_use & Desc::CensusKnown) == 0) {
+            ++census.use_unknown;
+        } else {
+            census.use_fetch += (t.shader_use & Desc::CensusFetch) != 0 ? 1 : 0;
+            census.use_query += (t.shader_use & Desc::CensusQuery) != 0 ? 1 : 0;
+            census.use_offset += (t.shader_use & Desc::CensusOffset) != 0 ? 1 : 0;
+            census.use_gather += (t.shader_use & Desc::CensusGather) != 0 ? 1 : 0;
+            census.use_rect += (t.shader_use & Desc::CensusRect) != 0 ? 1 : 0;
+        }
+    } else {
+        ++census.never_sampled;
+    }
+    if (const auto by_addr = census_by_addr.find(t.gpu_addr);
+        by_addr != census_by_addr.end() && by_addr->second == image_id) {
+        census_by_addr.erase(by_addr);
+    }
+    census_live.erase(it);
+}
+
+template <class P>
+void TextureCache<P>::CensusTickFrame() {
+    census_last_frame.swap(census_this_frame);
+    census_this_frame.clear();
+    std::vector<ImageId> aged;
+    for (const auto& [image_id, target] : census_live) {
+        if (frame_tick - target.frame > CensusMaxAge) {
+            aged.push_back(image_id);
+        }
+    }
+    for (const ImageId image_id : aged) {
+        CensusFinish(image_id, false);
+    }
+    if (frame_tick % 600 != 0) {
+        return;
+    }
+    const CensusCounts& c = census;
+    LOG_INFO(HW_GPU,
+             "Depth census (EDEN_NX2_DEPTH_CENSUS) last 600 frames: {} D32 targets made, {} at "
+             "384x384; vs last frame's n-th: {} same address, {} moved, {} none; side change "
+             "0/1-8/9-64/more {}/{}/{}/{}. Done {} ({} deleted, the rest {} frames old): "
+             "cleared+drawn {}, cleared only {}, drawn only {}, neither {} ({} drawn with depth "
+             "writes); sampled same frame {}, later {}, never {}; joined into a texture lookup's "
+             "image {}; CPU-read {}, copied to a buffer {}. Sampled, first sampler: address "
+             "repeat/clamp/border/mixed {}/{}/{}/{}, compare on {}, shader depth-reference {}, "
+             "no sampler {}; shader reads: fetch {}, size query {}, offsets {}, gather {}, rect "
+             "{}, unknown (precompiled info) {}; {} live",
+             c.made, c.at_floor, c.same_address, c.moved, c.no_predecessor, c.side_change[0],
+             c.side_change[1], c.side_change[2], c.side_change[3], c.done, c.deleted,
+             CensusMaxAge, c.cleared_and_drawn, c.cleared_only, c.drawn_only, c.neither,
+             c.drawn_writes, c.sampled_same, c.sampled_later, c.never_sampled, c.via_texture,
+             c.cpu_read, c.dma_read, c.address_mode[0], c.address_mode[1], c.address_mode[2],
+             c.address_mode[3], c.compare_on, c.shader_dref, c.no_sampler, c.use_fetch,
+             c.use_query, c.use_offset, c.use_gather, c.use_rect, c.use_unknown,
+             census_live.size());
+    census = {};
+    // The same switch: the occlusion reports and the 0xe2c reads of them (potroom 4b).
+    VideoCommon::Nx2ReportCensus::LogAndReset();
 }
 
 template <class P>
@@ -4560,7 +7639,44 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    if (!clearing_render_targets && !clear_exact_pending.empty()) {
+        // EXP68 bit 1 check: the first depth bind at an address after its clear uses the exact
+        // size the clear went to (several NPC targets are cleared before their draws).
+        if (const auto it = clear_exact_pending.find(gpu_addr); it != clear_exact_pending.end()) {
+            if (info.size.width == it->second.first && info.size.height == it->second.second) {
+                ++clear_exact_confirmed;
+            } else {
+                ++clear_exact_missed;
+                clear_exact_unsafe.insert(gpu_addr);
+                LOG_WARNING(HW_GPU,
+                            "Clear to exact size (EXP68): the bind after the clear at {:#x} is "
+                            "{}x{}, not {}x{}; this address keeps the register size",
+                            gpu_addr, info.size.width, info.size.height, it->second.first,
+                            it->second.second);
+            }
+            clear_exact_pending.erase(it);
+        }
+    }
+    if (clearing_render_targets && (VideoCore::Nx2Debug::Experiment(68) & 1) != 0 &&
+        regs.clear_surface.Z && regs.clear_control.use_scissor != 0 &&
+        info.type == ImageType::e2D && info.resources.levels == 1 && info.resources.layers == 1 &&
+        info.num_samples == 1 && !clear_exact_unsafe.contains(gpu_addr)) {
+        // The game clears the per-NPC depth target with the width register rounded up to 16 and
+        // a scissor of the real square, then draws into the real square: two images a frame
+        // with an upload and alias copies between them (fable52_answer_npcdips 1).
+        const auto& scissor = regs.scissor_test[0];
+        const u32 bytes = VideoCore::Surface::BytesPerBlock(info.format);
+        const u32 scissor_width = scissor.max_x;
+        if (scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_y >= info.size.height &&
+            scissor_width != 0 && scissor_width < info.size.width && bytes != 0 &&
+            Common::AlignUp(scissor_width * bytes, 64U) ==
+                Common::AlignUp(info.size.width * bytes, 64U)) {
+            info.size.width = scissor_width;
+            clear_exact_pending[gpu_addr] = {info.size.width, info.size.height};
+            ++clear_exact_used;
+        }
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
@@ -4576,28 +7692,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
-    // A render target that fails to allocate is bound as the null view and its frame is lost (or
-    // worse). Free memory right here and look it up again, twice at most; no image id is held
-    // across ReclaimMemoryNow, and the images it deletes set has_deleted_images, which the
-    // callers (RescaleRenderTargets) already treat as "look the render targets up again".
-    for (u32 attempt = 0;; ++attempt) {
-        join_out_of_memory = false;
-        do {
-            has_deleted_images = false;
-            image_id = FindOrInsertImage(info, gpu_addr);
-            delete_state |= has_deleted_images;
-        } while (has_deleted_images);
-        if (image_id || !join_out_of_memory || attempt >= 2) {
-            break;
-        }
+    render_target_lookup = true; // EDEN_NX2_RT_DEPTH_NOUPLOAD: JoinImages sees a render target
+    do {
         has_deleted_images = false;
-        const bool freed = ReclaimMemoryNow();
+        image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
-        if (!freed) {
-            break;
-        }
-    }
-    join_out_of_memory = false;
+    } while (has_deleted_images);
+    render_target_lookup = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
@@ -4835,6 +7936,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+    image.lru_touched_tick = ~u64{0};
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -4843,6 +7945,15 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
         auto map_id =
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
         page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
+        image_count_filter.Add(image.cpu_addr, image.guest_size_bytes);
+        // Memory stage step 7 (risk 9.1): a constant buffer write the stage made ahead of the
+        // back under this image (counted, must be 0).
+        VideoCommon::MemoryStageLink::NoteImageRegistered(image.cpu_addr, image.guest_size_bytes);
+        image.nx2_counted_addr = image.cpu_addr;
+        image.nx2_counted_size = image.guest_size_bytes;
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            CountGpuModified(image); // EXP100: registered while already GPU-modified
+        }
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
         image.map_view_id = map_id;
@@ -4853,6 +7964,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
             page_filter.Mark(cpu_addr, size);
+            sparse_page_filter.Mark(cpu_addr, size);
             ForEachCPUPage(cpu_addr, size,
                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
             sparse_maps.push_back(map_id);
@@ -4870,6 +7982,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already registered image");
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
+    image.last_use_tick = lru_cache.Tick(image.lru_index);
     lru_cache.Free(image.lru_index);
     const auto& clear_page_table =
         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
@@ -4892,6 +8005,13 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     });
     if (False(image.flags & ImageFlagBits::Sparse)) {
         const auto map_id = image.map_view_id;
+        image_count_filter.Remove(image.nx2_counted_addr, image.nx2_counted_size);
+        if (image.nx2_gpu_counted) { // EXP100
+            image_seq.BeforeChange();
+            gpu_image_filter.Remove(image.nx2_counted_addr, image.nx2_counted_size);
+            image.nx2_gpu_counted = false;
+        }
+        image.nx2_counted_size = 0;
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id](u64 page) {
             const auto page_it = page_table.find(page);
             if (page_it == page_table.end()) {
@@ -4997,10 +8117,62 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    if (depth_census_on) [[unlikely]] {
+        CensusFinish(image_id, true);
+    }
     ImageBase& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::CollectPending)) [[unlikely]] {
+        // EXP121: deleted by another path before its queued download landed.
+        for (size_t i = 0; i < collect_downloads.size(); ++i) {
+            if (collect_downloads[i].image_id == image_id) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_deleted;
+                break;
+            }
+        }
+    }
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
+    NoteThrashDelete(slot_images[image_id]);
+    if (image.unmapped_tick != 0) {
+        // Still flagged by an unmap. Unused since: no upload or full overwrite took the
+        // CpuModified the unmap set, so nothing could have downloaded it either.
+        const auto reason = static_cast<size_t>(delete_reason);
+        ++unmap_stats.died[reason];
+        if (True(image.flags & ImageFlagBits::CpuModified)) {
+            ++unmap_stats.died_unused[reason];
+            if (delete_reason == DeleteReason::GarbageCollect) {
+                unmap_stats.collector_unused_frames += frame_tick + 1 - image.unmapped_tick;
+                unmap_stats.collector_unused_bytes += image.unmapped_bytes;
+            }
+        }
+        if (image.unmapped_verify == 1) {
+            // EDEN_NX2_SWEEP_UNMAPPED=2: nothing uploaded into it since it was picked. Without
+            // CpuModified, a target written whole took it (the invalidate path): nothing read.
+            ++(True(image.flags & ImageFlagBits::CpuModified) ? unmap_stats.would_died_unused
+                                                               : unmap_stats.would_overwritten);
+        }
+        ForgetUnmapped(image_id, image);
+    }
     ++bindings_epoch;
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
+    if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
+        ForgetContent(image_id, image, true);
+    }
+    // EXP77: a GPU-written chain target the cold sweep takes leaves its shape at its address.
+    if (delete_reason == DeleteReason::ColdSweep &&
+        True(image.flags & ImageFlagBits::GpuModified) && RelocationShaped(image.info) &&
+        VideoCore::Nx2Debug::Experiment(77) != 0 && nx2_swept_shapes.size() < 65536) {
+        nx2_swept_shapes[image.gpu_addr] = RelocationShapeKey(image.info);
+    }
+    if (ImageHashLogEnabled()) [[unlikely]] {
+        const auto reason = static_cast<size_t>(delete_reason);
+        ++nx2_deletes[reason];
+        if (nx2_deleted_reasons.size() < 200'000) {
+            nx2_deleted_reasons[image.gpu_addr] = static_cast<u8>(
+                reason | (True(image.flags & ImageFlagBits::GpuModified) ? 0x80 : 0));
+        }
+    }
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -5010,6 +8182,28 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (async_decode->image_id == image_id) {
             async_decode->cancelled = true;
         }
+    }
+    // Fritchii's free guard: an async unswizzle still queued for it (GPU unswizzle, 3D BCn) went
+    // on reading and uploading through this slot in later frames, when the slot is gone or holds
+    // another image: compute writes into a destroyed or wrong-sized image. Only the collector
+    // skipped decoding images; unmaps, joins and the sweeps did not. Dropped here with its
+    // staging buffer, which the copies it recorded so far (older than this delete) still use:
+    // FreeDeferredStagingBuffer stamps it with the current tick.
+    for (auto it = unswizzle_queue.begin(); it != unswizzle_queue.end();) {
+        if (it->image_id != image_id) {
+            ++it;
+            continue;
+        }
+        if (it->initialized) {
+            runtime.FreeDeferredStagingBuffer(it->staging_buffer);
+        }
+        if (free_guard.unswizzle_dropped++ < 8) {
+            LOG_WARNING(HW_GPU,
+                        "Free guard: async unswizzle of image {:#x} dropped with the image ({} of "
+                        "{} bytes read)",
+                        image.gpu_addr, it->current_offset, it->total_size);
+        }
+        it = unswizzle_queue.erase(it);
     }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
@@ -5068,12 +8262,24 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
         slot_image_views.erase(image_view_id);
+        BumpImageViewGeneration(image_view_id);
         Churn::Add(Churn::ImageViewsDestroyed);
     }
-    const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
-                                                       uncommitted_downloads, committed_downloads);
+    u64 delete_tick = 0;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        delete_tick = runtime.CurrentTick();
+    }
+    std::shared_ptr<Image> retained =
+        RetainPendingImageDownloads(image_id, slot_images[image_id], uncommitted_downloads,
+                                    committed_downloads, delete_tick);
     if (retained) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
+        // Fritchii's free guard: the download's landing must not be what frees it while the
+        // GPU still runs work recorded before this delete (TickFrame lets go at IsFree).
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            retained_image_keepers.push_back({delete_tick, std::move(retained)});
+            ++free_guard.retained_held;
+        }
     } else if (!immediate_delete) {
         if constexpr (requires { runtime.CurrentTick(); }) {
             gpu_sentenced_images.push_back(
@@ -5123,7 +8329,9 @@ template <class P>
 void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr) {
     Image& image = slot_images[image_id];
     // 1. The GPU's data at the old address is lost, as when the collector deletes the image.
+    marking_relocation = true; // the lost contents counter's attribution
     MarkStale(image); // before UntrackImage (see MarkStale)
+    marking_relocation = false;
     if (True(image.flags & ImageFlagBits::Tracked)) {
         UntrackImage(image, image_id);
     }
@@ -5156,6 +8364,11 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
         }
     }
     RemoveImageViewReferences(image.image_view_ids);
+    // The views stay, but their descriptors now resolve to other views (the image is no longer
+    // at the old address): draw templates (EXP87) keeping them must not hold.
+    for (const ImageViewId image_view_id : image.image_view_ids) {
+        BumpImageViewGeneration(image_view_id);
+    }
     // 4. The new address. Contents count as the guest's (the clear overwrites them whole, and
     // PrepareImage's invalidate path drops the upload, as for a new image).
     image.gpu_addr = gpu_addr;
@@ -5164,8 +8377,9 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags &= ~ImageFlagBits::GpuModified;
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
-    image.previous_write_frame = ~u64{0};
+    image.write_streak = 0;
     image.relocation_guard_noted = 0;
+    image.lost_contents = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
     // cleared at this address in two render frames (ClassifyDrawTargets).
     image.last_clear_frame = ~u64{0};
@@ -5187,6 +8401,8 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    // EDEN_NX2_FASTDRAW_COUNT (Fable plan D1, row 2): view generations and tables changed.
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Relocate);
 }
 
 template <class P>
@@ -5289,17 +8505,228 @@ void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const Ren
     framebuffer_keys.erase(framebuffer_id);
 }
 
+// EXP100 (fable52_answer_imagereads 2). Holder of the mutex only (BeforeChange breaks the count
+// for good otherwise, and logs). A registered, non-sparse image that is or was GPU-modified: its
+// pages stay counted until it is unregistered. Clears of the flag are ignored on purpose.
+template <class P>
+void TextureCache<P>::CountGpuModified(ImageBase& image) noexcept {
+    if (image.nx2_gpu_counted || False(image.flags & ImageFlagBits::Registered) ||
+        True(image.flags & ImageFlagBits::Sparse) || image.nx2_counted_size == 0) {
+        return;
+    }
+    image_seq.BeforeChange();
+    gpu_image_filter.Add(image.nx2_counted_addr, image.nx2_counted_size);
+    image.nx2_gpu_counted = true;
+}
+
+template <class P>
+bool TextureCache<P>::EarlyImageWritePending(ImageViewId id) noexcept {
+    if constexpr (requires { runtime.IsFree(u64{}); }) {
+        const ImageViewBase& view = slot_image_views[id];
+        if (!view.image_id) {
+            return false;
+        }
+        const ImageBase& image = slot_images[view.image_id];
+        return image.early_write_tick != 0 && !runtime.IsFree(image.early_write_tick);
+    }
+    return false;
+}
+
+template <class P>
+auto TextureCache<P>::ComputeSkipImageState(DAddr addr, u64 size) -> SkipImageState {
+    const u64 render_frame = RenderFrame();
+    const DAddr end = addr + size;
+    bool covered = false;
+    SkipImageState state = SkipImageState::Redrawn;
+    ForEachImageInRegion(addr, size, [&](ImageId, ImageBase& image) {
+        if (state != SkipImageState::Redrawn) {
+            return;
+        }
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & ImageFlagBits::CpuModified)) {
+            state = SkipImageState::NoGpuData;
+            return;
+        }
+        // Written in this frame and the 7 before, or in the last frame and the 7 before that.
+        const bool streak_now =
+            IsRedrawnTarget(image.last_write_frame, image.write_streak, render_frame);
+        const bool streak_before = render_frame != 0 &&
+                                   IsRedrawnTarget(image.last_write_frame, image.write_streak,
+                                                   render_frame - 1);
+        if (!streak_now && !streak_before) {
+            state = SkipImageState::NotRedrawn;
+            return;
+        }
+        covered = covered || (image.cpu_addr <= addr && end <= image.cpu_addr_end);
+    });
+    if (state == SkipImageState::Redrawn && !covered) {
+        return SkipImageState::NoImage;
+    }
+    return state;
+}
+
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
-    image.flags |= ImageFlagBits::GpuModified;
-    image.modification_tick = ++modification_tick;
-    if (const u64 frame = RenderFrame(); image.last_write_frame != frame) {
-        image.previous_write_frame = image.last_write_frame;
-        image.last_write_frame = frame;
+    // FRITCHII_ASYNC_COMPUTE_SKIP: a GPU write over the image (the whole of it counts).
+    if (image.cpu_addr_end > image.cpu_addr) {
+        VideoCommon::ComputeSkipHook::NoteWrite(image.cpu_addr,
+                                                image.cpu_addr_end - image.cpu_addr);
     }
+    image.flags |= ImageFlagBits::GpuModified;
+    CountGpuModified(image); // EXP100
+    // EXP76: GPU-written texels no longer match a hash of guest bytes.
+    image.nx2_content_hash_lo = 0;
+    image.nx2_content_hash_hi = 0;
+    image.modification_tick = ++modification_tick;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (VideoCommon::EarlyCompute::g_early) [[unlikely]] {
+            image.early_write_tick = runtime.CurrentTick();
+        }
+    }
+    const u64 render_frame = RenderFrame();
+    image.write_streak = NextWriteStreak(image.last_write_frame, image.write_streak, render_frame);
+    image.last_write_frame = render_frame;
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
     }
+}
+
+template <class P>
+u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr gpu_addr) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::SlotRetire};
+    if (!RelocationShaped(new_info)) {
+        return 0;
+    }
+    // Depth targets only (the per-NPC ones): in the owner's 2026-11-11 playtest the wider rule
+    // retired colour targets (480x270 format 21, 17 times) and the 2560x1440 scene depth that
+    // were wanted again in the same frame. Same-size predecessors are left to EXP43 and the sweep.
+    const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+    if (type != VideoCore::Surface::SurfaceType::Depth &&
+        type != VideoCore::Surface::SurfaceType::Stencil &&
+        type != VideoCore::Surface::SurfaceType::DepthStencil) {
+        return 0;
+    }
+    // Not Alias (the per-NPC pile is all Alias: 2,000-3,200 kept a 600 frames for it): the cold
+    // sweep deletes those too; live alias links are refused below (aliased_images).
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
+        ImageFlagBits::CostlyLoad | ImageFlagBits::Rescaled |
+        ImageFlagBits::TrimmedLevels;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    const u64 render_frame = RenderFrame();
+    const u64 min_age = static_cast<u64>((std::max)(1, VideoCore::Nx2Debug::Experiment(64)));
+    bool seen = false;
+    boost::container::small_vector<ImageId, 8> retire;
+    for (const ImageId overlap_id : join_bad_overlap_ids) {
+        const Image& old = slot_images[overlap_id];
+        // The same slot, reused for another layout of the same format.
+        if (old.gpu_addr != gpu_addr || old.info.format != new_info.format ||
+            !RelocationShaped(old.info) ||
+            (old.info.size.width == new_info.size.width &&
+             old.info.size.height == new_info.size.height)) {
+            continue;
+        }
+        seen = true;
+        if (True(old.flags & excluded)) {
+            ++slot_kept_kind;
+            const auto flag_bits = static_cast<u32>(old.flags & excluded);
+            for (u32 bit = 0; bit < 32; ++bit) {
+                if ((flag_bits >> bit) & 1) {
+                    ++slot_kept_flag[bit];
+                }
+            }
+            continue;
+        }
+        // Not GPU-written: its contents are guest memory's, nothing is lost. Alias links: the
+        // cold sweep deletes such images too, and DeleteImage drops the links (2026-11-11 night
+        // market: 1,700-3,000 of the pile a 600 frames had them, ~500 were never GPU-written).
+        if (False(old.flags & ImageFlagBits::Registered)) {
+            ++slot_kept_kind;
+            ++slot_kept_not_gpu;
+            continue;
+        }
+        if (old.HasScaled()) {
+            ++slot_kept_kind;
+            ++slot_kept_aliased;
+            continue;
+        }
+        if (old.last_write_frame == render_frame) {
+            ++slot_kept_same_frame; // may still be read in this frame
+            continue;
+        }
+        // EXP64=N: only images nothing touched (bound, sampled, drawn) for N host frames. With
+        // 1, 29 retired targets were made again 1-4 frames later (drawn into without a clear:
+        // the game wanted their depth), 2026-11-11 night market.
+        if (frame_tick - lru_cache.Tick(old.lru_index) < min_age) {
+            ++slot_kept_same_frame;
+            continue;
+        }
+        const auto shape = relocation_shapes.find(RelocationShapeKey(old.info));
+        const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
+        constexpr u8 read_later = GuardSampled | GuardCpuRead;
+        if (old.info.forced_flushed || old.info.dma_downloaded ||
+            ((guard | old.relocation_guard_noted) & read_later) != 0) {
+            ++slot_kept_guard;
+            continue;
+        }
+        if (bound(old) || queued(overlap_id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                return queued(overlap_id, downloads);
+            })) {
+            ++slot_kept_busy;
+            continue;
+        }
+        retire.push_back(overlap_id);
+    }
+    slot_clears += seen ? 1 : 0;
+    // FRITCHII_LOST_WRITEBACK (default 1): written back first, deleted when that lands; until then
+    // it stays a bad overlap of the new image (so it leaves the retire list), as one the queue
+    // has no room for.
+    retire.erase(std::remove_if(retire.begin(), retire.end(),
+                                [this](ImageId old_id) {
+                                    return QueueLostWriteback(old_id, slot_images[old_id],
+                                                              LostPathSlot) != LostWriteback::Drop;
+                                }),
+                 retire.end());
+    for (const ImageId old_id : retire) {
+        // As EXP43=1 and the cold sweep delete one (no download: the contents have no reader).
+        Image& old = slot_images[old_id];
+        MarkStale(old); // before UntrackImage (see MarkStale)
+        if (True(old.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(old, old_id);
+        }
+        UnregisterImage(old_id);
+        slot_recent[slot_recent_next] = SlotRetired{old.gpu_addr, RelocationShapeKey(old.info),
+                                                    render_frame};
+        slot_recent_next = (slot_recent_next + 1) % slot_recent.size();
+        DeleteImage(old_id);
+        ++rt_stats.retired_images;
+    }
+    if (!retire.empty()) {
+        join_bad_overlap_ids.erase(std::remove_if(join_bad_overlap_ids.begin(),
+                                                  join_bad_overlap_ids.end(),
+                                                  [&retire](ImageId id) {
+                                                      return std::ranges::find(retire, id) !=
+                                                             retire.end();
+                                                  }),
+                                   join_bad_overlap_ids.end());
+    }
+    slot_retired += retire.size();
+    slot_retired_any = slot_retired_any || !retire.empty();
+    return static_cast<u32>(retire.size());
 }
 
 template <class P>
@@ -5609,6 +9036,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.modification_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
+        CountGpuModified(image); // EXP100
+        image.nx2_content_hash_lo = 0; // EXP76: aliases copied GPU-written texels in
+        image.nx2_content_hash_hi = 0;
     }
     std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
         const ImageBase& lhs_image = slot_images[lhs->id];
@@ -5650,6 +9080,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             SynchronizeAliases(image_id);
         }
     }
+    if (image.lost_contents != 0) [[unlikely]] {
+        NoteLostContents(image, is_modification, invalidate);
+    }
     if (is_modification) {
         if constexpr (requires { &Image::BackTilesWhole; }) {
             if (True(image.flags & ImageFlagBits::SparseTiles) && image.SparseTilesShareZeroBlock()) {
@@ -5684,8 +9117,26 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
             ++bindings_epoch;
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
         }
         MarkModification(image);
+    }
+    TouchImageLru(image);
+}
+
+template <class P>
+void TextureCache<P>::TouchImageLru(ImageBase& image) noexcept {
+    // EDEN_NX2_EXP90 (Fable, fable52_answer_after88 2): decide from the image's own field, which
+    // PrepareImage has just read, instead of the LRU node (a cache miss) on every use. The node
+    // already ignores a second touch with the same tick (LeastRecentlyUsedCache::Touch), so the
+    // LRU order and ticks stay exactly what they were.
+    if (VideoCore::Nx2Debug::Experiment(90) != 0) {
+        if (image.lru_touched_tick == frame_tick) {
+            ++nx2_lru_touches_skipped;
+            return;
+        }
+        image.lru_touched_tick = frame_tick;
+        ++nx2_lru_touches;
     }
     lru_cache.Touch(image.lru_index, frame_tick);
 }
@@ -5711,10 +9162,6 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
-        return;
-    }
-    if (True((dst.flags | src.flags) & ImageFlagBits::HostResized)) {
-        // Kizuna: the host image is not the guest's size; it is uploaded from guest memory.
         return;
     }
     if (dst.info.astc_opaque != src.info.astc_opaque) {
@@ -5817,6 +9264,7 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id) 
         if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload) &&
             False(slot_images[old_view.image_id].flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
             const PendingDownload new_download{true, 0, old_view.image_id};
+            async_flush_work_noted.store(true, std::memory_order_relaxed);
             uncommitted_downloads.emplace_back(new_download);
         }
     }
@@ -5875,27 +9323,6 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 }
 
 template <class P>
-bool TextureCache<P>::IsSceneTargetFormat(PixelFormat format) noexcept {
-    if (GetFormatType(format) != SurfaceType::ColorTexture) {
-        return true;
-    }
-    switch (format) {
-    case PixelFormat::R16G16B16A16_FLOAT:
-    case PixelFormat::R16G16B16X16_FLOAT:
-    case PixelFormat::B10G11R11_FLOAT:
-    case PixelFormat::R32G32B32A32_FLOAT:
-    case PixelFormat::R32G32_FLOAT:
-    case PixelFormat::R16G16_FLOAT:
-    case PixelFormat::R32_FLOAT:
-    case PixelFormat::R16_FLOAT:
-    case PixelFormat::A2B10G10R10_UNORM:
-        return true;
-    default:
-        return false;
-    }
-}
-
-template <class P>
 void TextureCache<P>::NoteFullClears() {
     // Not PrepareImage's invalidate path itself: UpdateRenderTargets(true) invalidates every bound
     // target, also those the clear leaves alone (the other colour targets, the depth target of a
@@ -5919,12 +9346,6 @@ void TextureCache<P>::NoteFullClears() {
                 image.previous_clear_frame = image.last_clear_frame;
             }
             image.last_clear_frame = render_frame;
-            if (ClassifyClearedTarget(image.last_clear_frame, image.previous_clear_frame,
-                                      render_frame) == DrawTargetClass::Recurring &&
-                IsSceneTargetFormat(image.info.format)) {
-                per_frame_shapes.insert(TargetShape(image.info.format, image.info.size.width,
-                                                    image.info.size.height));
-            }
         }
         image.drawn_since_clear = false;
     };
@@ -5947,28 +9368,8 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
     const u64 render_frame = RenderFrame();
     DrawTargets result{};
     bool any_target{};
-    // EDEN_NX2_SKIP_REDRAWN_DEPTH=0 / EDEN_NX2_SKIP_REDRAWN_COLOR=0: depth / colour targets the
-    // game redraws every frame keep their class (Persistent or FirstTime) and their draws wait.
-    static const bool skip_redrawn_depth = [] {
-        const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_DEPTH");
-        return value == nullptr || value[0] != '0';
-    }();
-    static const bool skip_redrawn_color = [] {
-        const char* value = std::getenv("EDEN_NX2_SKIP_REDRAWN_COLOR");
-        return value == nullptr || value[0] != '0';
-    }();
-    // EDEN_NX2_SKIP_PERIODIC=0: scene-format targets redrawn every few frames (RedrawnPeriodically)
-    // wait. EDEN_NX2_SHAPE_PRIOR=0: new scene-format targets shaped like per-frame ones wait.
-    static const bool skip_periodic = [] {
-        const char* value = std::getenv("EDEN_NX2_SKIP_PERIODIC");
-        return value == nullptr || value[0] != '0';
-    }();
-    static const bool shape_prior = [] {
-        const char* value = std::getenv("EDEN_NX2_SHAPE_PRIOR");
-        return value == nullptr || value[0] != '0';
-    }();
     const auto take = [&](ImageViewId bound, const ImageInfo& info, GPUVAddr gpu_addr,
-                          VideoCore::Surface::PixelFormat format, bool depth) {
+                          VideoCore::Surface::PixelFormat format) {
         any_target = true;
         const ImageBase* image{};
         if (bound_current) {
@@ -5980,56 +9381,21 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             image = &slot_images[image_id];
         }
         // Not registered yet: the draw is the first use of the target.
-        DrawTargetClass kind =
+        const DrawTargetClass kind =
             image ? ClassifyClearedTarget(image->last_clear_frame, image->previous_clear_frame,
                                           render_frame)
                   : DrawTargetClass::FirstTime;
-        // Kizuna: a target the game writes frame after frame is a per-frame target whatever its
-        // clears look like (none, partial, or its clear history reset by a relocation): a
-        // skipped draw shows again once its pipeline is built. v1.10 did this for depth only; the
-        // colour targets left waiting (128x128 and 512x512 HDR probes, the 1920x1080 HDR scene
-        // without a full clear) still froze Castle Town on the way to the Temple of Time for
-        // seconds (2026-11-11). A layer the game renders once (a chat bubble's text, a probe
-        // captured once) is not written in consecutive frames and still waits; full-screen passes
-        // are never skipped (CanDiscardPendingDraw).
-        const PixelFormat target_format = image ? image->info.format : format;
-        const bool scene_format = IsSceneTargetFormat(target_format);
-        if (kind != DrawTargetClass::Recurring && image &&
-            (depth ? skip_redrawn_depth : skip_redrawn_color) &&
-            (RedrawnEveryFrame(image->last_write_frame, image->previous_write_frame,
-                               render_frame) ||
-             (scene_format && skip_periodic &&
-              RedrawnPeriodically(image->last_write_frame, image->previous_write_frame,
-                                  render_frame)))) {
-            kind = DrawTargetClass::Recurring;
-            result.redrawn_depth = gpu_addr;
-            if (scene_format) {
-                per_frame_shapes.insert(TargetShape(target_format, image->info.size.width,
-                                                    image->info.size.height));
-            }
-        }
-        // Kizuna: a new scene-format target shaped like one the game drew every frame before
-        // (moving to a new area re-creates or moves the scene's depth, HDR and shadow targets) is
-        // a per-frame target too. A first-time target waited for each new pipeline until it had
-        // been cleared in two frames: 21 such waits held the game 4.3 s on entering the Kakariko
-        // church (2026-11-12). Not for small targets (probes, LUTs), which a game may draw once;
-        // nor for 8-bit layers (text, UI).
-        if (kind != DrawTargetClass::Recurring && shape_prior && scene_format) {
-            const u32 width = image ? image->info.size.width : info.size.width;
-            const u32 height = image ? image->info.size.height : info.size.height;
-            const bool fresh =
-                kind == DrawTargetClass::FirstTime ||
-                (image && image->previous_write_frame == ~u64{0} &&
-                 (image->last_write_frame == ~u64{0} || image->last_write_frame == render_frame));
-            if (fresh && width >= 256 && height >= 256 &&
-                per_frame_shapes.contains(TargetShape(target_format, width, height))) {
-                kind = DrawTargetClass::Recurring;
-                result.shape_prior = gpu_addr;
-            }
-        }
+        // A target never cleared but written in every recent frame is per-frame too.
+        const DrawTargetClass redrawn_kind =
+            kind == DrawTargetClass::Persistent && image &&
+                    IsRedrawnTarget(image->last_write_frame, image->write_streak, render_frame)
+                ? DrawTargetClass::Recurring
+                : kind;
+        result.kind_if_redrawn = (std::max)(result.kind_if_redrawn, redrawn_kind);
         if (kind > result.kind) {
             result = DrawTargets{
                 .kind = kind,
+                .kind_if_redrawn = result.kind_if_redrawn,
                 .gpu_addr = gpu_addr,
                 .width = image ? image->info.size.width : info.size.width,
                 .height = image ? image->info.size.height : info.size.height,
@@ -6046,15 +9412,16 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             continue;
         }
         const ImageInfo info(rt, regs.anti_alias_samples_mode);
-        take(render_targets.color_buffer_ids[index], info, gpu_addr, info.format, false);
+        take(render_targets.color_buffer_ids[index], info, gpu_addr, info.format);
     }
     if (regs.zeta_enable && regs.zeta.Address() != 0) {
         const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-        take(render_targets.depth_buffer_id, info, regs.zeta.Address(), info.format, true);
+        take(render_targets.depth_buffer_id, info, regs.zeta.Address(), info.format);
     }
     if (!any_target) {
         // No colour or depth target: what the draw does stays in storage it writes.
         result.kind = DrawTargetClass::Persistent;
+        result.kind_if_redrawn = DrawTargetClass::Persistent;
     }
     return result;
 }

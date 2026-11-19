@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -45,6 +44,10 @@ class System;
 } // namespace Core
 
 namespace Kernel {
+
+namespace Nx2ThreadStats {
+struct Counters;
+}
 
 class GlobalSchedulerContext;
 class KernelCore;
@@ -128,6 +131,18 @@ KProcess* GetCurrentProcessPointer(KernelCore& kernel);
 KProcess& GetCurrentProcess(KernelCore& kernel);
 s32 GetCurrentCoreId(KernelCore& kernel);
 Core::Memory::Memory& GetCurrentMemory(KernelCore& kernel);
+
+/// The hang report (FRITCHII_HANG_REPORT_S): the game's threads now in a kernel wait, longest
+/// first, each with what it waits on (a mutex or condition variable key, an arbitration address,
+/// the first object of a WaitSynchronization, an IPC reply, a sleep) and for how long. Read only,
+/// lock free; HLE service threads (dummy threads) are left out.
+[[nodiscard]] std::string DescribeGuestWaits();
+/// Forgets every recorded wait (the session's threads are gone).
+void ClearGuestWaitsForHangReport();
+/// A guest thread stopped for good (a prefetch abort or breakpoint without a debugger): the hang
+/// report's "game threads in kernel waits" line names the newest, as a freeze after it is the
+/// game's crash, not a lost wake-up. `what` must be a string literal.
+void NoteGuestCrashForHangReport(u64 thread_id, u64 pc, const char* what);
 
 class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorkerTask>,
                       public Common::IntrusiveListBaseNode<KThread>,
@@ -309,6 +324,11 @@ public:
         return m_cpu_time;
     }
 
+    /// EDEN_NX2_GUEST_THREAD_STATS: this thread's counters, made on first use.
+    std::atomic<Nx2ThreadStats::Counters*>& Nx2Stats() {
+        return m_nx2_stats;
+    }
+
     s32 GetActiveCore() const {
         return m_core_id;
     }
@@ -374,6 +394,24 @@ public:
 
     void SetYieldScheduleCount(s64 count) {
         m_schedule_count = count;
+    }
+
+    // EXP98 (k_scheduler.cpp): the last yield that found nothing to do, stamped under the
+    // scheduler lock with its core and that core's change counter. Kind 1 = same core (no
+    // rotation), 2 = also no migration. Only the thread itself reads or writes these.
+    s32 GetYieldCore() const {
+        return m_yield_core;
+    }
+    u8 GetYieldKind() const {
+        return m_yield_kind;
+    }
+    u64 GetYieldGen() const {
+        return m_yield_gen;
+    }
+    void SetYieldCache(s32 core, u64 gen, u8 kind) {
+        m_yield_core = static_cast<s8>(core);
+        m_yield_gen = gen;
+        m_yield_kind = kind;
     }
 
     void WaitCancel(KernelCore& kernel);
@@ -585,6 +623,7 @@ public:
     void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging reason,
                                    const void* timeline_key = nullptr) {
         m_wait_reason_for_debugging = reason;
+        NoteWaitForHangReport(reason, timeline_key);
         if (Common::Nx2Timeline::Guest() && reason != ThreadWaitReasonForDebugging::None)
             [[unlikely]] {
             RecordWaitForTimeline(reason, timeline_key);
@@ -895,6 +934,9 @@ private:
     /// SetWaitReasonForDebugging's "guest wait" marker: the thread, the reason and what it waits
     /// on (see k_thread.cpp).
     void RecordWaitForTimeline(ThreadWaitReasonForDebugging reason, const void* timeline_key) const;
+    /// DescribeGuestWaits' table: this thread's wait begins (or ends, reason None).
+    void NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
+                               const void* timeline_key) const;
 
     using LockWithPriorityInheritanceInfoList =
         Common::IntrusiveListBaseTraits<LockWithPriorityInheritanceInfo>::ListType;
@@ -913,9 +955,13 @@ private:
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
+    u64 m_yield_gen{};
+    s8 m_yield_core{-1};
+    u8 m_yield_kind{};
     s64 m_last_scheduled_tick{};
     std::vector<KThread*> m_pending_started_threads;
     std::atomic<bool> m_entered_kernel{false};
+    std::atomic<Nx2ThreadStats::Counters*> m_nx2_stats{};
     std::array<QueueEntry, Core::Hardware::NUM_CPU_CORES> m_per_core_priority_queue_entry{};
     KThreadQueue* m_wait_queue{};
     LockWithPriorityInheritanceInfoList m_held_lock_info_list{};

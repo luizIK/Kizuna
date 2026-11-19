@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(core STATIC
@@ -356,6 +355,8 @@ add_library(core STATIC
     hle/kernel/kernel.h
     hle/kernel/memory_types.h
     hle/kernel/message_buffer.h
+    hle/kernel/nx2_thread_stats.cpp
+    hle/kernel/nx2_thread_stats.h
     hle/kernel/physical_core.cpp
     hle/kernel/physical_core.h
     hle/kernel/slab_helpers.h
@@ -1292,6 +1293,8 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/arm_dynarmic_64.h
         arm/dynarmic/arm_dynarmic_32.cpp
         arm/dynarmic/arm_dynarmic_32.h
+        arm/dynarmic/host_routines.cpp
+        arm/dynarmic/host_routines.h
         arm/dynarmic/dynarmic_cp15.cpp
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp

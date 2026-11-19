@@ -6,6 +6,7 @@
 #include <atomic>
 
 #include "video_core/gpu_split.h"
+#include "video_core/memory_stage_link.h"
 
 namespace VideoCommon {
 
@@ -29,6 +30,30 @@ public:
     }
     BackWaitScope(const BackWaitScope&) = delete;
     BackWaitScope& operator=(const BackWaitScope&) = delete;
+
+private:
+    bool active;
+    const char* previous{};
+};
+
+/// The memory stage thread's (GPUMem) twin of back_wait_site.
+inline std::atomic<const char*> stage_wait_site{nullptr};
+
+/// Marks a blocking wait on GPUMem for the watchdog; nothing on other threads.
+class StageWaitScope {
+public:
+    explicit StageWaitScope(const char* site) : active{MemoryStageLink::OnStageThread()} {
+        if (active) {
+            previous = stage_wait_site.exchange(site, std::memory_order_relaxed);
+        }
+    }
+    ~StageWaitScope() {
+        if (active) {
+            stage_wait_site.store(previous, std::memory_order_relaxed);
+        }
+    }
+    StageWaitScope(const StageWaitScope&) = delete;
+    StageWaitScope& operator=(const StageWaitScope&) = delete;
 
 private:
     bool active;

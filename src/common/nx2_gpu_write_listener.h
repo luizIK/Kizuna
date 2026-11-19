@@ -7,7 +7,9 @@
 #include <cstdint>
 
 #include "common/common_types.h"
+#include "common/fritchii_write_ring.h"
 #include "common/nx2_timeline.h"
+#include "common/nx2_uniform_keep_pages.h"
 
 /// One listener for the GPU's semaphore and report writes to guest memory, called from every
 /// path that writes one (query cache completions, immediate and semi-flush writes, the 3D
@@ -88,6 +90,12 @@ inline constexpr const char* TimelineName(Path path) {
 
 inline void Notify(Path path, u64 device_address, u64 gpu_address, const void* host_pointer,
                    u32 value) {
+    // EXP92 (uniform keeps, tier 2): the word and a report's timestamp after it, 16 bytes at
+    // most, are in guest memory now. One relaxed load until a keep was ever made.
+    if (device_address != 0) {
+        Common::UniformKeepPages::Note(device_address, 16);
+        Common::WriteRing::Note(device_address, 16, TimelineName(path));
+    }
     if (Nx2Timeline::Guest()) [[unlikely]] {
         // What ends a guest poll of this word (tools/nx2/critical_path.py matches the host
         // pointer, or the GPU address, with the words of OoT's present poll event object).

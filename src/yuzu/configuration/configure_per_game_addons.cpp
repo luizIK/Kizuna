@@ -193,7 +193,7 @@ void ConfigurePerGameAddons::InstallModFolder() {
 }
 
 void ConfigurePerGameAddons::InstallModZip() {
-    // TODO(crueter): use GetOpenFileName to allow select multiple ZIPs
+    // TODO: use GetOpenFileName to allow select multiple ZIPs
     const auto path = QtCommon::Frontend::GetOpenFileName(
         tr("Zipped Mod Location"),
         QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),

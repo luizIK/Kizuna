@@ -167,6 +167,44 @@ QListWidget#selectorList::item:selected { background: #3a4354; color: #f0ebdf; }
 QLabel#FritchiiDialogTitle { font-size: 24px; font-weight: 500; color: #f0ebdf; }
 QTextBrowser#FritchiiNotes { background: transparent; border: none; font-size: 15px; }
 
+/* Clear old shader caches? (fritchii/cache_cleanup.cpp), Use the recommended settings? */
+QDialog#FritchiiCachePrompt, QDialog#FritchiiSettingsPrompt { background: #111113; }
+QDialog#FritchiiCachePrompt QPushButton, QDialog#FritchiiSettingsPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+/* Max Resolution on or off (fritchii/max_resolution.cpp) */
+QDialog#FritchiiMaxResPrompt { background: #111113; }
+QDialog#FritchiiMaxResPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+/* Faster mode for AMD (fritchii/occlusion_offer.cpp) */
+QDialog#FritchiiOcclPrompt { background: #111113; }
+QDialog#FritchiiOcclPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+QFrame#FritchiiMaxResCard { background: #18181b; border: 1px solid #2a2a30; border-radius: 12px; }
+QLabel#FritchiiMaxResSide { font-size: 19px; font-weight: 600; color: #ececf1; }
+QLabel#FritchiiMaxResYours { font-size: 17px; font-weight: 500; color: #a78bfa; }
+
+/* Switches window (fritchii/switches_window.cpp) */
+QLabel#FritchiiSwitchesSection { font-size: 16px; font-weight: 600; color: #ececf1; }
+QTextEdit#FritchiiSwitchesInUse { background: #141417; color: #c9c9d3; }
+QLabel#FritchiiSwitchesProblems { color: #f87171; font-size: 15px; }
+QLabel#FritchiiSwitchesSaved { color: #a78bfa; font-size: 15px; }
+
 /* Preparing shaders (fritchii/precompile_gate.cpp) */
 QDialog#FritchiiPrepare {
     background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #222937, stop: 1 #161a22);
@@ -259,3 +297,16 @@ QToolButton#KizunaDock {
 }
 QToolButton#KizunaDock:hover { color: #f0ebdf; }
 QFrame#KizunaDockLine { background: #2a3240; border: none; min-height: 1px; max-height: 1px; }
+QToolButton#FritchiiTile:hover { background: #1b1b1f; color: #ececf1; }
+
+/* Controls page: tighter buttons, boxes and lists so both button columns and the controller
+   preview fit beside each other (text keeps its normal size). */
+QWidget#ConfigureInputPlayer QPushButton { padding: 3px 8px; border-radius: 6px; }
+QWidget#ConfigureInputPlayer QGroupBox { margin-top: 18px; padding: 8px 6px 6px 6px; border-radius: 8px; }
+QWidget#ConfigureInputPlayer QComboBox { padding: 3px 8px; border-radius: 6px; }
+
+/* Good to know (fritchii/known_issues.cpp) */
+QDialog#FritchiiKnownIssues { background: #111113; }
+QDialog#FritchiiKnownIssues QPushButton { min-width: 120px; padding: 9px 22px; border-radius: 8px; }
+QLabel#FritchiiKnownIssuesLead { font-size: 17px; font-weight: 600; color: #ececf1; }
+QLabel#FritchiiKnownIssuesFooter { font-size: 15px; color: #a78bfa; }

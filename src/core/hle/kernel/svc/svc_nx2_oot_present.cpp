@@ -41,7 +41,7 @@
 namespace Kernel::Svc {
 namespace {
 
-// Ocarina of Time. Found by Hookshot (NotRexed's OoT recomp, host/hos_thread.c present_poll):
+// Ocarina of Time. Found by an OoT recomp's research (its host/hos_thread.c present_poll):
 // the main thread waits for its frame's GPU work with
 //     while (nvnEventGetValue(e) != 1) nn::os::SleepThread(1 ms);
 // ~3.5 sleeps a frame, so each frame ends 0.5-1 ms after the GPU wrote the event. In the loop a
@@ -70,9 +70,9 @@ struct PresentSite {
 };
 
 constexpr std::array PresentSites{
-    // E0F3CCFA... (2.0.0, v131072). Hookshot's 0x80590520 (sleep return), 0x8059051C and
-    // 0x8059052C are absolute addresses in its Eden layout (nx2/image.py): rtld at 0x80000000,
-    // main right after rtld's 0x20000 (as in Eden: rtld@0x80fe4000, main@0x81004000), so main
+    // E0F3CCFA... (2.0.0, v131072). The recomp's 0x80590520 (sleep return), 0x8059051C and
+    // 0x8059052C are absolute addresses in its emulator layout (nx2/image.py): rtld at 0x80000000,
+    // main right after rtld's 0x20000 (as in this emulator: rtld@0x80fe4000, main@0x81004000), so main
     // offsets 0x570520, 0x57051C, 0x57052C. main+0x590520 held a function epilogue. Not yet
     // seen verified; EXP24=2 shows the real site.
     PresentSite{
@@ -183,6 +183,13 @@ struct PresentPollState {
     std::atomic<bool> listener_set{}; // OnGpuWrite is installed (EXP24 = 1 or 3 found the site)
     KThread* waiter{}; // the thread in the wait; guarded by the scheduler lock
     std::atomic<bool> has_waiter{};
+    // EXP24 = 4: the event's value word (event object field EDEN_NX2_OOT_PRESENT_FIELD, default
+    // 0). Set before the wait, cleared with the waiter. Nx2OotPresentPollCheck reads it.
+    std::atomic<const u32*> check_word{};
+    std::atomic<bool> check_mode{}; // EXP24 = 4 last poll: GPU writes wake nothing
+    std::atomic<u64> check_wakes{};    // waits ended by the check
+    std::atomic<u64> check_already{};  // polls that found the word 1 before sleeping
+    std::atomic<u64> check_timeouts{}; // waits that ran out (250 us)
     // Set by the waker under the scheduler lock before it ends the wait; read by the woken thread.
     Path wake_path{};
     const void* wake_host{};
@@ -289,6 +296,7 @@ private:
         PresentPollState& state = PollState();
         if (state.waiter == waiting_thread) {
             state.waiter = nullptr;
+            state.check_word.store(nullptr, std::memory_order_relaxed);
             state.has_waiter.store(false, std::memory_order_release);
         }
     }
@@ -316,7 +324,8 @@ void OnGpuWrite(Path path, u64 device_address, u64 gpu_address, const void* host
             }
         }
     }
-    if (!state.has_waiter.load(std::memory_order_acquire)) {
+    if (!state.has_waiter.load(std::memory_order_acquire) ||
+        state.check_mode.load(std::memory_order_relaxed)) {
         return;
     }
     const size_t index = static_cast<size_t>(path);
@@ -699,8 +708,9 @@ void LocateCount(Core::System& system, KernelCore& kernel, KProcess& process, s6
     }
 }
 
-/// Sleeps up to `ns` (> 0), ended early by OnGpuWrite. Returns the wait's result.
-Result WaitForGpuWrite(KernelCore& kernel, s64 ns) {
+/// Sleeps up to `ns` (> 0), ended early by OnGpuWrite or, with `word` (EXP24 = 4), by
+/// Nx2OotPresentPollCheck once that word reads 1. Returns the wait's result.
+Result WaitForGpuWrite(KernelCore& kernel, s64 ns, const u32* word = nullptr) {
     KThread& thread = GetCurrentThread(kernel);
     PresentPollState& state = PollState();
     PresentPollQueue wait_queue(kernel);
@@ -719,6 +729,7 @@ Result WaitForGpuWrite(KernelCore& kernel, s64 ns) {
         // One waiter at a time (the game has one present poll); another thread just sleeps.
         if (state.waiter == nullptr) {
             state.waiter = std::addressof(thread);
+            state.check_word.store(word, std::memory_order_relaxed);
             state.has_waiter.store(true, std::memory_order_release);
         }
         wait_queue.SetHardwareTimer(timer);
@@ -729,6 +740,20 @@ Result WaitForGpuWrite(KernelCore& kernel, s64 ns) {
 }
 
 
+/// EXP24 = 4: which event object field holds the value word (EDEN_NX2_OOT_PRESENT_FIELD, boot,
+/// default 0: Fable's read of the 2026-11-12 night market timeline; the EXP24=1 "event object
+/// fields" log line confirms it).
+size_t ValueField() {
+    static const size_t field = [] {
+        const char* const text = std::getenv("EDEN_NX2_OOT_PRESENT_FIELD");
+        const long long parsed = text != nullptr ? std::strtoll(text, nullptr, 10) : 0;
+        return parsed >= 0 && parsed < static_cast<long long>(EventObjectWords)
+                   ? static_cast<size_t>(parsed)
+                   : size_t{0};
+    }();
+    return field;
+}
+
 s64 ShortSleepUs() {
     static const s64 us = [] {
         const char* const text = std::getenv("EDEN_NX2_OOT_PRESENT_SLEEP_US");
@@ -738,6 +763,10 @@ s64 ShortSleepUs() {
         const long long parsed = std::strtoll(text, nullptr, 10);
         return parsed > 0 ? static_cast<s64>(parsed) : DefaultShortSleepUs;
     }();
+    // EXP95 > 0 (live; Fable answer_front 2): the short sleep in us, switchable in one session.
+    if (const int live = VideoCore::Nx2Debug::Experiment(95); live > 0) {
+        return live;
+    }
     return us;
 }
 
@@ -953,6 +982,13 @@ void MaybeLog(PresentPollState& state, s64 now, int mode) {
                  take(state.short_sleeps), ShortSleepUs(), seconds, take(state.short_ok));
         return;
     }
+    if (mode == 4) {
+        LOG_INFO(Kernel_SVC,
+                 "OoT present poll (EXP24=4, field {}): in {:.1f} s {} polls found the word 1 "
+                 "before sleeping, {} sleeps of at most {} us: {} ended by the check, {} ran out",
+                 ValueField(), seconds, take(state.check_already), take(state.waits),
+                 ShortSleepUs(), take(state.check_wakes), take(state.check_timeouts));
+    }
     std::string learned_text;
     size_t learned_count = 0;
     {
@@ -1049,6 +1085,22 @@ u64 MarkEventObjectForTimeline(KProcess& process, const Svc::ThreadContext& ctx)
 
 } // Anonymous namespace
 
+void Nx2OotPresentPollCheck(KernelCore& kernel, const KThread* beginning) {
+    PresentPollState& state = PollState();
+    if (!state.has_waiter.load(std::memory_order_relaxed)) [[likely]] {
+        return;
+    }
+    const u32* const word = state.check_word.load(std::memory_order_relaxed);
+    KThread* const waiter = state.waiter; // scheduler lock held
+    // The waiter's own BeginWait comes before its timer is registered: ending it there would
+    // leave that timer to fire on a later wait. Its sleep ends at the next guest wait instead.
+    if (word == nullptr || waiter == nullptr || waiter == beginning ||
+        *static_cast<const volatile u32*>(word) != 1) {
+        return;
+    }
+    waiter->EndWait(kernel, ResultSuccess);
+}
+
 bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns, u64* event_object) {
     if (ns <= 0 || ns > MaxPollSleepNs) {
         return false;
@@ -1076,9 +1128,10 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
     if (ns <= 0 || ns > MaxPollSleepNs) {
         return false;
     }
-    // 1 = wait for the GPU's write, 2 = locate the site, 3 = a shorter plain sleep.
+    // 1 = wait for the GPU's write, 2 = locate the site, 3 = a shorter plain sleep, 4 = a shorter
+    // sleep that ends when the event's value word reads 1 (Nx2OotPresentPollCheck).
     const int mode = VideoCore::Nx2Debug::Experiment(24);
-    if (mode < 1 || mode > 3) {
+    if (mode < 1 || mode > 4) {
         return false;
     }
     auto& kernel = system.Kernel();
@@ -1110,9 +1163,40 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
         const s64 start = kernel.HardwareTimer().GetTick();
         ResolvePending(state, start);
         MaybeLog(state, start, mode);
-        if (mode == 1) {
+        if (mode == 1 || mode == 4) {
             ReadEventObject(state, process, ctx);
         }
+    }
+    state.check_mode.store(mode == 4, std::memory_order_relaxed);
+
+    if (mode == 4) {
+        // The game read the word just before this sleep; if it reads 1 now, return so it polls
+        // again at once. Else sleep at most the short sleep, ended by the check when it turns 1.
+        const u32* word = nullptr;
+        {
+            std::scoped_lock lk{state.wake_mutex};
+            word = static_cast<const u32*>(state.object_hosts[ValueField()]);
+        }
+        const auto reads_one = [word] {
+            return *static_cast<const volatile u32*>(word) == 1;
+        };
+        if (word != nullptr && reads_one()) {
+            state.check_already.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        state.waits.fetch_add(1, std::memory_order_relaxed);
+        const s64 sleep_ns = (std::min)(ns, ShortSleepUs() * 1000);
+        const Result result = WaitForGpuWrite(kernel, sleep_ns, word);
+        if (result == ResultSuccess) {
+            state.check_wakes.fetch_add(1, std::memory_order_relaxed);
+        } else if (result == ResultTimedOut) {
+            state.check_timeouts.fetch_add(1, std::memory_order_relaxed);
+        }
+        // As a timed-out wait for the word scoring (the check's wakes name no GPU write); the
+        // field statistics still count which field read 1 when the next poll found it set.
+        std::scoped_lock lk{state.poll_mutex};
+        CapturePending(state, false, kernel.HardwareTimer().GetTick());
+        return true;
     }
 
     if (mode == 3) {

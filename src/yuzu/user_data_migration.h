@@ -24,7 +24,7 @@ struct ProfileImportChoice {
     [[nodiscard]] static std::optional<ProfileImportChoice> Parse(const std::string& text);
 };
 
-// TODO(crueter): Quick implementation
+// TODO: Quick implementation
 class UserDataMigrator {
 public:
     UserDataMigrator(QMainWindow* main_window);
@@ -34,6 +34,12 @@ public:
     /// `from_menu`: Help > Copy Data (the current data is kept as backups, Fritchii restarts).
     [[nodiscard]] static std::optional<ProfileImportChoice> AskImport(QWidget* parent,
                                                                       bool from_menu);
+
+    /// v5.9, at startup once logging runs and before the game list or a game uses the shader
+    /// cache: logs what the import did, then, once, copies Eden's and Lichii's shader caches for
+    /// players who imported with v5.8 (it left them behind), with a progress dialog and a short
+    /// note when done.
+    static void CatchUpShaderCache(QWidget* parent);
 
     bool migrated{false};
     Emulator selected_emu;

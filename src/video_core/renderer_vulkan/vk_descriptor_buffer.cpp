@@ -74,11 +74,41 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
         chunk_hosts.push_back(buffer.Mapped().data() + (address - raw_address));
         chunks.push_back(std::move(buffer));
     }
+    LOG_INFO(Render_Vulkan,
+             "Descriptor buffer: {} chunk(s) of {} KiB per frame, {} frames in flight",
+             chunks_per_frame, chunk_capacity >> 10, FRAMES_IN_FLIGHT);
 }
 
-DescriptorBufferRing::~DescriptorBufferRing() = default;
+DescriptorBufferRing::~DescriptorBufferRing() {
+    if (!chunks.empty()) {
+        ReportCounters(true);
+    }
+}
+
+void DescriptorBufferRing::ReportCounters(bool shutdown) {
+    const VkDeviceSize frame_capacity = chunk_capacity * chunks_per_frame;
+    const u64 peak_percent = frame_capacity != 0 ? peak_frame_bytes * 100 / frame_capacity : 0;
+    LOG_INFO(Render_Vulkan,
+             "Descriptor buffer{}: peak frame {} KiB ({}% of {} KiB), frame exhausted {} times "
+             "(full GPU wait mid-draw), slot reused before its submit {} times",
+             shutdown ? " at shutdown" : "", peak_frame_bytes >> 10, peak_percent,
+             frame_capacity >> 10, exhausted, reuse_flushes);
+}
 
 void DescriptorBufferRing::TickFrame() {
+    // Zero-cost counters (once a frame): the frame's bytes, and a line while the mid-draw
+    // submit counters rise, at most every 3600 frames.
+    const VkDeviceSize used = frame_spill + chunk_cursor * chunk_capacity + cursor;
+    peak_frame_bytes = (std::max)(peak_frame_bytes, used);
+    frame_spill = 0;
+    ++frames;
+    if (const u64 events = exhausted + reuse_flushes;
+        events != reported_events && (reported_frame == 0 || frames - reported_frame >= 3600))
+        [[unlikely]] {
+        reported_events = events;
+        reported_frame = frames;
+        ReportCounters(false);
+    }
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
     }
@@ -103,6 +133,10 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
     const VkDeviceSize needed{Common::AlignUp(size, alignment)};
     if (frame_reused) {
         frame_reused = false;
+        if (frame_ticks[frame_index] != 0 &&
+            frame_ticks[frame_index] >= scheduler.CurrentTick()) [[unlikely]] {
+            ++reuse_flushes; // the Wait below submits the command buffer being recorded
+        }
         scheduler.Wait(frame_ticks[frame_index]);
     }
     if (cursor + needed > chunk_capacity) {
@@ -110,6 +144,8 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
             ++chunk_cursor;
         } else {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer frame exhausted, stalling on the GPU");
+            ++exhausted;
+            frame_spill += chunks_per_frame * chunk_capacity;
             scheduler.Finish();
             chunk_cursor = 0;
             ++generation;

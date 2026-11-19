@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -50,6 +51,36 @@ void KeplerMemory::CallMethod(Core::System& system, u32 method, u32 method_argum
         break;
     }
     }
+}
+
+void KeplerMemory::FrontNoteMethod(u32 method, u32 argument) {
+    if (method - FrontFirst >= FrontCount) {
+        return;
+    }
+    front_regs[method - FrontFirst] = argument;
+    front_seen |= 1U << (method - FrontFirst);
+    if (method == KEPLERMEMORY_REG_INDEX(exec)) {
+        // Upload::State::ProcessExec.
+        front_exec_size = u64{front_regs[0]} * front_regs[1];
+        front_linear = (argument & 1) != 0;
+    }
+}
+
+bool KeplerMemory::FrontDataRange(GPUVAddr& begin, u64& size) const {
+    // line_length_in, line_count, address high and low, exec; pitch for more than one line.
+    const u64 lines = (std::max)(front_regs[1], 1U);
+    const u32 needed = 0xF | (lines > 1 ? 0x10 : 0) |
+                       (1U << (KEPLERMEMORY_REG_INDEX(exec) - FrontFirst));
+    if (!front_linear || (front_seen & needed) != needed) {
+        return false;
+    }
+    // ProcessData reads the registers when the data arrives: lines of line_length_in bytes,
+    // pitch apart, from the address; a partial transfer writes within the exec's copy_size.
+    const u64 line_length = front_regs[0];
+    const u64 pitch = front_regs[4];
+    begin = (GPUVAddr{front_regs[2]} << 32) | front_regs[3];
+    size = (std::max)(pitch * (lines - 1) + line_length, front_exec_size);
+    return size != 0;
 }
 
 void KeplerMemory::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {

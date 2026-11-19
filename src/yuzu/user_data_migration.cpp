@@ -41,7 +41,10 @@
 #include <array>
 #include <chrono>
 #include <optional>
+#include <QTimer>
+#include <fmt/format.h>
 #include "common/fs/fs_paths.h"
+#include "common/logging.h"
 
 UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
     // NOTE: Logging is not initialized yet, do not produce logs here.
@@ -56,7 +59,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
     if (!FrontendCommon::NeedsLegacyProfileImport()) {
         return;
     }
-    // Fritchii imports on its own; zortos's choice dialog stays behind a switch for support.
+    // Fritchii imports on its own; the original choice dialog stays behind a switch for support.
     if (qEnvironmentVariableIntValue("EDEN_NX2_IMPORT_PROMPT") == 0) {
         AutoImport(main_window);
         return;
@@ -72,7 +75,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
                 QMessageBox::Retry | QMessageBox::Close, QMessageBox::Retry);
             if (answer != QMessageBox::Retry) {
                 throw std::runtime_error(
-                    "Import recovery was postponed. Relaunch Lichii to retry.");
+                    "Import recovery was postponed. Relaunch Fritchii to retry.");
             }
             Migration::Recover(state_dir);
         }
@@ -140,11 +143,11 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
                      [=](bool linked) { clear_shaders->setEnabled(!linked); });
     update_cache_default();
     migration_prompt.setText(
-        QObject::tr("Import an existing emulator profile into Lichii?\n"
+        QObject::tr("Import an existing emulator profile into Fritchii?\n"
                     "Copy keeps the original profile unchanged and is recommended.\n"
                     "Move retains a recovery backup and requires space for a full copy.\n"
                     "Link shares settings and saves with the source emulator.\n"
-                    "Existing Lichii data is kept in backup directories, not merged or deleted.\n\n"
+                    "Existing Fritchii data is kept in backup directories, not merged or deleted.\n\n"
                     "Close the source emulator, then choose its profile below.\n"
                     "Close this window to decide on the next launch."));
     migration_prompt.addButton(QObject::tr("Import"));
@@ -155,7 +158,7 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     QAbstractButton* button = migration_prompt.clickedButton();
 
     if (button == nullptr) {
-        throw std::runtime_error("Import was postponed. Relaunch Lichii to choose a profile.");
+        throw std::runtime_error("Import was postponed. Relaunch Fritchii to choose a profile.");
     }
     if (button == fresh) {
         Common::FS::ProfileMigration::MarkFresh(FrontendCommon::ProfileImportStateDirectory());
@@ -170,13 +173,13 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     MigrateUserData(main_window, clear_shaders->isEnabled() && clear_shaders->isChecked(),
                     strategy);
     if (!migrated) {
-        throw std::runtime_error("Import failed. Relaunch Lichii to retry or recover.");
+        throw std::runtime_error("Import failed. Relaunch Fritchii to retry or recover.");
     }
 }
 
 void UserDataMigrator::ShowMigrationCancelledMessage(QMainWindow* main_window) {
     QMessageBox::information(main_window, QObject::tr("Migration"),
-                             QObject::tr("Lichii will use its own profile. Your old emulator "
+                             QObject::tr("Fritchii will use its own profile. Your old emulator "
                                          "data has not been changed."),
                              QMessageBox::Ok);
 }
@@ -254,6 +257,8 @@ struct OldProfile {
     fs::path config; ///< Its config folder (inside `user` on Windows, XDG_CONFIG_HOME elsewhere).
     bool fritchii{}; ///< A previous Fritchii's (it has frizti.ini).
     fs::file_time_type used{fs::file_time_type::min()};
+    fs::path cache; ///< Its cache folder (shader caches under "shader").
+    bool family{};  ///< Eden or Lichii: their shader caches are ones this build reads.
 };
 
 fs::file_time_type LastUsed(const fs::path& config) {
@@ -299,15 +304,16 @@ std::vector<OldProfile> ListOldProfiles() {
         const char* name;
         EmuPath user;
         EmuPath config;
+        EmuPath cache;
         int rank; ///< 0: Eden and Lichii, 1: the older emulators
     };
     constexpr std::array candidates{
-        Candidate{QT_TR_NOOP("Eden"), LegacyEdenDir, LegacyEdenConfigDir, 0},
-        Candidate{QT_TR_NOOP("Lichii"), LichiiDir, LichiiConfigDir, 0},
-        Candidate{QT_TR_NOOP("Citron"), CitronDir, CitronConfigDir, 1},
-        Candidate{QT_TR_NOOP("Sudachi"), SudachiDir, SudachiConfigDir, 1},
-        Candidate{QT_TR_NOOP("Suyu"), SuyuDir, SuyuConfigDir, 1},
-        Candidate{QT_TR_NOOP("Yuzu"), YuzuDir, YuzuConfigDir, 1},
+        Candidate{QT_TR_NOOP("Eden"), LegacyEdenDir, LegacyEdenConfigDir, LegacyEdenCacheDir, 0},
+        Candidate{QT_TR_NOOP("Lichii"), LichiiDir, LichiiConfigDir, LichiiCacheDir, 0},
+        Candidate{QT_TR_NOOP("Citron"), CitronDir, CitronConfigDir, CitronCacheDir, 1},
+        Candidate{QT_TR_NOOP("Sudachi"), SudachiDir, SudachiConfigDir, SudachiCacheDir, 1},
+        Candidate{QT_TR_NOOP("Suyu"), SuyuDir, SuyuConfigDir, SuyuCacheDir, 1},
+        Candidate{QT_TR_NOOP("Yuzu"), YuzuDir, YuzuConfigDir, YuzuCacheDir, 1},
     };
     std::vector<std::pair<int, OldProfile>> found;
     for (const auto& candidate : candidates) {
@@ -318,7 +324,8 @@ std::vector<OldProfile> ListOldProfiles() {
         const auto& config = GetLegacyPath(candidate.config);
         found.emplace_back(candidate.rank,
                            OldProfile{QObject::tr(candidate.name), user, config,
-                                      fs::exists(config / "frizti.ini"), LastSaved(user, config)});
+                                      fs::exists(config / "frizti.ini"), LastSaved(user, config),
+                                      GetLegacyPath(candidate.cache), candidate.rank == 0});
     }
     std::ranges::stable_sort(found, [](const auto& a, const auto& b) {
         return a.first != b.first ? a.first < b.first : a.second.used > b.second.used;
@@ -356,15 +363,32 @@ QString Gigabytes(std::uintmax_t bytes) {
     return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 1);
 }
 
+/// "850 MB" or "2.4 GB".
+QString SizeText(std::uintmax_t bytes) {
+    if (bytes < (std::uintmax_t{1} << 30)) {
+        return QObject::tr("%1 MB").arg((std::max)(std::uintmax_t{1}, (bytes + (1 << 19)) >> 20));
+    }
+    return QObject::tr("%1 GB").arg(Gigabytes(bytes));
+}
+
+/// The import runs before logging starts: its log lines wait here for CatchUpShaderCache.
+std::vector<std::string>& PendingLogLines() {
+    static std::vector<std::string> lines;
+    return lines;
+}
+
 struct ImportPlan {
     Migration::Plan plan;
     std::vector<QString> linked; ///< Folders linked instead of copied (not enough free space)
     std::uintmax_t copy_bytes{};
+    FrontendCommon::ShaderCacheCopy shaders; ///< v5.9: the old shader cache (Eden, Lichii)
+    fs::path shader_source;
+    bool shaders_no_room{}; ///< There was a shader cache, but not the disk space for it
 };
 
-/// Settings, keys, mods, saves and the small user folders are copied; caches, logs, dumps and
-/// screenshots are not (shaders are prepared again on the first boot). nand and sdmc are linked
-/// instead when copying them would not fit.
+/// Settings, keys, mods, saves and the small user folders are copied, and (v5.9) Eden's or
+/// Lichii's shader cache; other caches, logs, dumps and screenshots are not. nand and sdmc are
+/// linked instead when copying them would not fit; the shader cache is left out then.
 ImportPlan PlanImport(const OldProfile& old, const ProfileImportChoice& choice) {
     using namespace Common::FS;
     ImportPlan result;
@@ -385,7 +409,7 @@ ImportPlan PlanImport(const OldProfile& old, const ProfileImportChoice& choice) 
     if (choice.settings) {
         add(old.config, GetEdenPath(EdenPath::ConfigDir));
         folders.insert(folders.end(), {TAS_DIR, ICONS_DIR, POST_SHADER_DIR, POST_PRESET_DIR,
-                                       LOSSLESS_DIR, STREAMLINE_DIR, FIDELITYFX_DIR});
+                                       STREAMLINE_DIR, FIDELITYFX_DIR});
     }
     if (choice.saves) {
         folders.insert(folders.end(), {KEYS_DIR, AMIIBO_DIR, PLAY_TIME_DIR});
@@ -418,6 +442,26 @@ ImportPlan PlanImport(const OldProfile& old, const ProfileImportChoice& choice) 
         } else {
             result.linked.push_back(QString::fromLatin1(name));
             add(source, destination / name, Migration::Strategy::Link);
+        }
+    }
+    // v5.9: the shader cache too, so games don't build every shader again (players who
+    // imported with v5.8 stuttered "every few steps" until it refilled). Copied file by file
+    // beside what Fritchii has, not through the plan: nothing of Fritchii's cache is replaced.
+    if (old.family && !result.plan.roots.empty()) {
+        result.shader_source = old.cache / SHADER_DIR;
+        auto shaders = FrontendCommon::PlanShaderCacheCopy({result.shader_source},
+                                                           GetEdenPath(EdenPath::ShaderDir));
+        constexpr std::uintmax_t Spare = std::uintmax_t{1} << 30;
+        if (shaders.files.empty()) {
+            // nothing there, or Fritchii has it all
+        } else if (shaders.bytes + Spare <= free_bytes) {
+            result.copy_bytes += shaders.bytes;
+            result.shaders = std::move(shaders);
+        } else {
+            result.shaders_no_room = true;
+            PendingLogLines().push_back(fmt::format(
+                "Import: shader cache {} not copied ({} MiB): not enough free disk space",
+                PathToUTF8String(result.shader_source), shaders.bytes >> 20));
         }
     }
     return result;
@@ -464,7 +508,12 @@ std::optional<ProfileImportChoice> UserDataMigrator::AskImport(QWidget* parent, 
     auto* layout = new QVBoxLayout(&dialog);
     layout->setSpacing(12);
     QFont big = dialog.font();
-    big.setPointSizeF(big.pointSizeF() * 1.15);
+    // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+    if (big.pointSizeF() > 0) {
+        big.setPointSizeF(big.pointSizeF() * 1.15);
+    } else if (big.pixelSize() > 0) {
+        big.setPixelSize(static_cast<int>(big.pixelSize() * 1.15 + 0.5));
+    }
     auto* text = new QLabel(
         from_menu ? QObject::tr("Copy your data from another folder?\nFritchii restarts and "
                                 "copies it over its own. What it has now is kept as a backup.")
@@ -519,6 +568,133 @@ std::optional<ProfileImportChoice> UserDataMigrator::AskImport(QWidget* parent, 
     };
 }
 
+void UserDataMigrator::CatchUpShaderCache(QWidget* parent) {
+    using namespace Common::FS;
+    for (const auto& line : PendingLogLines()) {
+        LOG_INFO(Frontend, "{}", line);
+    }
+    PendingLogLines().clear();
+#ifndef __ANDROID__
+    if (IsPortableMode() || FrontendCommon::ShaderCacheCatchUpDone()) {
+        return;
+    }
+    // For players whose data an import brought over (v5.8 left the shader cache behind).
+    // "Start fresh" stays fresh; an unfinished import is finished first, on the next launch.
+    const auto state = Migration::GetState(FrontendCommon::ProfileImportStateDirectory());
+    if (state == Migration::State::Pending) {
+        return;
+    }
+    if (state != Migration::State::Complete) {
+        FrontendCommon::MarkShaderCacheCatchUpDone();
+        return;
+    }
+    struct Source {
+        QString folder;
+        fs::path shaders;
+    };
+    const std::array<Source, 2> sources{
+        Source{QString::fromStdString(PathToUTF8String(GetLegacyPath(LegacyEdenDir).filename())),
+               GetLegacyPath(LegacyEdenCacheDir) / SHADER_DIR},
+        Source{QString::fromStdString(PathToUTF8String(GetLegacyPath(LichiiDir).filename())),
+               GetLegacyPath(LichiiCacheDir) / SHADER_DIR},
+    };
+    std::vector<fs::path> roots;
+    for (const auto& source : sources) {
+        std::error_code ec;
+        if (fs::is_directory(source.shaders, ec)) {
+            roots.push_back(source.shaders);
+        }
+    }
+    const auto& destination = GetEdenPath(EdenPath::ShaderDir);
+    // Both Eden and Lichii: newest wins per file.
+    const auto plan = FrontendCommon::PlanShaderCacheCopy(roots, destination);
+    if (plan.files.empty()) {
+        FrontendCommon::MarkShaderCacheCatchUpDone();
+        return;
+    }
+    QStringList folders;
+    std::string from_text;
+    for (const auto& source : sources) {
+        const bool used = std::ranges::any_of(plan.files, [&](const auto& file) {
+            const auto relative = file.source.lexically_relative(source.shaders);
+            return !relative.empty() && *relative.begin() != "..";
+        });
+        if (used) {
+            folders << source.folder;
+            from_text += (from_text.empty() ? "" : " and ") + PathToUTF8String(source.shaders);
+        }
+    }
+    if (!FrontendCommon::HasRoomForShaderCache(destination, plan.bytes)) {
+        // Tried again on the next launch.
+        LOG_INFO(Frontend, "Shader cache from {} not copied ({} MiB): not enough free disk space",
+                 from_text, plan.bytes >> 20);
+        return;
+    }
+    const QString where = folders.size() == 1
+                              ? QObject::tr("the %1 folder").arg(folders.value(0))
+                              : QObject::tr("the %1 and %2 folders").arg(folders.value(0),
+                                                                         folders.value(1));
+
+    // A few GB take a while: a worker copies, the dialog shows how far it got.
+    std::atomic<std::uintmax_t> copied{0};
+    FrontendCommon::ShaderCacheCopyResult result;
+    QProgressDialog progress(parent);
+    progress.setWindowTitle(QStringLiteral("Fritchii"));
+    progress.setLabelText(QObject::tr("Copying your shader cache from %1 (%2)...")
+                              .arg(where, SizeText(plan.bytes)));
+    progress.setRange(0, 1000);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumDuration(0);
+    progress.setCancelButton(nullptr);
+    progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+    progress.setWindowModality(Qt::ApplicationModal);
+    QEventLoop loop;
+    bool done = false;
+    QObject::connect(&progress, &QDialog::rejected, &progress, [&] {
+        if (!done) {
+            progress.show();
+        }
+    });
+    QTimer timer;
+    timer.setInterval(100);
+    QObject::connect(&timer, &QTimer::timeout, &progress, [&] {
+        const auto total = (std::max)(plan.bytes, std::uintmax_t{1});
+        progress.setValue(static_cast<int>(copied.load(std::memory_order_relaxed) * 1000 / total));
+    });
+    QThread* thread =
+        QThread::create([&] { result = FrontendCommon::CopyShaderCache(plan, &copied); });
+    QObject::connect(thread, &QThread::finished, &loop, [&] {
+        done = true;
+        loop.quit();
+    });
+    thread->start();
+    timer.start();
+    progress.show();
+    loop.exec();
+    thread->wait();
+    delete thread;
+    timer.stop();
+    progress.close();
+
+    LOG_INFO(Frontend, "Copied {} shader cache files ({} MiB) from {} to {}{}", result.files,
+             result.bytes >> 20, from_text, PathToUTF8String(destination),
+             result.failed == 0 ? std::string{}
+                                : fmt::format("; {} failed, first: {}", result.failed,
+                                              result.first_error));
+    // Once, whatever came of it.
+    FrontendCommon::MarkShaderCacheCatchUpDone();
+    if (result.files == 0) {
+        return;
+    }
+    QMessageBox::information(
+        parent, QStringLiteral("Fritchii"),
+        QObject::tr("Copied your shader cache from %1 (%2), so games don't have to build "
+                    "their shaders again.")
+            .arg(where, SizeText(result.bytes)));
+#endif
+}
+
 void UserDataMigrator::AutoImport(QMainWindow* main_window,
                                   std::optional<ProfileImportChoice> request) {
     using namespace Common::FS;
@@ -554,6 +730,7 @@ void UserDataMigrator::AutoImport(QMainWindow* main_window,
 
     QString failure;
     bool busy = false;
+    FrontendCommon::ShaderCacheCopyResult shader_result;
     const auto run = [&](const ImportPlan& import) {
         failure.clear();
         // The other emulator still running on that profile would change files mid-copy.
@@ -597,6 +774,10 @@ void UserDataMigrator::AutoImport(QMainWindow* main_window,
                     fs::copy_file(switches, destination / "nx2_switches.txt");
                 }
 #endif
+                // Last, once the data is in place: a file that fails is only a cache miss.
+                if (!import.shaders.files.empty()) {
+                    shader_result = FrontendCommon::CopyShaderCache(import.shaders);
+                }
             } catch (const std::exception& exception) {
                 failure = QString::fromUtf8(exception.what());
                 if (failure.isEmpty()) {
@@ -658,9 +839,34 @@ void UserDataMigrator::AutoImport(QMainWindow* main_window,
             text += QObject::tr("\n\nFritchii's previous data is kept next to it, in the folders "
                                 "ending in \".backup\".");
         }
-        text += QObject::tr("\n\nShaders get prepared again the first time you start a game.\n"
-                            "Your old folder was not changed: %1")
-                    .arg(old_text);
+        // v5.9: the shader cache came along (Eden and Lichii folders).
+        if (!import.shaders.files.empty()) {
+            PendingLogLines().push_back(fmt::format(
+                "Import: copied {} shader cache files ({} MiB) from {} to {}{}",
+                shader_result.files, shader_result.bytes >> 20,
+                PathToUTF8String(import.shader_source),
+                PathToUTF8String(GetEdenPath(EdenPath::ShaderDir)),
+                shader_result.failed == 0
+                    ? std::string{}
+                    : fmt::format("; {} failed, first: {}", shader_result.failed,
+                                  shader_result.first_error)));
+        }
+        if (shader_result.files > 0) {
+            text += QObject::tr("\n\nShader cache: copied (%1 files, %2).")
+                        .arg(shader_result.files)
+                        .arg(SizeText(shader_result.bytes));
+        } else if (import.shaders_no_room) {
+            text += QObject::tr("\n\nShader cache: not copied, not enough disk space.\n"
+                                "Shaders get prepared again the first time you start a game.");
+        } else {
+            text += QObject::tr("\n\nShaders get prepared again the first time you start a game.");
+        }
+        // The import settled the shader cache: the startup catch-up has nothing to do, unless
+        // the disk was too full (it tries again then).
+        if (!import.shaders_no_room) {
+            FrontendCommon::MarkShaderCacheCatchUpDone();
+        }
+        text += QObject::tr("\nYour old folder was not changed: %1").arg(old_text);
         QMessageBox box(QMessageBox::Information, QStringLiteral("Kizuna"), text,
                         QMessageBox::Ok, main_window);
         auto* open = box.addButton(QObject::tr("Open folder"), QMessageBox::ActionRole);

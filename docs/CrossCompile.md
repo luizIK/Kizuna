@@ -41,7 +41,7 @@ alias qemu-aarch64="qemu-aarch64 -L /usr/aarch64-unknown-linux-gnu"
 
 ### Dependencies
 
-Dependencies are the same [as normal Gentoo](./Deps.md#Commands); simply replace the `emerge` command with `emerge-<target>-unknown-linux-gnu` (e.g. `emerge-aarch64-unknown-linux-gnu`). However, there are a few caveats:
+Dependencies are the same as for a normal Gentoo build; simply replace the `emerge` command with `emerge-<target>-unknown-linux-gnu` (e.g. `emerge-aarch64-unknown-linux-gnu`). However, there are a few caveats:
 
 #### Enabling GURU
 

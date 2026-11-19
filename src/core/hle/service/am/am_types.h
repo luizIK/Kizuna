@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -202,7 +201,7 @@ enum class ProgramSpecifyKind : u32 {
     RestartProgram = 2,
 };
 
-// Maufeat: Use enums for zindex instead of using random zindex numbers
+// TODO: Use enums for zindex instead of using random zindex numbers
 enum AppletZIndex : s32 {
     Background = 0,
     Foreground = 1,

@@ -10,7 +10,7 @@
 
 namespace VideoCommon::NativeIndirectReset {
 
-// Bananza's pointer-list reset kernel, captured in the pre-upstream fork.
+// Bananza's pointer-list reset kernel, captured in an earlier fork.
 inline constexpr std::array<u32, 44> Program{
     0xff007321, 0x0002fcff, 0x00000000, 0x000e2400, 0x00007a11, 0x00004400, 0x078018ff,
     0x001fca00, 0xff017624, 0x00004500, 0x000e06ff, 0x000fcc00, 0x00007381, 0x00000000,

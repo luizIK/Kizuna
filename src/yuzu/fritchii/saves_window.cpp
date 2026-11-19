@@ -192,7 +192,12 @@ void ShowSavesWindow(QWidget* parent, const std::function<bool()>& emulation_run
     dialog.setWindowTitle(QObject::tr("Saves"));
     dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     QFont big = dialog.font();
-    big.setPointSizeF(big.pointSizeF() * 1.15);
+    // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+    if (big.pointSizeF() > 0) {
+        big.setPointSizeF(big.pointSizeF() * 1.15);
+    } else if (big.pixelSize() > 0) {
+        big.setPixelSize(static_cast<int>(big.pixelSize() * 1.15 + 0.5));
+    }
     dialog.setFont(big);
     auto* layout = new QGridLayout(&dialog);
     layout->setHorizontalSpacing(12);

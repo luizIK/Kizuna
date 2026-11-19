@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// MainWindow's Fritchii setup, kept out of main_window.cpp so Lichii merges stay clean. It runs
-// once at the end of the constructor and does nothing in a Lichii build.
+// MainWindow's Fritchii setup, kept out of main_window.cpp so merges stay clean. It runs
+// once at the end of the constructor and does nothing in a build without the Fritchii look.
 
 #include <QApplication>
 #include <QMessageBox>
@@ -164,7 +164,11 @@ void MainWindow::SetUpFritchiiUi() {
     // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
     auto* gate = new FritchiiUi::PrecompileGate(
         this, statusBar(),
-        {.pause = [this] { OnPauseGame(); },
+        {.pause =
+             [this] {
+                 LOG_INFO(Frontend, "Pausing: shader preparation");
+                 OnPauseGame();
+             },
          .resume = [this] { OnStartGame(); },
          .game_name = [] {
              return QtCommon::system &&

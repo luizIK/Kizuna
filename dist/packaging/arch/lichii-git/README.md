@@ -1,7 +1,7 @@
 # Arch Linux development package
 
-This directory contains a draft `lichii-git` PKGBUILD, adapted from Eglantine's
-packaging request in [issue #167](https://github.com/Djihads80/Eglantine/issues/167).
+This directory contains a draft `lichii-git` PKGBUILD, written for a community
+packaging request.
 It builds the `nx2` branch from source against Arch's system Qt, SDL3 and FFmpeg.
 That avoids shipping Ubuntu-linked binaries to a rolling-release distribution
 and gives the Qt frontend access to the host's platform plugins, including

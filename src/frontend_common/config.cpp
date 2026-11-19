@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <string_view>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -13,6 +17,7 @@
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
 #include "config.h"
+#include "core/file_sys/patch_manager.h"
 #include "frontend_common/profile_import.h"
 
 #ifdef _WIN32
@@ -349,6 +354,144 @@ void Config::ReadDisabledAddOnValues() {
     EndGroup();
 }
 
+namespace {
+constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+constexpr std::string_view MaxResolutionName = "Max Resolution (built-in)";
+
+// The mods on disk now, per title: load/<title>/ folders and cheat_ files, and "SDMC" for the SD
+// card's atmosphere/contents/<title>/ (the names FileSys::PatchManager lists them by).
+std::map<u64, std::vector<std::string>> ModsOnDisk() {
+    std::map<u64, std::vector<std::string>> out;
+    const auto parse_title = [](const std::filesystem::path& path) -> std::optional<u64> {
+        const std::string name = FS::PathToUTF8String(path.filename());
+        if (name.size() != 16 ||
+            !std::ranges::all_of(name, [](char c) { return std::isxdigit(u8(c)) != 0; })) {
+            return std::nullopt;
+        }
+        return std::stoull(name, nullptr, 16);
+    };
+    std::error_code error;
+    for (const auto& title : std::filesystem::directory_iterator(
+             FS::GetEdenPath(FS::EdenPath::LoadDir), error)) {
+        const auto title_id = parse_title(title.path());
+        if (!title_id || !title.is_directory(error)) {
+            continue;
+        }
+        std::error_code inner;
+        for (const auto& mod : std::filesystem::directory_iterator(title.path(), inner)) {
+            std::string name = FS::PathToUTF8String(mod.path().filename());
+            if (mod.is_directory(inner) || name.starts_with("cheat_")) {
+                out[*title_id].push_back(std::move(name));
+            }
+        }
+    }
+    for (const auto& title : std::filesystem::directory_iterator(
+             FS::GetEdenPath(FS::EdenPath::SDMCDir) / "atmosphere" / "contents", error)) {
+        if (const auto title_id = parse_title(title.path());
+            title_id && title.is_directory(error) &&
+            !std::filesystem::is_empty(title.path(), error)) {
+            out[*title_id].emplace_back("SDMC");
+        }
+    }
+    return out;
+}
+} // Anonymous namespace
+
+// New mods start disabled (FileSys::PatchManager): the add-on names Fritchii has seen per title.
+// The first time a config is read by such a build, tracking starts:
+// - a config used before (Frizti's config/frizti.ini, a disabled list or a tuned settings
+//   revision): every mod on disk now is seen and keeps its state, as the player chose them;
+// - a new config: nothing is seen, so every mod there starts disabled when first listed.
+// Max Resolution (built-in) is off by default (owner 2026-11-18): a new config starts with it
+// disabled; a config used before keeps its state (Fritchii's one-time v6 prompt covers those).
+// Once seen, the player's choice for any add-on sticks. The other built-ins, game updates and
+// DLC are never on this list.
+void Config::ReadSeenAddOnValues() {
+    const auto lock = FileSys::PatchManager::LockAddOns();
+    BeginGroup(std::string("SeenAddOns"));
+    const bool tracking = ReadBooleanSetting(std::string("tracking"));
+    Settings::values.seen_addons.clear();
+    const int size = BeginArray(std::string(""));
+    for (int i = 0; i < size; ++i) {
+        SetArrayIndex(i);
+        const auto title_id = ReadUnsignedIntegerSetting(std::string("title_id"), 0);
+        std::vector<std::string> out;
+        const int s_size = BeginArray("seen");
+        for (int j = 0; j < s_size; ++j) {
+            SetArrayIndex(j);
+            out.push_back(ReadStringSetting(std::string("s"), std::string("")));
+        }
+        EndArray(); // seen
+        Settings::values.seen_addons.insert_or_assign(title_id, std::move(out));
+    }
+    EndArray();
+    EndGroup();
+
+    if (!tracking) {
+        const bool used_before =
+            FS::Exists(FS::GetEdenPath(FS::EdenPath::ConfigDir) / "frizti.ini") ||
+            !Settings::values.disabled_addons.empty() ||
+            Settings::values.frizti_settings_revision.GetValue() > 0;
+        auto& oot_seen = Settings::values.seen_addons[OcarinaOfTimeId];
+        if (used_before) {
+            std::size_t mods = 0;
+            for (auto& [title_id, names] : ModsOnDisk()) {
+                auto& seen = Settings::values.seen_addons[title_id];
+                for (auto& name : names) {
+                    if (std::ranges::find(seen, name) == seen.end()) {
+                        seen.push_back(std::move(name));
+                        ++mods;
+                    }
+                }
+            }
+            LOG_INFO(Config, "Mods: new mods start disabled from now on; the {} already there "
+                             "keep their state", mods);
+        } else {
+            auto& disabled = Settings::values.disabled_addons[OcarinaOfTimeId];
+            if (std::ranges::find(disabled, MaxResolutionName) == disabled.end()) {
+                disabled.emplace_back(MaxResolutionName);
+            }
+            LOG_INFO(Config, "Mods: new config, every mod starts disabled (Max Resolution too)");
+        }
+        if (std::ranges::find(oot_seen, MaxResolutionName) == oot_seen.end()) {
+            oot_seen.emplace_back(MaxResolutionName);
+        }
+    }
+    Settings::values.seen_addons_tracking = true;
+}
+
+void Config::SaveSeenAddOnValues() {
+    BeginGroup(std::string("SeenAddOns"));
+    WriteBooleanSetting(std::string("tracking"), Settings::values.seen_addons_tracking);
+    int i = 0;
+    BeginArray(std::string(""));
+    for (const auto& [title_id, names] : Settings::values.seen_addons) {
+        SetArrayIndex(i);
+        WriteIntegerSetting(std::string("title_id"), title_id, std::make_optional(u64(0)));
+        BeginArray(std::string("seen"));
+        for (std::size_t j = 0; j < names.size(); ++j) {
+            SetArrayIndex(int(j));
+            WriteStringSetting(std::string("s"), names[j], std::make_optional(std::string("")));
+        }
+        EndArray(); // seen
+        ++i;
+    }
+    EndArray();
+    EndGroup();
+}
+
+void Config::SaveAddOnValues() {
+    if (!global) {
+        return;
+    }
+    {
+        const auto lock = FileSys::PatchManager::LockAddOns();
+        SaveDisabledAddOnValues();
+        SaveSeenAddOnValues();
+    }
+    WriteToIni();
+}
+
 void Config::ReadMiscellaneousValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Miscellaneous));
 
@@ -441,6 +584,10 @@ void Config::ReadValues() {
     ReadRendererValues();
     ReadAudioValues();
     ReadSystemValues();
+    if (global) {
+        // After the data paths, the disabled list and the tuned settings revision it looks at.
+        ReadSeenAddOnValues();
+    }
 }
 
 void Config::SavePlayerValues(const std::size_t player_index) {
@@ -523,7 +670,11 @@ void Config::SaveValues() {
     if (global) {
         LOG_DEBUG(Config, "Saving global generic configuration values");
         SaveDataStorageValues();
-        SaveDisabledAddOnValues();
+        {
+            const auto lock = FileSys::PatchManager::LockAddOns();
+            SaveDisabledAddOnValues();
+            SaveSeenAddOnValues();
+        }
         SaveWebServiceValues();
         SaveMiscellaneousValues();
     } else {

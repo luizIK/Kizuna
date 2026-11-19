@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -12,6 +11,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <span>
 
@@ -32,6 +33,14 @@ class DeviceMemory;
 namespace Memory {
 class Memory;
 }
+
+/// Moved each time a GPU cache takes guest memory's bytes as clean again (pages tracked again by
+/// UpdatePagesCachedCount with a positive delta, collected CPU writes taken by a dirty manager's
+/// Gather). A CPU write marks its pages before it stores its bytes (Core::Memory's Write), so a
+/// cache that takes the marks in between can upload the old bytes and treat them as current; a
+/// write that sees this value move across its store marks its pages again (NoteStoredWrite in
+/// core/memory.cpp, FRITCHII_WRITE_REMARK). Only equality is compared.
+inline std::atomic<u64> g_pages_tracked_generation{};
 
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator;
@@ -129,10 +138,25 @@ public:
         return translation_generation.load(std::memory_order_acquire);
     }
 
+    /// The bytes from `address` (at most `size`) before the first device page with no host
+    /// backing, which ReadBlock reads as zeros (FRITCHII_BARE_SSBO_CLAMP). One table read a page.
+    [[nodiscard]] size_t BackedPrefix(DAddr address, size_t size) const {
+        const DAddr end = address + size;
+        for (DAddr page = address & ~DAddr{page_mask}; page < end; page += page_size) {
+            if (tracked_entries[page >> page_bits].compressed_physical_ptr == 0) {
+                return page <= address ? 0 : static_cast<size_t>(page - address);
+            }
+        }
+        return size;
+    }
+
     void ReadBlock(DAddr address, void* dest_pointer, size_t size);
     void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
+    /// EXP92: bytes stored in place through a span (Core::Memory::GuestMemoryScoped), after
+    /// they landed: noted for the uniform keeps (Common::UniformKeepPages).
+    void NoteHostStore(DAddr address, size_t size);
 
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);
@@ -144,6 +168,11 @@ public:
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
+
+    /// EXP89 (lingering protection, fable52_answer_after88 1.3): once a frame, from the
+    /// rasterizer's TickFrame. Raises the lingering frame and really uncaches the pages that
+    /// lingered more than EXP89 frames (all of them with EXP89 = 0).
+    void ReleaseLingering();
 
 private:
     struct TranslationEntry {
@@ -174,6 +203,31 @@ private:
 
     // Internal helper that performs the update assuming the caller already holds the necessary lock.
     void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
+
+    /// DeviceMethods::MarkRegionCaching, counted and timed under EDEN_NX2_PROTECT_STATS=1.
+    void MarkCaching(Memory::Memory* memory_inter, u64 vaddr, u64 bytes, bool cached);
+
+    // EXP89 lingering protection. The caller holds counter_guard for the page; linger_mutex is
+    // only ever taken after counter_guard, never before.
+    /// Count 1 -> 0: leaves the page protected and notes it with the lingering frame. False when
+    /// it can't linger (no process interface, or no sweep ran yet: no TickFrame calls it).
+    bool NoteLingering(size_t page, Memory::Memory* memory_inter);
+    /// Count 0 -> 1: true when the page was lingering (still protected; the note is dropped).
+    bool TakeLingering(size_t page);
+    /// Uncaches the noted pages of `pages` (sorted device pages with the frame they were seen
+    /// noted with) that are still noted (with that frame when `match_frame`), per run of
+    /// consecutive device pages under counter_guard. Returns the pages uncached.
+    size_t ReleaseLingeringPages(std::span<const std::pair<u64, u32>> pages, bool match_frame);
+    /// Uncaches the noted pages of a device range, whatever their age (Map, Unmap).
+    void ReleaseLingeringRange(DAddr address, size_t size);
+    /// EXP92 (Common::UniformKeepPages): gives back the page watches the uniform keeps hold on a
+    /// device range whose backing is about to change (Map, Unmap). One load while none is held.
+    void UnwatchUniformKeepPages(DAddr address, size_t size);
+    /// Uncaches every noted page (UnregisterProcess).
+    void ReleaseAllLingering();
+    /// MarkRegionCaching(false) for sorted device pages, per run of consecutive guest pages of
+    /// one process. The caller holds counter_guard for them.
+    void UncacheDevicePages(std::span<const u64> pages);
 
 private:
     static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
@@ -283,6 +337,16 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    // EXP89 lingering protection: device page number -> lingering frame it was noted in. Pages
+    // here have a cached count of 0 but are still protected. Dropped without calls when the
+    // manager is destroyed (the process interfaces may be gone by then).
+    std::mutex linger_mutex;
+    std::unordered_map<u64, u32> lingering;
+    /// lingering.size(), changed under linger_mutex: TakeLingering's lock-free "nothing noted".
+    std::atomic<size_t> lingering_count{0};
+    /// Raised once a frame by ReleaseLingering; 0 until the first sweep.
+    std::atomic<u32> linger_frame{0};
 
 
 };

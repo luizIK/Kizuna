@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
@@ -18,19 +17,26 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <bit>
+#include <iterator>
 #include <numeric>
 #include "common/alignment.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/nx2_timeline.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
 #include "video_core/fsr.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/small_card.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -40,6 +46,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -48,6 +55,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -196,9 +204,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // level 0 block count shifted down (341 texels: 86 blocks at level 0, 85 texels = 22 blocks at
 // level 2, not 86 >> 2 = 21). On AMD (RX 6600 XT, Windows driver) the BC1/BC3 copies of such
 // images show dark lines along the seams of distant terrain in title 1; RGBA8 copies don't.
-// Kizuna: the first such level, or the level count when there is none (768x768: level 7, 6x6
-// texels = 2 blocks where 192 >> 7 = 1; 683x683: level 1).
-[[nodiscard]] s32 FirstUnevenBlockLevel(const ImageInfo& info) {
+[[nodiscard]] bool HasUnevenBlockMips(const ImageInfo& info) {
     const u32 blocks_x = Common::DivCeil(info.size.width, 4U);
     const u32 blocks_y = Common::DivCeil(info.size.height, 4U);
     for (s32 level = 1; level < info.resources.levels; ++level) {
@@ -206,45 +212,16 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         const u32 level_y = Common::DivCeil((std::max)(info.size.height >> level, 1U), 4U);
         if (level_x != (std::max)(blocks_x >> level, 1U) ||
             level_y != (std::max)(blocks_y >> level, 1U)) {
-            return level;
+            return true;
         }
     }
-    return info.resources.levels;
+    return false;
 }
-
-[[nodiscard]] bool HasUnevenBlockMips(const ImageInfo& info) {
-    return FirstUnevenBlockLevel(info) < info.resources.levels;
-}
-
-// Kizuna: how ASTC images with uneven block mips are handled on AMD (EDEN_NX2_ASTC_UNEVEN_RGBA8):
-// '1' keeps them all as RGBA8 (Fritchii: 4-8x the memory, out of memory at Ocarina's scene
-// changes), '0' keeps them all as BC with their views cut at the first uneven level, unset does
-// that only when the levels kept go down to MaxUnevenTailTexels and RGBA8 otherwise.
-enum class UnevenAstcMode {
-    Auto,
-    AllRgba8,
-    AllBc,
-};
-
-[[nodiscard]] UnevenAstcMode GetUnevenAstcMode() {
-    static const UnevenAstcMode mode = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_RGBA8");
-        if (value == nullptr || value[0] == '\0') {
-            return UnevenAstcMode::Auto;
-        }
-        return value[0] == '1' ? UnevenAstcMode::AllRgba8 : UnevenAstcMode::AllBc;
-    }();
-    return mode;
-}
-
-// Past this size the last level a cut view keeps would shimmer far away: such images stay RGBA8.
-// 64: Ocarina's town has hundreds of 576x576 textures (even down to 36x36), 1.7 MiB each as RGBA8.
-constexpr u32 MaxUnevenTailTexels = 64;
 
 // ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
-// an AMD driver, which samples the BC copy wrong from the first uneven level on: dark lines along
-// the seams of distant tiled terrain (title 1 in Fritchii, Ocarina's Hyrule Field in Kizuna).
-[[nodiscard]] bool IsUnevenBcCandidate(const Device& device, const ImageInfo& info) {
+// an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
+// arrays.
+[[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
@@ -257,103 +234,6 @@ constexpr u32 MaxUnevenTailTexels = 64;
         return false;
     }
     return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
-}
-
-// Kizuna: an image of IsUnevenBcCandidate whose even levels stop too early to cut its views there
-// (683x683: level 0 only) is kept as BC all the same, a few texels larger: at the size, up to 1/8
-// more, with the most even levels (683 -> 768: 7 levels down to 12x12, like a 768x768 image;
-// 1365 -> 1536: 8). The BC encoder resamples every level to it (bc_encoder.comp) and sampling is
-// by normalized coordinates, so the image covers what it did, a little softer.
-//
-// These were RGBA8: 4x the memory of BC3 and 8x that of BC1. Ocarina's handheld textures are 2/3
-// of their docked size (1365, 683, 341, 171), so that was most of them; its two 1365x1365x90
-// terrain arrays alone held 1.8 GiB of the 5 GiB an RX 6600 had to give next to a browser. The
-// device stayed 1 GiB over the collector's critical threshold all session and Hyrule Field ran at
-// 19-25 FPS re-decoding 60-150 evicted textures a second (2026-11-13).
-// EDEN_NX2_ASTC_UNEVEN_PAD=0 keeps them RGBA8.
-struct PaddedBcShape {
-    u32 width;
-    u32 height;
-    s32 levels; ///< The even levels its views keep
-};
-
-[[nodiscard]] std::optional<PaddedBcShape> GetPaddedBcShape(const Device& device,
-                                                            const ImageInfo& info) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_PAD");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (!enabled || GetUnevenAstcMode() != UnevenAstcMode::Auto ||
-        !IsUnevenBcCandidate(device, info)) {
-        return std::nullopt;
-    }
-    {
-        // The image as it is keeps enough even levels: its views are cut, nothing is resampled.
-        const u32 last = static_cast<u32>(FirstUnevenBlockLevel(info) - 1);
-        if ((std::max)((std::max)(info.size.width >> last, 1U),
-                       (std::max)(info.size.height >> last, 1U)) <= MaxUnevenTailTexels) {
-            return std::nullopt;
-        }
-    }
-    constexpr u32 max_size = 16384; // every desktop driver's maxImageDimension2D or less
-    for (s32 levels = info.resources.levels; levels >= 1; --levels) {
-        // Level 0 a multiple of 4 << (levels - 1) texels: every level before `levels` is whole
-        // blocks, half the level before it.
-        const u32 align = 4U << (levels - 1);
-        const u32 width = Common::AlignUp(info.size.width, align);
-        const u32 height = Common::AlignUp(info.size.height, align);
-        // 1/8 and a block: 1365 -> 1536 and 341 -> 384 are 12.5% and a texel.
-        if (width > info.size.width + info.size.width / 8 + 4 ||
-            height > info.size.height + info.size.height / 8 + 4 || width > max_size ||
-            height > max_size) {
-            continue;
-        }
-        ImageInfo padded = info;
-        padded.size.width = width;
-        padded.size.height = height;
-        const s32 even_levels = FirstUnevenBlockLevel(padded);
-        // No larger size has more even levels: when even this one cuts the views too early, the
-        // image stays RGBA8.
-        if (even_levels < info.resources.levels &&
-            (std::max)(width, height) >> (even_levels - 1) > MaxUnevenTailTexels) {
-            return std::nullopt;
-        }
-        return PaddedBcShape{
-            .width = width,
-            .height = height,
-            .levels = even_levels,
-        };
-    }
-    return std::nullopt;
-}
-
-// Kizuna: the levels the views of such an image keep when it stays BC (the even ones before the
-// first uneven level: 7 of 768x768's 10, down to 12x12), or 0 when it is kept as RGBA8 instead.
-// Sampling then stops at the last even level, a few texels coarser far away than the game asked:
-// no dark lines, and BC's memory (768x768 BC1: 0.4 MiB, RGBA8: 3 MiB).
-[[nodiscard]] s32 UnevenBcSampledLevels(const Device& device, const ImageInfo& info) {
-    if (!IsUnevenBcCandidate(device, info)) {
-        return 0;
-    }
-    const UnevenAstcMode mode = GetUnevenAstcMode();
-    if (mode == UnevenAstcMode::AllRgba8) {
-        return 0;
-    }
-    const s32 levels = FirstUnevenBlockLevel(info);
-    const u32 last = static_cast<u32>(levels - 1);
-    const u32 tail = (std::max)((std::max)(info.size.width >> last, 1U),
-                                (std::max)(info.size.height >> last, 1U));
-    if (mode == UnevenAstcMode::Auto && tail > MaxUnevenTailTexels) {
-        const auto padded = GetPaddedBcShape(device, info);
-        return padded ? padded->levels : 0;
-    }
-    return levels;
-}
-
-// Kept as the GPU decoder's RGBA8 instead of BC, like huge arrays: the uneven-mip images that
-// UnevenBcSampledLevels does not keep as BC.
-[[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
-    return IsUnevenBcCandidate(device, info) && UnevenBcSampledLevels(device, info) == 0;
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -543,13 +423,6 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
-    if (const auto padded = GetPaddedBcShape(device, info)) {
-        // Kizuna: a BC copy a few texels larger than the image (GetPaddedBcShape).
-        ImageInfo host = info;
-        host.size.width = padded->width;
-        host.size.height = padded->height;
-        return host;
-    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -702,6 +575,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             }
         }
     }
+    // EDEN_NX2_GPU_PROFILE: the create (vkCreateImage, VMA allocate and bind) as its own zone.
+    VideoCommon::Nx2Profile::Scope create_scope{VideoCommon::Nx2Profile::Zone::ImageCreate};
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
@@ -992,11 +867,6 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
 
 // A guest view's levels on a host image that keeps only levels >= host_level_offset.
 [[nodiscard]] SubresourceRange HostRange(const Image& image, SubresourceRange range) {
-    // Kizuna: views of a BC copy with uneven block mips stop before its first uneven level.
-    if (const s32 limit = image.sampled_level_limit;
-        limit > 0 && range.base.level < limit) {
-        range.extent.levels = (std::min)(range.extent.levels, limit - range.base.level);
-    }
     const s32 skip = static_cast<s32>(image.host_level_offset);
     if (skip == 0) {
         return range;
@@ -1435,6 +1305,21 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
+
+// FRITCHII_BC1_KEEPS_ALPHA (boot, default 0; 1 on): BC1 for every ASTC image turns alpha into a
+// 1-bit cutout (punch-through, black texels where the alpha holds mask data: dark faces and
+// banding in OoT). The BC3 path already sends the images its opaque scan clears to BC1 and keeps
+// the others in BC3, so with the switch on the BC1 setting runs that path for this session.
+void UseOpaqueScanForBc1(const Device& device) {
+    const char* value = std::getenv("FRITCHII_BC1_KEEPS_ALPHA");
+    if (value == nullptr || value[0] != '1' || device.IsOptimalAstcSupported() ||
+        Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path "
+                            "(opaque textures BC1, textures with alpha BC3) for this session");
+    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -1448,9 +1333,14 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       staging_buffer_pool{staging_buffer_pool_}, blit_image_helper{blit_image_helper_},
       render_pass_cache{render_pass_cache_}, descriptor_pool{descriptor_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
-      resolution{Settings::values.resolution_info} {
+      resolution{Settings::values.resolution_info},
+      image_free_queue{device_.IsAllocatorThreadSafe()} {
+    max_scaled_extent = (std::min)({device.GetMaxImageDimension2D(),
+                                    device.GetMaxFramebufferWidth(),
+                                    device.GetMaxFramebufferHeight()});
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    UseOpaqueScanForBc1(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
@@ -1491,11 +1381,13 @@ void TextureCacheRuntime::Finish() {
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
+    return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred,
+                                       VideoCommon::BufferChurnStats::StagingCaller::TextureUpload);
 }
 
 StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+    return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred,
+                                       VideoCommon::BufferChurnStats::StagingCaller::TextureDownload);
 }
 
 void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
@@ -2505,9 +2397,15 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const VkImage src_image = src.ImageHandle();
     const VkImageSubresourceLayers dst_layers = MakeSubresourceLayers(&dst);
     const VkImageSubresourceLayers src_layers = MakeSubresourceLayers(&src);
+    // Ported fix: a blit inside one image (a mip chain, say) keeps it
+    // in GENERAL: moving the whole image to TRANSFER_DST_OPTIMAL would leave the source levels in
+    // another layout than the blit reads. AMD drivers only: other vendors keep the old layouts.
+    const VkImageLayout dst_layout = src_image == dst_image && device.IsAmdDriver()
+                                         ? VK_IMAGE_LAYOUT_GENERAL
+                                         : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([filter, dst_region, src_region, dst_image, src_image, dst_layers, src_layers,
-                      aspect_mask, is_resolve](vk::CommandBuffer cmdbuf) {
+                      aspect_mask, is_resolve, dst_layout](vk::CommandBuffer cmdbuf) {
         const std::array read_barriers{
             VkImageMemoryBarrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2537,7 +2435,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = dst_layout,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = dst_image,
@@ -2558,7 +2456,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = dst_layout,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2574,14 +2472,13 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        0, nullptr, nullptr, read_barriers);
         if (is_resolve) {
-            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                                 MakeImageResolve(dst_region, src_region, dst_layers, src_layers));
         } else {
             const bool is_linear = filter == Fermi2D::Filter::Bilinear;
             const VkFilter vk_filter = is_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
             cmdbuf.BlitImage(
-                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                 MakeImageBlit(dst_region, src_region, dst_layers, src_layers), vk_filter);
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
@@ -2993,6 +2890,101 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
+    return max_scaled_extent;
+}
+
+void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
+    device.LimitKeptBlocks(budget, critical);
+}
+
+bool TextureCacheRuntime::MainHeapNumbers(u64& size, u64& usage, u64& budget) const {
+    return device.MainHeapNumbers(size, usage, budget);
+}
+
+std::optional<u64> TextureCacheRuntime::OtherProcessesVideoMemory() const {
+    if (luid_state == 0) {
+        luid_state = device.GetDeviceLuid(luid_low, luid_high) ? 1 : 2;
+    }
+    if (luid_state != 1) {
+        return std::nullopt;
+    }
+    const auto sample = Common::GetAdapterVideoMemory(luid_low, luid_high);
+    if (!sample) {
+        return std::nullopt;
+    }
+    return sample->adapter_dedicated -
+           (std::min)(sample->adapter_dedicated, sample->process_dedicated);
+}
+
+std::string TextureCacheRuntime::VramOwnersText(u64 texture_image_bytes, u64 deleted_bytes) {
+    // FRITCHII_VRAM_OWNERS: who holds the main device-local heap. Images are made by the main
+    // allocator; buffers by the buffer allocator when it is split off (else by the main one too).
+    u64 size{};
+    u64 usage{};
+    u64 budget{};
+    device.MainHeapNumbers(size, usage, budget);
+    const size_t heap = device.GetMainHeap();
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+    vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+    if (device.HasSplitAllocators()) {
+        device.BufferHeapBudgets(buffer_budgets.data());
+    }
+    const VmaStatistics& images = main_budgets[heap].statistics;
+    const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+    const u64 blocks = images.blockBytes + buffers.blockBytes;
+    const u64 allocated = images.allocationBytes + buffers.allocationBytes;
+    const u64 pool = image_pool_bytes;
+    const u64 frees = PendingImageFreeBytes();
+    // The image allocations the texture cache does not name are mostly in the main allocator;
+    // what is left of both allocators' allocations is the buffers (buffer cache, stream and
+    // device-local staging buffers) and the rest.
+    const u64 named = texture_image_bytes + deleted_bytes + pool + frees;
+    const u64 rest = allocated - (std::min)(allocated, named);
+    const u64 staging = staging_buffer_pool.CachedBytes(MemoryUsage::Upload) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::Download) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) +
+                        staging_buffer_pool.StreamBufferBytes();
+    // Kept blocks (FRITCHII_KEEP_BLOCKS) are memory VMA gave back that is kept from the driver.
+    const u64 kept = device.KeptBlockBytes();
+    const u64 held = blocks + kept;
+    // Where the unused space in the blocks lies, per allocator and pool (a walk of every block,
+    // every 10 s). The buffer allocator only on its user's thread (memory stage spec 5.3).
+    std::string slack = "main allocator " + VramSlackText(device, device.GetAllocator(),
+                                                          static_cast<u32>(heap));
+    if (device.HasSplitAllocators()) {
+        slack += VideoCommon::MemoryStageLink::IsCacheUser()
+                     ? "; buffer allocator " +
+                           VramSlackText(device, device.GetBufferAllocator(),
+                                         static_cast<u32>(heap))
+                     : std::string{"; buffer allocator not walked (the memory stage holds it)"};
+    }
+    // FRITCHII_DEPTH_POOL_FIT: its padding is allocated to VMA but holds nothing.
+    if (const std::string fit = DepthFitText(); !fit.empty()) {
+        slack += "; " + fit;
+    }
+    // FRITCHII_VRAM_HOLES (live, default 0): what the holes are and what holds the half-empty
+    // blocks, for the main allocator (images, depth pools). Builds VMA's detailed map: ms of
+    // work every owners line, so a diagnostic only.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_holes,
+                                         "FRITCHII_VRAM_HOLES") != 0) {
+        slack += "; holes (FRITCHII_VRAM_HOLES) main allocator: " +
+                 VramHolesText(device.GetAllocator(), static_cast<u32>(heap));
+    }
+    return fmt::format(
+        "main heap {} of {} MiB budget ({} MiB heap): texture cache images {} MiB, deleted images "
+        "still allocated {} MiB, image pool {} MiB, frees in flight {} MiB, buffers and the rest "
+        "{} MiB (buffer allocator {} MiB in {} allocations), unused space in allocator blocks {} "
+        "MiB, kept blocks {} MiB, outside the allocators {} MiB (the driver's: pipelines, "
+        "descriptors, swapchain, its own); staging pool {} MiB (any heap); block slack by pool: "
+        "{}",
+        usage >> 20, budget >> 20, size >> 20, texture_image_bytes >> 20, deleted_bytes >> 20,
+        pool >> 20, frees >> 20, rest >> 20, buffers.allocationBytes >> 20,
+        buffers.allocationCount, (blocks - (std::min)(blocks, allocated)) >> 20, kept >> 20,
+        (usage - (std::min)(usage, held)) >> 20, staging >> 20, slack);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3081,12 +3073,17 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
     if (!key.valid || VideoCore::Nx2Debug::Experiment(42) == 0) {
         return vk::Image{};
     }
+    if (ghost_pools) [[unlikely]] {
+        ghost_pools->Take(ImagePoolKeyHash(key), image_pool_frame);
+    }
     // Newest first: its memory is the most likely to be resident still.
     for (auto it = image_pool.rbegin(); it != image_pool.rend(); ++it) {
         if (it->key != key) {
             continue;
         }
         vk::Image image = std::move(it->image);
+        image_pool_proven.insert(it->hash);
+        NoteImagePoolTake(it->hash);
         image_pool_bytes -= it->bytes;
         image_pool.erase(std::next(it).base());
         ++image_pool_taken;
@@ -3100,66 +3097,698 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     if (!key.valid || !image || bytes > ImagePoolMaxBytes) {
         return;
     }
+    const u64 hash = ImagePoolKeyHash(key);
+    if (ghost_pools) [[unlikely]] {
+        ghost_pools->Give(hash, bytes, image_pool_frame);
+    }
+    const u64 rule_cap = ImagePoolRuleCap();
+    if (rule_cap != 0 && image_pool_bytes > rule_cap) {
+        // EXP110 just turned on or lowered: the bulk goes by the plain loop, not the rule's walk.
+        TrimImagePool(rule_cap);
+    }
     image_pool.push_back(PooledImage{
         .key = key,
         .image = std::move(image),
         .bytes = bytes,
         .frame = image_pool_frame,
+        .proven = image_pool_proven.contains(hash),
+        .hash = hash,
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
-    TrimImagePool(ImagePoolCap());
+    if (rule_cap != 0) {
+        TrimImagePoolByRule(rule_cap);
+    } else {
+        TrimImagePool(FittedPoolCap());
+    }
+}
+
+void TextureCacheRuntime::NoteImagePoolTake(u64 hash) {
+    const auto [it, added] = image_pool_shapes.try_emplace(hash);
+    it->second.takes += 1;
+    it->second.last_take = image_pool_frame;
+    if (!added || image_pool_shapes.size() < ImagePoolShapesMax) {
+        return;
+    }
+    // Bound (~64 bytes a shape): at ImagePoolShapesMax keep the ImagePoolShapesKeep most recently
+    // taken, so one pass per ~1,000 new shapes. A dropped shape's pooled entries count as never
+    // taken again (first to go); it was among the least recently taken of all shapes.
+    std::vector<u64> last_takes;
+    last_takes.reserve(image_pool_shapes.size());
+    for (const auto& [shape_hash, shape] : image_pool_shapes) {
+        last_takes.push_back(shape.last_take);
+    }
+    const size_t drop = image_pool_shapes.size() - ImagePoolShapesKeep;
+    std::nth_element(last_takes.begin(), last_takes.begin() + drop, last_takes.end());
+    const u64 keep_from = last_takes[drop];
+    std::erase_if(image_pool_shapes,
+                  [keep_from](const auto& entry) { return entry.second.last_take < keep_from; });
+}
+
+u64 TextureCacheRuntime::ImagePoolRuleCap() {
+    const int rule = VideoCore::Nx2Debug::Experiment(110);
+    if (rule <= 0) {
+        return 0;
+    }
+    return rule == 1 ? u64{512} << 20 : u64{static_cast<u32>(rule)} << 20;
+}
+
+u64 TextureCacheRuntime::IdleDestroyBytes() {
+    std::scoped_lock lock{idle_destroy_mutex};
+    return idle_destroy_bytes;
+}
+
+void TextureCacheRuntime::TrimImagePoolByRule(u64 max_bytes) {
+    // EXP110 (fable52_answer_stall3 3, the ghost's "unproven first + takes"): the pool and EXP99's
+    // idle backlog share the cap, so the pool may hold the cap less what waits to be destroyed.
+    const u64 backlog = IdleDestroyBytes();
+    const u64 target = max_bytes - std::min(max_bytes, backlog);
+    while (!image_pool.empty() && image_pool_bytes > target) {
+        // Oldest first, the first entry whose shape was never taken goes; failing that the one
+        // with the fewest takes, then the least recent take, then the oldest (strict compares
+        // keep the earlier). Proof is looked up now, per shape, not stored at PoolImage time.
+        auto victim = image_pool.end();
+        const PoolShape* victim_shape = nullptr;
+        for (auto it = image_pool.begin(); it != image_pool.end(); ++it) {
+            const auto found = image_pool_shapes.find(it->hash);
+            if (found == image_pool_shapes.end()) {
+                victim = it;
+                break;
+            }
+            const PoolShape& shape = found->second;
+            if (victim == image_pool.end() || shape.takes < victim_shape->takes ||
+                (shape.takes == victim_shape->takes &&
+                 shape.last_take < victim_shape->last_take)) {
+                victim = it;
+                victim_shape = &shape;
+            }
+        }
+        image_pool_bytes -= victim->bytes;
+        DropPooledImage(std::move(victim->image), victim->bytes);
+        image_pool.erase(victim);
+        ++image_pool_evicted;
+    }
+}
+
+u64 TextureCacheRuntime::ImagePoolKeyHash(const ImagePoolKey& key) noexcept {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](u64 value) {
+        hash ^= value;
+        hash *= 0x100000001b3ULL;
+    };
+    mix(key.flags);
+    mix(key.type);
+    mix(key.format);
+    mix(key.width);
+    mix(key.height);
+    mix(key.depth);
+    mix(key.levels);
+    mix(key.layers);
+    mix(key.samples);
+    mix(key.tiling);
+    mix(key.usage);
+    mix(reinterpret_cast<uintptr_t>(key.view_formats));
+    mix(key.view_format_count);
+    return hash;
 }
 
 u64 TextureCacheRuntime::ImagePoolCap() {
+    // EXP110 sets its own cap (a lowered one applies at TickFrame by the plain oldest-first loop).
+    if (const u64 rule_cap = ImagePoolRuleCap(); rule_cap != 0) {
+        return rule_cap;
+    }
+    // EXP66 (live, MiB, 0 = the built-in cap): the owner sees device memory jump ~0.8 GB while an
+    // NPC passes, ~500 MiB of it this pool at its cap (fable_answer_npcdips).
+    if (const int mib = VideoCore::Nx2Debug::Experiment(66); mib > 0) {
+        return u64{static_cast<u32>(mib)} << 20;
+    }
     return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
+}
+
+void TextureCacheRuntime::UpdatePoolFitCap() {
+    // The texture cache counts pooled images as free memory, so its thresholds (set from the
+    // budget) leave the pool out: at its built-in cap (EXP66, 1 GiB) next to a full cache the
+    // process passed the budget of a small card (6 GB: budget ~5 GiB, critical ~4.2 GiB + the
+    // pool), and Windows moved memory to system RAM or an image failed and the whole pool was
+    // dropped at once. With FRITCHII_VRAM_POOL_FIT the pool holds at most what the rest of the
+    // process leaves under the budget less the cache's margin (1/8 of it, at most 1 GiB). Large
+    // cards keep the built-in cap: 16 GB card at the market, ~7.7 GiB of room for a 1 GiB cap.
+    const u64 budget = device.GetDeviceMemoryBudget();
+    if (budget == 0) {
+        pool_fit_cap = ~u64{0};
+        pool_floor_bytes = 0;
+        return;
+    }
+    // What the driver counts: the live usage (pool included) plus the kept blocks and the unused
+    // space in the allocators' blocks, which GetDeviceMemoryUsage leaves out.
+    const u64 usage = device.GetDeviceMemoryUsage() + device.KeptBlockBytes() +
+                      device.GetDeviceMemorySlack();
+    const u64 others = usage - (std::min)(usage, image_pool_bytes);
+    const u64 margin = (std::min)(budget / 8, u64{1} << 30);
+    const u64 ceiling = budget - (std::min)(budget, margin);
+    pool_fit_cap = ceiling > others ? ceiling - others : 0;
+    // FRITCHII_VRAM_POOL_FLOOR (live, default 1, 0 off): past the budget the fit gave 0, for as
+    // long as the card stayed over. Castle Town on a simulated 4 GB card: every render target
+    // given to the pool was destroyed on the spot and none taken (0 taken, 2,800-5,400 missed,
+    // 640-2,400 given and evicted per 600 frames; 16 GB card: ~640 taken, 20-50 missed). The
+    // targets of a frame come back within a few frames, so a small pool of them costs little more
+    // than the images in flight would. 1/24 of the budget, 64 to 192 MiB, each waiting 16 frames.
+    pool_floor_bytes = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_floor,
+                                                        "FRITCHII_VRAM_POOL_FLOOR", 1) > 0
+                           ? std::clamp(budget / 24, u64{64} << 20, u64{192} << 20)
+                           : 0;
+    pool_fit_budget = budget;
+    pool_fit_others = others;
+    pool_fit_lowest = (std::min)(pool_fit_lowest, pool_fit_cap);
+}
+
+void TextureCacheRuntime::SampleVramReport() {
+    // FRITCHII_VRAM_REPORT (live, default 0): every 30 frames the main device-local heap's usage
+    // against its budget as the driver reports them (what decides whether Windows moves memory
+    // to system RAM, the fps cliff of a full card), one line every 600 frames.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_report,
+                                         "FRITCHII_VRAM_REPORT") == 0) {
+        vram_report_frames = vram_report_samples = vram_report_over = 0;
+        vram_report_peak_usage = vram_report_peak_over = 0;
+        vram_report_seen_pressure = memory_allocator.MemoryPressureEvents();
+        vram_report_seen_failed = memory_allocator.FailedImages();
+        return;
+    }
+    const u32 frame = vram_report_frames++;
+    if (frame % 30 == 0) {
+        u64 usage{};
+        u64 budget{};
+        if (device.MainHeapUsage(usage, budget)) {
+            ++vram_report_samples;
+            vram_report_last_budget = budget;
+            vram_report_peak_usage = (std::max)(vram_report_peak_usage, usage);
+            if (usage > budget) {
+                ++vram_report_over;
+                vram_report_peak_over = (std::max)(vram_report_peak_over, usage - budget);
+            }
+        }
+    }
+    if (frame % 600 != 599) {
+        return;
+    }
+    u64 usage{};
+    u64 budget{};
+    device.MainHeapUsage(usage, budget);
+    const u32 pressure = memory_allocator.MemoryPressureEvents();
+    const u32 failed = memory_allocator.FailedImages();
+    LOG_INFO(Render_Vulkan,
+             "VRAM fit (FRITCHII_VRAM_REPORT) last 600 frames: main heap {} of {} MiB budget now, "
+             "peak {} MiB; over the budget in {} of {} samples (most {} MiB over); image pool {} "
+             "MiB (cap {} MiB), kept blocks {} MiB, block slack {} MiB; staging upload {} download "
+             "{} device {} MiB, stream {} MiB; {} memory pressure events, {} failed images",
+             usage >> 20, budget >> 20, vram_report_peak_usage >> 20, vram_report_over,
+             vram_report_samples, vram_report_peak_over >> 20, image_pool_bytes >> 20,
+             FittedPoolCap() >> 20, device.KeptBlockBytes() >> 20,
+             device.GetDeviceMemorySlack() >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20,
+             staging_buffer_pool.StreamBufferBytes() >> 20, pressure - vram_report_seen_pressure,
+             failed - vram_report_seen_failed);
+    // Where the main heap's usage sits: each allocator's blocks against what is allocated in
+    // them (their difference is the block slack), and what the driver holds outside both
+    // (pipelines, descriptor and command memory, the swapchain, its own reservations).
+    {
+        const size_t heap = device.GetMainHeap();
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+        vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+        if (device.HasSplitAllocators()) {
+            device.BufferHeapBudgets(buffer_budgets.data());
+        }
+        const VmaStatistics& images = main_budgets[heap].statistics;
+        const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+        const u64 blocks = images.blockBytes + buffers.blockBytes;
+        LOG_INFO(Render_Vulkan,
+                 "VRAM split (FRITCHII_VRAM_REPORT): main allocator blocks {} MiB ({} MiB "
+                 "allocated, {} allocations), buffer allocator blocks {} MiB ({} MiB allocated, "
+                 "{} allocations), outside the allocators {} MiB; small card profile {} "
+                 "(FRITCHII_SMALL_CARD={}, parts {:#x})",
+                 images.blockBytes >> 20, images.allocationBytes >> 20, images.allocationCount,
+                 buffers.blockBytes >> 20, buffers.allocationBytes >> 20,
+                 buffers.allocationCount, (usage - (std::min)(usage, blocks)) >> 20,
+                 VideoCore::SmallCard::Active() ? "on" : "off", VideoCore::SmallCard::Mode(),
+                 VideoCore::SmallCard::Parts());
+    }
+    vram_report_samples = vram_report_over = 0;
+    vram_report_peak_usage = vram_report_peak_over = 0;
+    vram_report_seen_pressure = pressure;
+    vram_report_seen_failed = failed;
+}
+
+void TextureCacheRuntime::TickVramTrim() {
+    // FRITCHII_VRAM_TRIM (live, default 1 = auto: 90 with the small card profile on, else off;
+    // 0 off; 2-100 = percent of the budget, on any card): every 60 frames, while the main heap's
+    // usage is at or above that share of its budget, each allocator gives back the empty block
+    // VMA keeps in each block vector (each memory type's default blocks and the depth, colour,
+    // sparse and buffer pools: up to 32-64 MiB each). VMA frees them by itself only once the
+    // usage passed the budget, when Windows may already be moving memory to system RAM. The
+    // memory held nothing; the cost is a driver allocation if that vector needs a block again.
+    if (vram_trim_frames++ % 60 != 0) {
+        return;
+    }
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_trim,
+                                                       "FRITCHII_VRAM_TRIM", 1);
+    u64 percent = 0;
+    if (value == 1) {
+        percent = VideoCore::SmallCard::Active() ? 90 : 0;
+    } else if (value >= 2) {
+        percent = (std::min)(static_cast<u64>(value), u64{100});
+    }
+    if (percent == 0) {
+        return;
+    }
+    u64 usage{};
+    u64 budget{};
+    if (!device.MainHeapUsage(usage, budget) || budget == 0 || usage * 100 < budget * percent) {
+        return;
+    }
+    const u32 heap = static_cast<u32>(device.GetMainHeap());
+    const u64 main = TrimEmptyBlocks(device, device.GetAllocator(), heap);
+    u64 buffers = 0;
+    // The buffer allocator only on its user's thread (memory stage spec 5.3); at
+    // FRITCHII_MEMSTAGE_THREAD=1 it is trimmed when the back holds it at this point.
+    if (device.HasSplitAllocators() && VideoCommon::MemoryStageLink::IsCacheUser()) {
+        buffers = TrimEmptyBlocks(device, device.GetBufferAllocator(), heap);
+    }
+    if (main + buffers == 0) {
+        return;
+    }
+    ++vram_trim_events;
+    vram_trim_bytes += main + buffers;
+    const auto now = std::chrono::steady_clock::now();
+    if (vram_trim_events > 8 && now - vram_trim_logged < std::chrono::seconds{10}) {
+        return;
+    }
+    vram_trim_logged = now;
+    LOG_INFO(Render_Vulkan,
+             "VRAM trim (FRITCHII_VRAM_TRIM at {}% of the budget): main heap {} of {} MiB, gave "
+             "back {} MiB of empty blocks (main allocator {} MiB, buffer allocator {} MiB); "
+             "session {} MiB in {} trims",
+             percent, usage >> 20, budget >> 20, (main + buffers) >> 20, main >> 20,
+             buffers >> 20, vram_trim_bytes >> 20, vram_trim_events);
+}
+
+void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
+    // EDEN_NX2_EXP99 (live, 0 = off; fable52_answer_chicken 1): an evicted pool image is
+    // destroyed on the image free thread instead of here, on the GPU back thread at the frame's
+    // end (OoT's per-NPC depth targets: ~3 a frame while a chicken passes, 1-4.7 ms stalls).
+    // The GPU finished with pooled images before they were pooled (IsFree), so no ordering.
+    // EXP99 = 1: the back destroys it when it next has nothing to do (RasterizerVulkan's split
+    // idle hook), on its own thread, so VMA stays externally synchronized; the free thread
+    // (2, needs EDEN_NX2_ASYNC_IMAGE_FREE=1) fought the back for VMA's and the driver's locks.
+    const int exp99 = VideoCore::Nx2Debug::Experiment(99);
+    if (exp99 == 1) {
+        std::scoped_lock lock{idle_destroy_mutex};
+        // Bounded by device memory, not count (Fable after: 64 filled in ~23 frames of a pass).
+        // EXP110: 128 MiB, inside the cap it shares with the pool (fable52_answer_stall3 3).
+        const u64 bound = ImagePoolRuleCap() != 0 ? u64{128} << 20 : u64{512} << 20;
+        if (idle_destroy_bytes + bytes <= bound) {
+            idle_destroy_bytes += bytes;
+            idle_destroys.emplace_back(std::move(image), bytes);
+            ++image_pool_dropped_async;
+            return;
+        }
+    }
+    if (exp99 == 2 && image_free_queue.Enabled() &&
+        image_free_queue.PendingBytes() <= ImageFreeQueue::MaxPendingBytes) {
+        image_free_queue.AddBare(std::move(image), bytes);
+        ++image_pool_dropped_async;
+        return;
+    }
+    ++image_pool_dropped_here;
+    VideoCommon::Nx2Profile::Scope destroy_scope{VideoCommon::Nx2Profile::Zone::PoolDestroyHere};
+    DestroyPoolImage(image, pool_destroy_here_timing);
+}
+
+void TextureCacheRuntime::DestroyPoolImage(vk::Image& image, PoolDestroyTiming& timing) {
+    if (!Vulkan::MemoryAllocator::ImageTimingEnabled()) [[likely]] {
+        image = vk::Image{};
+        return;
+    }
+    const vk::Image::DestroyTiming split = image.DestroyTimed();
+    ++timing.images;
+    timing.destroy_ns += split.destroy_ns;
+    timing.free_ns += split.free_ns;
+    timing.blocks_freed += split.block_freed ? 1 : 0;
+}
+
+void TextureCacheRuntime::DestroyIdlePooledImages(u32 max) {
+    VideoCommon::Nx2Profile::Scope destroy_scope{VideoCommon::Nx2Profile::Zone::PoolDestroyIdle};
+    image_pool_dropped_idle += DestroyPooledBacklog(max, "back: idle pool destroy", false);
+}
+
+u32 TextureCacheRuntime::DestroyPooledBacklog(u32 max, const char* span_name, bool frame_end) {
+    u32 destroyed = 0;
+    for (; destroyed < max; ++destroyed) {
+        vk::Image image;
+        {
+            std::scoped_lock lock{idle_destroy_mutex};
+            if (idle_destroys.empty()) {
+                break;
+            }
+            image = std::move(idle_destroys.front().first);
+            idle_destroy_bytes -= idle_destroys.front().second;
+            idle_destroys.pop_front();
+        }
+        Common::Nx2Timeline::Span span{span_name};
+        DestroyPoolImage(image, frame_end ? pool_destroy_frame_end_timing
+                                          : pool_destroy_idle_timing);
+    }
+    return destroyed;
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
     while (!image_pool.empty() && image_pool_bytes > max_bytes) {
         image_pool_bytes -= image_pool.front().bytes;
+        DropPooledImage(std::move(image_pool.front().image), image_pool.front().bytes);
         image_pool.pop_front();
         ++image_pool_evicted;
     }
 }
 
+ImageFreeQueue::ImageFreeQueue(bool enabled_) : enabled{enabled_} {
+    if (!enabled) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Deleted images are destroyed on their own thread "
+                            "(EDEN_NX2_ASYNC_IMAGE_FREE, 0 turns it off)");
+    thread = std::jthread([this](std::stop_token stop_token) { Run(stop_token); });
+}
+
+ImageFreeQueue::~ImageFreeQueue() {
+    Submit();
+    if (thread.joinable()) {
+        // Run destroys everything submitted before it sees the stop.
+        thread.request_stop();
+        thread.join();
+    }
+    // Without a thread (never started), the queue's images are destroyed here, with the members.
+}
+
+void ImageFreeQueue::Add(std::unique_ptr<Image> image, u64 bytes) {
+    pending_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    batch.emplace_back(std::move(image), bytes);
+}
+
+void ImageFreeQueue::AddBare(vk::Image image, u64 bytes) {
+    pending_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    bare_batch.emplace_back(std::move(image), bytes);
+}
+
+void ImageFreeQueue::Submit() {
+    if (batch.empty() && bare_batch.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{mutex};
+        std::move(bare_batch.begin(), bare_batch.end(), std::back_inserter(bare_queue));
+        bare_batch.clear();
+        if (queue.empty()) {
+            queue.swap(batch);
+        } else {
+            std::move(batch.begin(), batch.end(), std::back_inserter(queue));
+            batch.clear();
+        }
+    }
+    cv.notify_one();
+}
+
+void ImageFreeQueue::Run(std::stop_token stop_token) {
+    Common::SetCurrentThreadName("ImageFree");
+    // Off the GPU threads' cores and below them: falling behind only holds memory a little
+    // longer (MaxPendingBytes bounds it).
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    Common::SetCurrentThreadToBackgroundWork();
+    std::vector<Entry> work;
+    std::vector<BareEntry> bare_work;
+    while (true) {
+        {
+            std::unique_lock lock{mutex};
+            cv.wait(lock, stop_token, [this] { return !queue.empty() || !bare_queue.empty(); });
+            if (queue.empty() && bare_queue.empty()) {
+                return; // stop requested, nothing left
+            }
+            work.swap(queue);
+            bare_work.swap(bare_queue);
+        }
+        for (BareEntry& entry : bare_work) {
+            entry.first = vk::Image{};
+            pending_bytes.fetch_sub(entry.second, std::memory_order_release);
+        }
+        bare_work.clear();
+        // Oldest first, in the order the GPU finished with them.
+        for (Entry& entry : work) {
+            entry.first.reset();
+            pending_bytes.fetch_sub(entry.second, std::memory_order_release);
+        }
+        work.clear();
+    }
+}
+
+void TextureCacheRuntime::FreeImageLater(Image& image) {
+    if (!image_free_queue.Enabled() ||
+        image_free_queue.PendingBytes() > ImageFreeQueue::MaxPendingBytes) {
+        return;
+    }
+    const std::optional<u64> bytes = image.PrepareForAsyncFree();
+    if (!bytes) {
+        return;
+    }
+    image_free_queue.Add(std::make_unique<Image>(std::move(image)), *bytes);
+}
+
+void TextureCacheRuntime::SubmitImageFrees() {
+    image_free_queue.Submit();
+}
+
 void TextureCacheRuntime::TickFrame() {
     ++image_pool_frame;
     {
+        // On the timeline (fable52_answer_chicken): the pool's evictions at the frame's end.
+        Common::Nx2Timeline::Span pool_span{"back: image pool tick"};
         // EXP42's pool: images older than ImagePoolMaxFrames go, and all of them when the
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
         const u32 failed = memory_allocator.FailedImages();
-        const bool short_of_memory =
-            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        const bool image_failed = failed != image_pool_seen_failed;
+        const bool short_of_memory = pressure != image_pool_seen_pressure || image_failed;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
-        const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
-        if (pool_switch == 0 || short_of_memory) {
-            TrimImagePool(0);
+        // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
+        // frame while they hold more than the cap and the budget's limit allow.
+        // FRITCHII_VRAM_BUDGET_MODE: while the texture cache's live budget cap binds, kept blocks
+        // are memory the driver counts against a budget that is already short.
+        if (short_of_memory || budget_pressure) {
+            device.ReleaseKeptBlocks();
         }
-        while (!image_pool.empty() &&
-               image_pool_frame - image_pool.front().frame > ImagePoolMaxFrames) {
-            image_pool_bytes -= image_pool.front().bytes;
-            image_pool.pop_front();
+        device.TickKeptBlocks();
+        // FRITCHII_VRAM_POOL_FIT (live, default 0): the pool's cap follows the room under the
+        // budget, re-read every 30 frames. Also while the budget cap binds (budget_pressure):
+        // deleted images went to the pool, so its memory stayed counted, and the cap went on down.
+        if (!budget_pressure &&
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
+                                             "FRITCHII_VRAM_POOL_FIT") == 0) {
+            pool_fit_cap = ~u64{0};
+            pool_floor_bytes = 0;
+            pool_fit_frames = 0;
+        } else if (pool_fit_frames++ % 30 == 0) {
+            UpdatePoolFitCap();
+        }
+        // FRITCHII_SMALL_CARD (part Pool): the pool held 850-1000 MiB of deleted render targets at
+        // the market (EXP66 = 1024), a seventh of an 8 GB card's budget and a fifth of a 6 GB
+        // one's. On a small card it gets 1/16 of the budget (~450 MiB on 8 GB, ~340 on 6 GB, at
+        // least 256), trimmed oldest first as before; the cache's part Fit counts what it holds.
+        if (!VideoCore::SmallCard::On(VideoCore::SmallCard::Pool)) {
+            small_pool_cap = ~u64{0};
+            small_pool_frames = 0;
+        } else if (small_pool_frames++ % 30 == 0) {
+            const u64 budget = device.GetDeviceMemoryBudget();
+            small_pool_cap = budget != 0 ? (std::max)(budget / 16, u64{256} << 20) : ~u64{0};
+        }
+        SampleVramReport();
+        TickVramTrim();
+        const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
+        // FRITCHII_VRAM_POOL_FLOOR: an image refused by the budget halves the pool, one that could
+        // not be made at all empties it. On a card that stays over budget refusals keep coming,
+        // and emptying the pool at each one is the flush the floor is there to stop.
+        if (pool_switch == 0 || image_failed || (short_of_memory && pool_floor_bytes == 0)) {
+            TrimImagePool(0);
+            if (ghost_pools) [[unlikely]] {
+                ghost_pools->Clear();
+            }
+        } else if (short_of_memory) {
+            TrimImagePool(FittedPoolCap() / 2);
+        } else {
+            TrimImagePool(FittedPoolCap()); // a lowered EXP66 applies at once
+        }
+        // Only the floor keeps these: what is not taken back soon goes.
+        if (pool_floor_bytes != 0 && pool_fit_cap < pool_floor_bytes) {
+            while (!image_pool.empty() &&
+                   image_pool_frame - image_pool.front().frame > ImagePoolFloorFrames) {
+                image_pool_bytes -= image_pool.front().bytes;
+                DropPooledImage(std::move(image_pool.front().image), image_pool.front().bytes);
+                image_pool.pop_front();
+                ++image_pool_evicted;
+            }
+        }
+        // EDEN_NX2_EXP82 (live, frames, 0 = off; fable52_answer_after7778 1): proven entries (a
+        // shape taken from the pool before) stay this many frames instead of ImagePoolMaxFrames.
+        // OoT's per-NPC depth targets are sized by screen bounds, so a size comes back later
+        // than 180 frames; the daytime market made one ~8 times a second at 0.2-2.3 ms each.
+        // Unproven entries still leave at ImagePoolMaxFrames; the byte cap still applies.
+        const int proven_switch = VideoCore::Nx2Debug::Experiment(82);
+        const u64 proven_frames = proven_switch > 0 ? static_cast<u64>(proven_switch)
+                                                    : ImagePoolMaxFrames;
+        // EXP110: proof is the shape's, looked up now (an entry pooled before its shape's first
+        // take counts as proven once it is taken), and EXP65 is not applied (the ghost ran so).
+        const bool rule = ImagePoolRuleCap() != 0;
+        for (auto it = image_pool.begin(); it != image_pool.end();) {
+            const u64 age = image_pool_frame - it->frame;
+            if (age <= ImagePoolMaxFrames) {
+                break; // oldest first: the rest are younger
+            }
+            const bool proven = rule ? image_pool_shapes.contains(it->hash) : it->proven;
+            if (proven && age <= proven_frames) {
+                ++it;
+                continue;
+            }
+            image_pool_bytes -= it->bytes;
+            DropPooledImage(std::move(it->image), it->bytes);
+            it = image_pool.erase(it);
             ++image_pool_evicted;
+        }
+        if (const int unproven_frames = VideoCore::Nx2Debug::Experiment(65);
+            unproven_frames > 0 && !rule) {
+            // Oldest first; proven entries stay for ImagePoolMaxFrames as before.
+            for (auto it = image_pool.begin(); it != image_pool.end();) {
+                if (image_pool_frame - it->frame <= static_cast<u64>(unproven_frames)) {
+                    break;
+                }
+                if (it->proven) {
+                    ++it;
+                    continue;
+                }
+                image_pool_bytes -= it->bytes;
+                DropPooledImage(std::move(it->image), it->bytes);
+                it = image_pool.erase(it);
+                ++image_pool_evicted;
+                ++image_pool_unproven_evicted;
+            }
+        }
+        if (ghost_pools) [[unlikely]] {
+            const int unproven_switch = VideoCore::Nx2Debug::Experiment(65);
+            ghost_pools->Age(image_pool_frame, ImagePoolMaxFrames, proven_frames,
+                             unproven_switch > 0 ? static_cast<u64>(unproven_switch) : 0);
+        }
+        // EXP110: past 64 MiB waiting, the idle backlog also loses two a frame end, so it stays
+        // well inside its 128 MiB and the cap it shares with the pool.
+        if (rule && IdleDestroyBytes() > (u64{64} << 20)) {
+            VideoCommon::Nx2Profile::Scope destroy_scope{
+                VideoCommon::Nx2Profile::Zone::PoolDestroyBacklog};
+            image_pool_dropped_frame_end +=
+                DestroyPooledBacklog(2, "back: pool backlog destroy", true);
+        }
+        if (image_pool_frame % 600 == 0 && Vulkan::MemoryAllocator::ImageTimingEnabled()) {
+            // EDEN_NX2_IMAGE_ALLOC_TIMING (fable52_answer_potroom 4): what the pool's destroys
+            // cost in vmaDestroyImage's two steps, and whether creates took new VMA memory.
+            const auto part = [](const PoolDestroyTiming& t) {
+                return fmt::format("{} ({} us destroy, {} us VMA free, {} blocks freed)", t.images,
+                                   t.destroy_ns / 1000, t.free_ns / 1000, t.blocks_freed);
+            };
+            const auto now = Vulkan::MemoryAllocator::ReadImageTiming();
+            const auto& seen = pool_create_timing_seen;
+            const u64 created = now.images - seen.images;
+            const u64 new_block = now.new_block_images - seen.new_block_images;
+            const u64 all_ns = (now.create_ns - seen.create_ns) + (now.alloc_ns - seen.alloc_ns) +
+                               (now.bind_ns - seen.bind_ns);
+            const u64 new_block_ns = now.new_block_ns - seen.new_block_ns;
+            LOG_INFO(Render_Vulkan,
+                     "Image pool destroys (IMAGE_ALLOC_TIMING) last 600 frames: here {}; idle {}; "
+                     "backlog at frame end {}; creates {} ({} us), {} on a new VMA memory object "
+                     "({} us, {} dedicated), {} in an old block ({} us)",
+                     part(pool_destroy_here_timing), part(pool_destroy_idle_timing),
+                     part(pool_destroy_frame_end_timing), created, all_ns / 1000, new_block,
+                     new_block_ns / 1000, now.dedicated_images - seen.dedicated_images,
+                     created - new_block, (all_ns - std::min(all_ns, new_block_ns)) / 1000);
+            pool_destroy_here_timing = {};
+            pool_destroy_idle_timing = {};
+            pool_destroy_frame_end_timing = {};
+            pool_create_timing_seen = now;
         }
         if (image_pool_frame % 600 == 0 &&
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
+            if (ghost_pools) {
+                // EDEN_NX2_GHOST_POOLS: the same 600 frames under other rules and caps.
+                LOG_INFO(Render_Vulkan,
+                         "Ghost pools (EXP42) last 600 frames, taken/missed hit% held: {}",
+                         ghost_pools->Report());
+            }
+            const std::string rule_text =
+                rule ? fmt::format("unproven first + takes, {} MiB with the backlog, {} shapes",
+                                   ImagePoolRuleCap() >> 20, image_pool_shapes.size())
+                     : std::string{"oldest first"};
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
-                     "evicted; holds {} images, {} MiB",
+                     "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB; "
+                     "evictions deferred {} (EXP99={}; destroyed while idle {}), here {}; "
+                     "rule {} (EXP110={}); backlog {} MiB, destroyed at frame end {}",
                      image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
-                     image_pool.size(), image_pool_bytes >> 20);
+                     image_pool_unproven_evicted, VideoCore::Nx2Debug::Experiment(65),
+                     image_pool.size(), image_pool_bytes >> 20, image_pool_dropped_async,
+                     VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_idle,
+                     image_pool_dropped_here, rule_text, VideoCore::Nx2Debug::Experiment(110),
+                     IdleDestroyBytes() >> 20, image_pool_dropped_frame_end);
+            if (pool_fit_cap != ~u64{0}) {
+                LOG_INFO(Render_Vulkan,
+                         "Image pool fit (FRITCHII_VRAM_POOL_FIT) last 600 frames: cap {} MiB now "
+                         "(lowest {} MiB, built-in {} MiB); budget {} MiB, the rest of the "
+                         "process {} MiB",
+                         pool_fit_cap >> 20, pool_fit_lowest >> 20, ImagePoolCap() >> 20,
+                         pool_fit_budget >> 20, pool_fit_others >> 20);
+                pool_fit_lowest = pool_fit_cap;
+            }
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
+            image_pool_unproven_evicted = 0;
+            image_pool_dropped_async = image_pool_dropped_here = image_pool_dropped_idle = 0;
+            image_pool_dropped_frame_end = 0;
         }
+        // EXP99: hand what the trims above dropped to the free thread now, not next frame.
+        image_free_queue.Submit();
     }
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    RecycleTranscodes();
+    // Finished decode images wait for the next texture of their shape, up to this much memory.
+    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    const auto decode_bytes = [](const PendingTranscode& t) {
+        u64 bytes{};
+        for (u32 level = 0; level < t.levels; ++level) {
+            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+        }
+        return bytes * t.layers;
+    };
+    u64 free_bytes{};
+    for (const PendingTranscode& t : free_transcodes) {
+        free_bytes += decode_bytes(t);
+    }
+    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        PendingTranscode& done = pending_transcodes.front();
+        const u64 bytes = decode_bytes(done);
+        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
+            done.unused_frames = 0;
+            free_bytes += bytes;
+            free_transcodes.push_back(std::move(done));
+        }
+        pending_transcodes.pop_front();
+    }
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -3175,48 +3804,18 @@ void TextureCacheRuntime::TickFrame() {
     });
 }
 
-namespace {
-// Device memory of a transcode's RGBA8 decode image.
-[[nodiscard]] u64 TranscodeDecodeBytes(u32 width, u32 height, u32 levels, u32 layers) {
-    u64 bytes{};
-    for (u32 level = 0; level < levels; ++level) {
-        bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+// EXP67: the host extent JoinImages asked for (TextureCacheRuntime::SetNextHostPad), if any.
+[[nodiscard]] ImageInfo PaddedHostInfo(TextureCacheRuntime& runtime, ImageInfo host,
+                                       VideoCommon::ImageFlagBits& flags) {
+    const u32 width = std::exchange(runtime.next_host_pad_width, 0U);
+    const u32 height = std::exchange(runtime.next_host_pad_height, 0U);
+    if (width >= host.size.width && height >= host.size.height &&
+        (width != host.size.width || height != host.size.height)) {
+        host.size.width = width;
+        host.size.height = height;
+        flags |= VideoCommon::ImageFlagBits::HostPadded;
     }
-    return bytes * layers;
-}
-} // Anonymous namespace
-
-bool TextureCacheRuntime::WaitOldestTranscode() {
-    if (pending_transcodes.empty()) {
-        return false;
-    }
-    // Submits the recording first if the decode is still in it.
-    scheduler.Wait(pending_transcodes.front().tick);
-    RecycleTranscodes();
-    return true;
-}
-
-void TextureCacheRuntime::RecycleTranscodes() {
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto bytes_of = [](const PendingTranscode& t) {
-        return TranscodeDecodeBytes(t.width, t.height, t.levels, t.layers);
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += bytes_of(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = bytes_of(done);
-        pending_transcode_bytes -= (std::min)(pending_transcode_bytes, bytes);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    return host;
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -3224,7 +3823,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               PaddedHostInfo(runtime_,
+                                              TrimmedHostInfo(runtime_.device, info,
+                                                              host_level_offset),
+                                              flags),
                                IsHugeAstcArray(runtime_.device, info) ||
                                        IsUnevenMipRgba8Astc(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
@@ -3247,11 +3849,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
+        const u64 bytes =
+            runtime_.device.GetLogical().GetImageMemoryRequirements(*original_image).size;
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;
-        } else if (texels <= MaxBackedImageTexels) {
+        } else if (!IsTooLargeToBack(texels, bytes)) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
             // was written there yet, so the first write gets it replaced.
             flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;
@@ -3270,33 +3874,6 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
                 WillUseGpuBcnTranscode(runtime->device, info)) {
                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
-            }
-            if (const auto padded = GetPaddedBcShape(runtime->device, info)) {
-                sampled_level_limit = padded->levels;
-                flags |= VideoCommon::ImageFlagBits::HostResized;
-                static std::atomic<u32> padded_images{0};
-                const u32 count = ++padded_images;
-                if (count <= 4 || (count & (count - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan,
-                             "ASTC {}x{}x{} with {} levels kept as BC at {}x{}, sampled down to "
-                             "level {} (uneven BC block mips; EDEN_NX2_ASTC_UNEVEN_PAD=0 keeps "
-                             "RGBA8), {} images so far",
-                             info.size.width, info.size.height, info.resources.layers,
-                             info.resources.levels, padded->width, padded->height,
-                             padded->levels - 1, count);
-                }
-            } else if (const s32 sampled = UnevenBcSampledLevels(runtime->device, info);
-                       sampled > 0) {
-                sampled_level_limit = sampled;
-                static std::atomic<u32> uneven_bc_images{0};
-                const u32 count = ++uneven_bc_images;
-                if (count <= 4 || (count & (count - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan,
-                             "ASTC {}x{}x{} with {} levels kept as BC, sampled down to level {} "
-                             "(uneven BC block mips from level {}), {} images so far",
-                             info.size.width, info.size.height, info.resources.layers,
-                             info.resources.levels, sampled - 1, sampled, count);
-                }
             }
             if (IsUnevenMipRgba8Astc(runtime->device, info)) {
                 static std::atomic<u32> uneven_images{0};
@@ -3348,7 +3925,7 @@ void Image::ReleaseToPool() {
     }
     constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                                       ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
-                                      ImageFlagBits::Unbacked;
+                                      ImageFlagBits::Unbacked | ImageFlagBits::NoPool;
     if (True(flags & unusual)) {
         return;
     }
@@ -3375,6 +3952,37 @@ void Image::ReleaseToPool() {
     };
     give(original_image, original_pool_key);
     give(scaled_image, scaled_pool_key);
+}
+
+std::optional<u64> Image::PrepareForAsyncFree() {
+    using VideoCommon::ImageFlagBits;
+    constexpr ImageFlagBits sparse = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                     ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
+                                     ImageFlagBits::Unbacked;
+    if (True(flags & sparse) || sparse_layers.allocator != nullptr) {
+        return std::nullopt;
+    }
+    u64 bytes = 0;
+    for (const vk::Image* const image : {&original_image, &scaled_image}) {
+        if (*image) {
+            bytes += image->GetMemoryBlock().size;
+        }
+    }
+    if (bytes == 0) {
+        return std::nullopt;
+    }
+    // ~Image's runtime part, done here. With runtime null the destructor does nothing else
+    // besides destroying the members (Vulkan objects, VMA allocations, plain memory).
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        if (original_image) {
+            runtime->EraseResolveShadow(*original_image);
+        }
+        if (scaled_image) {
+            runtime->EraseResolveShadow(*scaled_image);
+        }
+    }
+    runtime = nullptr;
+    return bytes;
 }
 
 Image::~Image() {
@@ -3531,6 +4139,78 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
     UploadMemory(map.buffer, map.offset, copies);
+}
+
+void Image::ClearToZero(bool current) {
+    // As UploadMemory: the upload it stands in for leaves no resolve shadow behind.
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        runtime->InvalidateResolveShadow(Handle());
+    }
+    scheduler->RequestOutsideRenderPassOperationContext();
+    // current: the image in use (the scaled one when rescaled), for FRITCHII_STALE_ZERO.
+    const VkImage vk_image = current ? Handle() : *original_image;
+    const VkImageAspectFlags vk_aspect_mask = aspect_mask;
+    const bool was_initialized = std::exchange(initialized, true);
+    scheduler->Record([vk_image, vk_aspect_mask, was_initialized](vk::CommandBuffer cmdbuf) {
+        // CopyBufferToImage's barriers, over every level and layer (the upload's copies cover
+        // all of them).
+        static constexpr VkAccessFlags WRITE_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        static constexpr VkAccessFlags READ_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        const VkImageSubresourceRange range{
+            .aspectMask = vk_aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        const VkImageMemoryBarrier to_transfer{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = WRITE_ACCESS_FLAGS,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = was_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        const VkImageMemoryBarrier to_general{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = WRITE_ACCESS_FLAGS | READ_ACCESS_FLAGS,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_transfer);
+        if ((vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+            // All bytes zero: 0 in every numeric format (float, norm, int, sRGB, packed).
+            cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VkClearColorValue{}, range);
+        } else {
+            // Depth 0.0 and stencil 0: all bytes zero in every depth and stencil format.
+            cmdbuf.ClearDepthStencilImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          VkClearDepthStencilValue{.depth = 0.0f, .stencil = 0},
+                                          range);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               0, to_general);
+    });
 }
 
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
@@ -3851,6 +4531,19 @@ bool Image::InitSparseLayers() {
         u64{granularity.width} * granularity.height * block_bytes == tile) {
         s.tile_width *= block_width;
         s.tile_height *= block_height;
+    }
+    // Ported fix: a block that is not one sparse
+    // page of the image can't be bound by (AMD reported 65549 x 339860304 for Mario Kart World's
+    // RGBA8 terrain arrays on an RX 9070 XT). The image then takes the sparse tiles or
+    // UnwrittenSparse path. Checked on AMD drivers only: other vendors keep their path.
+    if (device.IsAmdDriver() &&
+        (s.tile_width < block_width || s.tile_height < block_height ||
+         u64{s.tile_width / block_width} * (s.tile_height / block_height) * block_bytes != tile)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Sparse layered image {:#x}: driver block {}x{} is not a {} byte page; not "
+                    "using sparse layers",
+                    gpu_addr, granularity.width, granularity.height, tile);
+        return false;
     }
     const u32 tail_lod = (std::min)(it->imageMipTailFirstLod, s.levels);
     VkDeviceSize bytes = 0;
@@ -4703,7 +5396,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         create(TextureType::ColorArray2D, std::nullopt);
         render_target = Handle(Shader::TextureType::ColorArray2D);
         // Native shaders can sample six layers of a 2D array as a cube (point-light shadows).
-        // Adapted from Duck912/eden-fefw a1b23ac3.
+        // Adapted from a ported change.
         if (info.type == VideoCommon::ImageViewType::e2DArray && info.range.extent.layers >= 6 &&
             image.info.num_samples == 1 && IsCubeCompatible(*device, image.info)) {
             create(TextureType::ColorCube, 6);
@@ -4826,8 +5519,7 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
 }
 
 bool ImageView::IsRescaled() const noexcept {
-    // The null view (a render target or texture left out for lack of memory) has no slot vector.
-    return slot_images != nullptr && (*slot_images)[image_id].IsRescaled();
+    return (*slot_images)[image_id].IsRescaled();
 }
 
 vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
@@ -4910,8 +5602,59 @@ void CustomBorderColorBudget::Release() noexcept {
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
-        ocarina_fsr_lod_bias =
-            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+        const auto backend = ResolveOcarinaUpscaler(device);
+        if (!ocarina) {
+            ocarina_fsr_lod_bias = 0.0f;
+        } else if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+                   Fsr4Upscaler::RunsUnjittered(device)) {
+            // FSR 4 takes the scene without camera jitter: a sharper mip would only shimmer.
+            ocarina_fsr_lod_bias = 0.0f;
+            LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
+        } else {
+            // From the sizes, docked (handheld drops the bias). Max Resolution: the scene is
+            // 1440p tall, or what oot_render_height made it, and the output 4K (or the picked
+            // output; one below 1440p from a lowered scene is made at its own size). Without it
+            // the game's dynamic scene (1080p at most) goes to 1440p. DLAA (the quality when the
+            // game started) keeps the scene's size. FRITCHII_DLSS_SCALED: the scaled scene, and
+            // a scene above the output is upscaled to its own size (supersampling).
+            const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+            u32 render_height =
+                max_resolution
+                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight())
+                    : 1080;
+            const auto& resolution = Settings::values.resolution_info;
+            if (VideoCommon::OcarinaScaledUpscale() && resolution.active) {
+                render_height = static_cast<u32>(
+                    static_cast<f32>(render_height) * resolution.up_factor + 0.5f);
+            }
+            const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+                              Settings::GetNvidiaDlssRuntimeSettings().quality ==
+                                  Settings::NvidiaDlssQuality::Native;
+            // The output: oot_upscale_output (Auto: 4K, or the game's own 1440p picture with
+            // FRITCHII_FSR_OUTPUT; 1440p without Max Resolution), the scene's size for 1x AA.
+            const auto plan = VideoCommon::PlanOcarinaPassOutput(
+                OcarinaUpscaleOutput(device).height, max_resolution,
+                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight()), dlaa,
+                OcarinaFsrOutputsGameSize(backend));
+            const u32 output_height =
+                plan.native_aa ? render_height
+                : plan.small_height != 0
+                    ? plan.small_height
+                    : std::max(render_height, plan.big_height != 0 ? plan.big_height : 1440U);
+            const bool dlss_jitter =
+                VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+            const int mode = VideoCommon::OcarinaLodRatioMode();
+            const auto choice = Settings::values.oot_texture_sharpness.GetValue();
+            ocarina_fsr_lod_bias = VideoCommon::OcarinaTextureLodBias(
+                backend, render_height, output_height, dlss_jitter, mode, choice,
+                Settings::values.oot_lod_bias_custom.GetValue());
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, texture sharpness {}, "
+                     "DLSS jitter {}, FRITCHII_OOT_LOD_RATIO={})",
+                     *ocarina_fsr_lod_bias, VideoCommon::OcarinaBackendName(backend),
+                     render_height, output_height, Settings::CanonicalizeEnum(choice),
+                     dlss_jitter ? "on" : "off", mode);
+        }
     }
     return *ocarina_fsr_lod_bias;
 }
@@ -4979,6 +5722,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
     f32 lod_bias = tsc.LodBias();
     ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    spare_sampler = &runtime.spare_sampler;
     if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
         fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
@@ -5042,7 +5786,7 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
-    return *it->sampler;
+    return it->Get();
 }
 
 VkSampler Sampler::Emplace(VariantKey key) {
@@ -5113,11 +5857,42 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
-        .key = key,
-        .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+    // Drivers limit how many samplers exist (maxSamplerAllocationCount: about 4,000 on NVIDIA) and
+    // the cache keeps every one. Past that a sampler that is close enough beats ending the game:
+    // this sampler's first variant, or else the first sampler made (linear filtering).
+    Variant variant{.key = key};
+    try {
+        // FRITCHII_TEST_SAMPLER_LIMIT=<n> (boot, TEST): the driver refuses samplers after n.
+        static const u32 test_limit = [] {
+            const char* const value = std::getenv("FRITCHII_TEST_SAMPLER_LIMIT");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        static std::atomic<u32> made{0};
+        if (test_limit != 0 && made.fetch_add(1, std::memory_order_relaxed) >= test_limit) {
+            throw vk::Exception(VK_ERROR_TOO_MANY_OBJECTS);
+        }
+        variant.sampler = device_ptr->GetLogical().CreateSampler(create_info);
+        VkSampler none = VK_NULL_HANDLE;
+        spare_sampler->compare_exchange_strong(none, *variant.sampler, std::memory_order_relaxed);
+    } catch (const vk::Exception& exception) {
+        const VkResult result = exception.GetResult();
+        variant.borrowed =
+            !variants.empty() ? variants.front().Get() : spare_sampler->load(std::memory_order_relaxed);
+        if ((result != VK_ERROR_TOO_MANY_OBJECTS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+             result != VK_ERROR_OUT_OF_DEVICE_MEMORY) ||
+            variant.borrowed == VK_NULL_HANDLE) {
+            throw;
+        }
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "The driver refused a sampler ({}, its limit is {}): using another one",
+                      string_VkResult(result),
+                      device_ptr->GetMaxSamplerAllocationCount());
+        }
+    }
+    variants.push_back(std::move(variant));
+    return variants.back().Get();
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
@@ -5389,17 +6164,6 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
-    // Kizuna: a scene change (Ocarina's town to Hyrule Field) decodes hundreds of textures before
-    // the next frame, and every decode image lived until that frame's tick: gigabytes of RGBA8 at
-    // once, and a card out of memory before the field loaded. The ones the GPU is done with are
-    // reused at once now, and past MaxPendingTranscodeBytes the oldest are waited for: a longer
-    // load instead of a crash.
-    static constexpr u64 MaxPendingTranscodeBytes = u64{192} << 20;
-    const u64 needed_bytes = TranscodeDecodeBytes(width, height, levels, layers);
-    RecycleTranscodes();
-    while (pending_transcode_bytes + needed_bytes > MaxPendingTranscodeBytes &&
-           WaitOldestTranscode()) {
-    }
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
@@ -5431,13 +6195,6 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
-            free_transcodes.clear();
-            decode = memory_allocator.TryCreateImage(decode_ci, true);
-        }
-        if (!decode && !pending_transcodes.empty()) {
-            // Kizuna: the decodes still on the GPU, waited for and freed, then once more.
-            while (WaitOldestTranscode()) {
-            }
             free_transcodes.clear();
             decode = memory_allocator.TryCreateImage(decode_ci, true);
         }
@@ -5485,12 +6242,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
-    // Kizuna: the BC copy's own size, a few texels more than the image's for GetPaddedBcShape.
-    u32 host_offset{};
-    const ImageInfo host_info = TrimmedHostInfo(device, info, host_offset);
     for (u32 level = 0; level < levels; ++level) {
-        const u32 level_width = (std::max)(host_info.size.width >> level, 1U);
-        const u32 level_height = (std::max)(host_info.size.height >> level, 1U);
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
@@ -5512,8 +6266,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
         bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, (std::max)(width >> level, 1U),
-                                (std::max)(height >> level, 1U), layers, bc3, output.buffer,
+                                copies[level].image_extent.height, layers, bc3, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -5528,7 +6281,6 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
-    pending_transcode_bytes += needed_bytes;
     pending_transcodes.push_back(std::move(pending));
 }
 

@@ -1,7 +1,7 @@
 # Fritchii branding
 
-Fritchii is Frizti's fork of Lichii. Its own look (name, logo) is kept apart from emulator work so
-upstream can take fixes without it.
+Fritchii's own look (name, logo) is kept apart from emulator work so
+other builds can take its fixes without it.
 
 ## Telling branding from fixes
 
@@ -13,17 +13,16 @@ git log --grep='^Fritchii-Branding: yes' --oneline           # branding commits
 git log --invert-grep --grep='^Fritchii-Branding: yes' ...    # everything else (fixes, ports)
 ```
 
-When cherry-picking from Fritchii into Lichii, leave the branding commits out. A Claude doing the
+When cherry-picking fixes out of Fritchii, leave the branding commits out. A Claude doing the
 merge can be told: "skip commits with the trailer Fritchii-Branding: yes".
 
 ## What branding changes
 
-- `dist/fritchii.ico`, `dist/fritchii.png`: the logo (art by Frizti, Triforce badge added).
-- `src/yuzu/yuzu.rc`, `src/yuzu_cmd/yuzu.rc`, `src/dedicated_room/yuzu_room.rc`, `src/yuzu/yuzu.qrc`,
-  `dist/qt_themes/default/default.qrc`: point the existing icon names at the Fritchii files.
+- `dist/fritchii.ico`, `dist/fritchii.png`: the logo, the pear (art by Freshdyno, made for Fritchii; `dist/lichii.*` hold the same art until the file rename).
+- `src/yuzu/yuzu.rc`, `src/yuzu/yuzu.qrc`, `dist/qt_themes/default/default.qrc`: point the existing icon names at the Fritchii files.
 - Version string and window title "Fritchii vN" (CMakeModules/GenerateSCMRev.cmake,
   src/qt_common/qt_common.cpp, src/yuzu/bootmanager.cpp), only when dist/frizti_version.txt exists.
 - This folder.
 
-The executable stays `lichii.exe` and user data stays in the same folder, so Lichii and Fritchii
-installs share settings, saves and caches.
+The executable is still `lichii.exe` (it becomes `fritchii.exe` later); user data lives in
+`%APPDATA%\fritchii` since v5.8.

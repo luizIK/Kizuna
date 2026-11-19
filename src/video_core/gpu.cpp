@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -23,6 +23,8 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/buffer_cache/read_run_stats.h"
+#include "video_core/buffer_cache/store_footprint_live.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -39,10 +41,14 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
+#include "video_core/one_follower.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -111,8 +117,87 @@ struct GPU::Impl {
         renderer->ReadRasterizer()->FlushCommands();
     }
 
+    /// FRITCHII_GATHER_EMPTY_TEST's counts, one line every 10 s (any gathering thread; the clock
+    /// is read every 1,024th test).
+    static void NoteGatherEmptyTest(int mode, bool empty) {
+        static std::atomic<u64> asked{};
+        static std::atomic<u64> skipped{};
+        static std::atomic<s64> since{};
+        if (empty) {
+            skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((asked.fetch_add(1, std::memory_order_relaxed) & 1023) != 0) {
+            return;
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = since.load(std::memory_order_relaxed);
+        if (last == 0) {
+            since.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            asked.store(0, std::memory_order_relaxed);
+            skipped.store(0, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000 ||
+            !since.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        const double window = static_cast<double>(now - last) / 1000.0;
+        const u64 asked_count = asked.exchange(0, std::memory_order_relaxed);
+        const u64 skipped_count = skipped.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Gather empty test (FRITCHII_GATHER_EMPTY_TEST={}) {:.0f} s: gathers asked "
+                 "{:.0f}/s, skipped as empty {:.0f}/s ({:.1f}%)",
+                 mode, window, static_cast<double>(asked_count) / window,
+                 static_cast<double>(skipped_count) / window,
+                 asked_count != 0 ? 100.0 * static_cast<double>(skipped_count) /
+                                        static_cast<double>(asked_count)
+                                  : 0.0);
+    }
+
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        // EDEN_NX2_RUNAHEAD: behind the frontier the guest's newest bytes are not the draws'
+        // (the front's next boundary takes them); past it they are applied at once (exact).
+        if (VideoCommon::Runahead::HandleInvalidate(system)) {
+            return;
+        }
+        // FRITCHII_GATHER_EMPTY_TEST (live, default 0; fable_front_drains 8.2 G3): most gathers
+        // find nothing. Each manager answers that without a lock (NothingCollected: a write
+        // collected before this test is seen, or a gather already took it); a write collected
+        // after it is taken by the next gather, as when it lands after the managers' locks.
+        if (const int empty_test = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_gather_empty_test, "FRITCHII_GATHER_EMPTY_TEST");
+            empty_test != 0) {
+            const bool empty = std::ranges::all_of(
+                system.GetGPUDirtyMemoryManager(),
+                [](const Core::GPUDirtyMemoryManager& manager) {
+                    return manager.NothingCollected();
+                });
+            NoteGatherEmptyTest(empty_test, empty);
+            if (empty) {
+                return;
+            }
+        }
+        // FRITCHII_MEMSTAGE_PASS bit 1 (fable_stage_levelpoints 6.3, 13.3 item 5): the back in a
+        // served entry takes nothing itself, read tracking or not. Empty collectors: nothing to
+        // do (a write collected after this test is taken at the next gather, as one collected
+        // after the managers' locks). Else the take and the buffer half run on GPUMem in one
+        // served call, so only GPUMem takes while the back is served (no write sits between two
+        // takers while a fill passes); that take is listed as below (rule T).
+        // Bit 2 too (P3): a passed fence entry's fence ends in this gather while served.
+        if (VideoCommon::MemoryStageLink::BackServed() && VideoCommon::MemoryStageLink::PassOn(3)) {
+            if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
+                                    [](const Core::GPUDirtyMemoryManager& manager) {
+                                        return manager.NothingCollected();
+                                    })) {
+                return;
+            }
+            if (renderer->ReadRasterizer()->GatherOnStage()) {
+                return;
+            }
+        }
         std::vector<std::pair<DAddr, u64>> writes;
         std::function<void(PAddr, size_t)> callback_writes(
             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
@@ -147,6 +232,42 @@ struct GPU::Impl {
         renderer->ReadRasterizer()->OnCacheInvalidations(writes);
     }
 
+    /// FRITCHII_MEMSTAGE_PASS (GPUMem): the take alone (GPU::TakeCpuWrites), listed on
+    /// applying_writes whatever EXP49 says (fable_stage_levelpoints 13.3, rule T): until the
+    /// buffer cache has the writes, a landing of downloaded GPU bytes leaves them out, as for a
+    /// tracked gather. `out` must not move or change while listed. True when listed.
+    bool TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+        if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
+                                [](const Core::GPUDirtyMemoryManager& manager) {
+                                    return manager.NothingCollected();
+                                })) {
+            return false;
+        }
+        std::function<void(PAddr, size_t)> callback(
+            [&out](PAddr address, size_t size) { out.emplace_back(address, size); });
+        // Lock order: applying_writes_mutex, then the managers' (as ForEachPendingCpuWrite).
+        std::scoped_lock lock{applying_writes_mutex};
+        system.GatherGPUDirtyMemory(callback);
+        if (out.empty()) {
+            return false;
+        }
+        applying_writes.push_back(&out);
+        return true;
+    }
+
+    /// Rule T: the list TakeCpuWrites listed leaves applying_writes (the buffer cache has it).
+    void ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list) {
+        std::scoped_lock lock{applying_writes_mutex};
+        std::erase(applying_writes, list);
+    }
+
+    /// Rule T's check: how many lists are on applying_writes (0 at the ring's end, no gather
+    /// running).
+    size_t ListedWrites() {
+        std::scoped_lock lock{applying_writes_mutex};
+        return applying_writes.size();
+    }
+
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
         std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
@@ -156,6 +277,15 @@ struct GPU::Impl {
             for (const auto& [address, size] : *writes) {
                 callback(address, size);
             }
+        }
+        // EDEN_NX2_RUNAHEAD: writes taken into chunks the back has not applied yet.
+        if (VideoCommon::Runahead::g_exact_used.load(std::memory_order_acquire)) {
+            VideoCommon::Runahead::ForEachUnappliedRange(
+                [](void* argument, u64 address, u64 size) {
+                    (*static_cast<const std::function<void(DAddr, size_t)>*>(argument))(
+                        address, static_cast<size_t>(size));
+                },
+                const_cast<std::function<void(DAddr, size_t)>*>(&callback));
         }
     }
 
@@ -202,7 +332,7 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
-        // EDEN_NX2_EXP29 & 2 (zortos293/Lichii#717 EDEN_NX2_OPT_TICKWORK): TickWork runs for
+        // EDEN_NX2_EXP29 & 2 (the original's EDEN_NX2_OPT_TICKWORK): TickWork runs for
         // every draw, clear and dispatch; check without the mutex whether a request is queued
         // at all. A request queued after this check runs at the next TickWork, as one queued
         // just after the loop below empties the queue does; whoever queued it and then had this
@@ -216,6 +346,7 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();
@@ -307,8 +438,41 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        namespace ReadRunStats = VideoCommon::ReadRunStats;
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_run_pages = 0;
+            ReadRunStats::t_read_bytes = {};
+            ReadRunStats::t_writer_answer = {};
+        }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        // FRITCHII_STORE_FOOTPRINT=2: a sampled read compares its bytes once its wait is over
+        // (nothing pending: one acquire load)
+        SCOPE_EXIT {
+            VideoCommon::StoreFootprintLive::FinishVerify(
+                addr, size, [this](u64 address, u8* out, u64 bytes) {
+                    system.Host1x().MemoryManager().ReadBlockUnsafe(address, out, bytes);
+                });
+        };
         if (raster_area.preemtive) {
+            return raster_area;
+        }
+        // FRITCHII_READ_RUNS: this read goes to the back or waits for a download.
+        const u64 run_pages = ReadRunStats::t_run_pages;
+        const ReadRunStats::ReadBytes read_bytes =
+            ReadRunStats::g_enabled ? ReadRunStats::t_read_bytes : ReadRunStats::ReadBytes{};
+        const u64 run_start = ReadRunStats::g_enabled ? VideoCore::AsyncReadback::Now() : 0;
+        // EDEN_NX2_EXP72: everything this read lacks is in a fence download already submitted:
+        // wait for it to land instead of a new copy behind all the work recorded since.
+        if (raster_area.fence_download != 0 &&
+            renderer->ReadRasterizer()->WaitFenceDownload(raster_area.fence_download)) {
+            raster_area.preemtive = true;
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                const u64 wait_ns = VideoCore::AsyncReadback::Now() - run_start;
+                ReadRunStats::NoteRead(ReadRunStats::Kind::FenceDownload,
+                                       raster_area.start_address, run_pages, wait_ns, size,
+                                       read_bytes);
+                NoteReadWriter(ReadRunStats::Kind::FenceDownload, wait_ns);
+            }
             return raster_area;
         }
         raster_area.preemtive = true;
@@ -322,7 +486,7 @@ struct GPU::Impl {
         namespace AsyncReadback = VideoCore::AsyncReadback;
         const u64 request = AsyncReadback::Now();
         const u64 area_size = raster_area.end_address - raster_area.start_address;
-        // EDEN_NX2_EXP49 (live; zortos293/Lichii#1028): the GPU thread submits the read's
+        // EDEN_NX2_EXP49 (live): the GPU thread submits the read's
         // downloads without waiting for the host GPU, and this thread waits for them. An area an
         // earlier read's downloads cover (in_flight) only waits; with the switch off it flushes
         // as before, which lands or downloads those bytes again.
@@ -346,6 +510,8 @@ struct GPU::Impl {
             });
             gpu_thread.TickGPU(is_async);
             WaitForSyncOperation(fence);
+            AsyncReadback::Add(AsyncReadback::g_counters.to_flushed_ns,
+                               AsyncReadback::Now() - request);
         }
         AsyncReadback::Read kind = AsyncReadback::Read::Sync;
         if (async) {
@@ -358,7 +524,30 @@ struct GPU::Impl {
         }
         AsyncReadback::CountRead(kind, AsyncReadback::Now() - request);
         AsyncReadback::MaybeReport();
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            const ReadRunStats::Kind read_kind = kind == AsyncReadback::Read::InFlight
+                                                     ? ReadRunStats::Kind::InFlight
+                                                     : ReadRunStats::Kind::Flushed;
+            const u64 wait_ns = AsyncReadback::Now() - run_start;
+            ReadRunStats::NoteRead(read_kind, raster_area.start_address, run_pages, wait_ns, size,
+                                   read_bytes);
+            NoteReadWriter(read_kind, wait_ns);
+        }
         return raster_area;
+    }
+
+    /// FRITCHII_READ_RUNS: the read's writer, as GetFlushArea found it, and whether the read's
+    /// bytes in guest memory differ now that its download landed from before it landed.
+    void NoteReadWriter(VideoCommon::ReadRunStats::Kind kind, u64 wait_ns) {
+        namespace ReadRunStats = VideoCommon::ReadRunStats;
+        const ReadRunStats::WriterAnswer& answer = ReadRunStats::t_writer_answer;
+        std::array<u8, ReadRunStats::CompareBytes> after{};
+        if (answer.compared != 0) {
+            system.Host1x().MemoryManager().ReadBlockUnsafe(answer.address, after.data(),
+                                                            answer.compared);
+        }
+        ReadRunStats::NoteWriter(kind, wait_ns, answer,
+                                 answer.compared != 0 ? after.data() : nullptr);
     }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
@@ -548,6 +737,18 @@ void GPU::InvalidateGPUCache() {
     impl->InvalidateGPUCache();
 }
 
+bool GPU::TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+    return impl->TakeCpuWrites(out);
+}
+
+void GPU::ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list) {
+    impl->ReleaseTakenWrites(list);
+}
+
+size_t GPU::ListedWrites() {
+    return impl->ListedWrites();
+}
+
 bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
     for (auto& manager : impl->system.GetGPUDirtyMemoryManager()) {
         if (manager.Overlaps(addr, size)) {
@@ -661,6 +862,41 @@ bool GPU::IsAsync() const {
 
 bool GPU::HasSuspendedChannels() const {
     return impl->scheduler.HasPendingChannelsAnyThread();
+}
+
+void GPU::LogHangState() {
+    auto& host1x = impl->system.Host1x();
+    std::string acquires;
+    u32 count = 0;
+    // Every suspended acquire registers here (Puller::ProcessSemaphoreAcquire), the channel's own
+    // and the memory stage's watches alike. The word is read as the guest sees it now.
+    const bool listed = Nx2SemaphoreWaiters::Get().TryForEach(
+        [&](u64 address, u32 value, u32 operation, bool latched, const u32* word, double seconds) {
+            if (++count > 16) {
+                return;
+            }
+            const u32 now = word != nullptr
+                                ? std::atomic_ref<u32>{*const_cast<u32*>(word)}.load(
+                                      std::memory_order_relaxed)
+                                : host1x.MemoryManager().Read<u32>(address);
+            acquires += fmt::format(
+                "{}device {:#x} {} {:#x}, word now {:#x}{}, for {:.1f} s",
+                acquires.empty() ? "" : "; ", address,
+                operation == Nx2SemaphoreWaiters::AcquireEqual    ? "=="
+                : operation == Nx2SemaphoreWaiters::AcquireGequal ? ">="
+                : operation == Nx2SemaphoreWaiters::AcquireMask   ? "&"
+                                                                  : "?",
+                value, now, latched ? " (latched by a GPU write)" : "", seconds);
+        });
+    LOG_CRITICAL(HW_GPU,
+                 "Hang report: channels suspended on an acquire: {}; acquires waiting ({}): {}",
+                 HasSuspendedChannels() ? "yes" : "no", count,
+                 !listed            ? std::string{"not read: their lock stayed held for 200 ms"}
+                 : acquires.empty() ? std::string{"none"}
+                                    : acquires);
+    LOG_CRITICAL(HW_GPU, "Hang report: syncpoint waits: {}",
+                 host1x.GetSyncpointManager().DescribeWaits());
+    VideoCommon::OneFollower::ReportHangState();
 }
 
 bool GPU::UseNvdec() const {

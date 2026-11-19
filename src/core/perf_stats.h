@@ -82,6 +82,18 @@ private:
     Clock::duration previous_frame_length = Clock::duration::zero();
     /// Previously computed fps
     double previous_fps = 0;
+
+    /// Whole-run frame times for the "Run summary:" line at game stop (1% and 0.1% lows): 0.25 ms
+    /// buckets like the test scripts' histograms, the last one holds every frame of 1 s or more.
+    /// Unlike perf_history it never fills up.
+    static constexpr std::size_t RunBucketUs = 250;
+    static constexpr std::size_t RunBuckets = 4000;
+    std::array<u32, RunBuckets> run_buckets{};
+    u64 run_frames = 0;
+    Clock::duration run_time = Clock::duration::zero();
+    Clock::duration run_longest = Clock::duration::zero();
+    u64 run_over_100ms = 0;
+    void LogRunSummary() const;
 };
 
 class SpeedLimiter {

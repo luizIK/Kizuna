@@ -70,8 +70,11 @@ void MigrationWorker::process() {
                 fs::create_directories(shader);
             }
         });
+        // The cache came along or was cleared on purpose: Fritchii's startup catch-up
+        // (UserDataMigrator::CatchUpShaderCache) must not bring it back.
+        FrontendCommon::MarkShaderCacheCatchUpDone();
 
-        QString message = tr("Data was imported successfully. Existing Lichii data, if any, "
+        QString message = tr("Data was imported successfully. Existing Fritchii data, if any, "
                              "was kept in backup directories beside the new profile.");
         if (strategy == MigrationStrategy::Link) {
             message += tr("\n\nData and settings are shared with %1. The source shader cache "
@@ -88,7 +91,7 @@ void MigrationWorker::process() {
         emit finished(message, PathToUTF8String(source));
     } catch (const std::exception& exception) {
         emit error(tr("Import did not complete. Your source and previous destination data "
-                      "have been kept. Close Lichii and launch it again to retry or recover.\n\n%1")
+                      "have been kept. Close Fritchii and launch it again to retry or recover.\n\n%1")
                        .arg(QString::fromUtf8(exception.what())));
     }
 }

@@ -17,7 +17,7 @@
 #include "common/logging.h"
 #include "video_core/nx2_debug_control.h"
 
-// TEST: EDEN_NX2_LIST_VERIFY=1 (live; the LIST_VERIFY part of zortos293/Lichii#805 3a665f9f27).
+// TEST: EDEN_NX2_LIST_VERIFY=1 (live; the LIST_VERIFY part of a ported change).
 // Each command list the split's front reads on GPU-written pages (DmaPusher::
 // ReadGpuWrittenCommands) is read again as the front read such lists before EXP40: after every
 // dispatch and copy sent so far (GpuSplit::WaitForWriters), from the pages' whole copies

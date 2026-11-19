@@ -6,8 +6,10 @@
 #include <cwctype>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #ifndef SI_NO_CONVERSION
 #define SI_NO_CONVERSION 1
@@ -108,6 +110,204 @@ void CheckLegacyProfileBeforeConfig() {
                                  "Open the Kizuna window to import it or explicitly start fresh "
                                  "before using eden-cli. No configuration was created.");
     }
+}
+
+namespace {
+
+/// This fork's own pipeline cache files (vk_pipeline_cache.cpp): never replaced by an old copy.
+constexpr std::array<std::string_view, 2> OwnPipelineStems{"vulkan-frizti", "vulkan_used-frizti"};
+
+/// "vulkan-frizti.fork-v54.bin" -> "vulkan-frizti-imported.fork-v54.bin", the name the pipeline
+/// cache merges once at boot; empty for any other file.
+std::string ImportedPipelineName(const std::string& name) {
+    if (!name.ends_with(".bin")) {
+        return {};
+    }
+    for (const auto stem : OwnPipelineStems) {
+        if (name.size() > stem.size() && name.starts_with(stem) && name[stem.size()] == '.') {
+            return std::string{stem} + "-imported" + name.substr(stem.size());
+        }
+    }
+    return {};
+}
+
+/// The pipeline cache's merge log (vulkan-frizti.fork-v54.bin.merged): it belongs to its cache.
+bool IsOwnMergeLog(const std::string& name) {
+    return name.starts_with("vulkan-frizti.") && name.ends_with(".bin.merged");
+}
+
+fs::path ShaderCacheCatchUpMarker() {
+    return ProfileImportStateDirectory() / "shader-cache-copied";
+}
+
+} // namespace
+
+ShaderCacheCopy PlanShaderCacheCopy(const std::vector<fs::path>& sources,
+                                    const fs::path& destination) {
+    struct Newest {
+        fs::path source;
+        fs::file_time_type time;
+        std::uintmax_t size{};
+    };
+    // Newest wins per file across the sources.
+    std::map<fs::path, Newest> newest;
+    const auto now = fs::file_time_type::clock::now();
+    for (const auto& root : sources) {
+        std::error_code ec;
+        if (!fs::is_directory(root, ec) || fs::is_symlink(root, ec)) {
+            continue;
+        }
+        for (auto it = fs::recursive_directory_iterator(
+                 root, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            std::error_code entry_ec;
+            if (it->is_symlink(entry_ec)) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file(entry_ec)) {
+                continue;
+            }
+            const auto name = Common::FS::PathToUTF8String(it->path().filename());
+            if (name.ends_with(".fritchii-copy") || name.ends_with(".migrating")) {
+                continue; // a copy another program left half done
+            }
+            const auto time = it->last_write_time(entry_ec);
+            const auto size = entry_ec ? 0 : it->file_size(entry_ec);
+            if (entry_ec) {
+                continue;
+            }
+            // Written in the last seconds: the old emulator may still be writing it.
+            const auto age = now - time;
+            if (age >= decltype(age)::zero() && age < std::chrono::seconds{10}) {
+                continue;
+            }
+            const auto [entry, added] = newest.try_emplace(it->path().lexically_relative(root),
+                                                           Newest{it->path(), time, size});
+            if (!added && time > entry->second.time) {
+                entry->second = Newest{it->path(), time, size};
+            }
+        }
+    }
+
+    ShaderCacheCopy plan;
+    const auto add = [&](const Newest& from, const fs::path& target) {
+        plan.files.push_back({from.source, target, from.size});
+        plan.bytes += from.size;
+    };
+    // True when `target` is missing or older than `from` (and not the same file copied before).
+    const auto wanted = [](const Newest& from, const fs::path& target) {
+        std::error_code ec;
+        if (!fs::exists(target, ec)) {
+            return !ec;
+        }
+        const auto time = fs::last_write_time(target, ec);
+        return !ec && time < from.time;
+    };
+    std::vector<fs::path> own_copied; // this fork's caches copied under their own names
+    for (const auto& [relative, from] : newest) {
+        const auto name = Common::FS::PathToUTF8String(relative.filename());
+        if (IsOwnMergeLog(name)) {
+            continue;
+        }
+        const auto target = destination / relative;
+        const auto imported = ImportedPipelineName(name);
+        std::error_code ec;
+        if (!imported.empty() && fs::exists(target, ec)) {
+            // Fritchii has its own cache of this game already (played since the import): keep
+            // it, and put the old one beside it for the boot to merge.
+            const bool same = fs::file_size(target, ec) == from.size && !ec &&
+                              fs::last_write_time(target, ec) == from.time && !ec;
+            if (!same && wanted(from, target.parent_path() / imported)) {
+                add(from, target.parent_path() / imported);
+            }
+            continue;
+        }
+        if (wanted(from, target)) {
+            add(from, target);
+            if (!imported.empty()) {
+                own_copied.push_back(relative);
+            }
+        }
+    }
+    // A merge log goes with its cache, and only when that cache was copied under its own name.
+    for (const auto& [relative, from] : newest) {
+        const auto name = Common::FS::PathToUTF8String(relative.filename());
+        if (!IsOwnMergeLog(name)) {
+            continue;
+        }
+        auto cache = relative;
+        cache.replace_extension(); // drops ".merged"
+        if (std::ranges::find(own_copied, cache) != own_copied.end()) {
+            add(from, destination / relative);
+        }
+    }
+    return plan;
+}
+
+ShaderCacheCopyResult CopyShaderCache(const ShaderCacheCopy& plan,
+                                      std::atomic<std::uintmax_t>* copied) {
+    ShaderCacheCopyResult result;
+    for (const auto& file : plan.files) {
+        std::error_code ec;
+        auto temporary = file.destination;
+        temporary += ".fritchii-copy";
+        fs::create_directories(file.destination.parent_path(), ec);
+        if (!ec) {
+            fs::copy_file(file.source, temporary, fs::copy_options::overwrite_existing, ec);
+        }
+        if (!ec) {
+            // Keep the old file's time, so a later newest-wins pass compares real ages.
+            std::error_code time_ec;
+            const auto time = fs::last_write_time(file.source, time_ec);
+            if (!time_ec) {
+                fs::last_write_time(temporary, time, time_ec);
+            }
+            fs::rename(temporary, file.destination, ec);
+        }
+        if (ec) {
+            std::error_code ignored;
+            fs::remove(temporary, ignored);
+            if (result.failed++ == 0) {
+                result.first_error =
+                    Common::FS::PathToUTF8String(file.source) + ": " + ec.message();
+            }
+        } else {
+            ++result.files;
+            result.bytes += file.size;
+        }
+        if (copied) {
+            copied->fetch_add(file.size, std::memory_order_relaxed);
+        }
+    }
+    return result;
+}
+
+bool HasRoomForShaderCache(const fs::path& destination, std::uintmax_t bytes) {
+    constexpr std::uintmax_t Spare = std::uintmax_t{1} << 30;
+    std::error_code ec;
+    auto path = destination;
+    while (!fs::exists(path, ec)) {
+        const auto parent = path.parent_path();
+        if (parent.empty() || parent == path) {
+            return false;
+        }
+        path = parent;
+    }
+    const auto space = fs::space(path, ec);
+    return !ec && space.available >= bytes + Spare;
+}
+
+bool ShaderCacheCatchUpDone() {
+    std::error_code ec;
+    return fs::exists(ShaderCacheCatchUpMarker(), ec);
+}
+
+void MarkShaderCacheCatchUpDone() {
+    std::error_code ec;
+    fs::create_directories(ProfileImportStateDirectory(), ec);
+    std::ofstream file{ShaderCacheCatchUpMarker(), std::ios::trunc};
+    file << "1\n";
 }
 
 fs::path RemapImportedPath(const fs::path& value, const fs::path& source,

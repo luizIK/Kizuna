@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/settings.h"
@@ -208,7 +207,7 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
     }
 
     // Safe optimizations
-    switch (Settings::values.cpu_accuracy.GetValue()) {
+    switch (Settings::EffectiveCpuAccuracy()) {
     case Settings::CpuAccuracy::Debugging:
         if (!Settings::values.cpuopt_page_tables) {
             config.page_table = nullptr;

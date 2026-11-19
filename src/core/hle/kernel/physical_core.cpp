@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -13,10 +13,13 @@
 #elif defined(__aarch64__)
 #define NX2_IDLE_HAS_PAUSE 1
 #endif
+#include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
@@ -31,8 +34,8 @@ namespace Kernel {
 
 namespace {
 
-/// EDEN_NX2_IDLE_PAUSE=1 (live, VideoCore::Nx2Debug::g_idle_pause, off by default; from
-/// zortos293/Lichii#641, where it is on): Idle's poll runs PAUSE instead of SwitchToThread, so
+/// EDEN_NX2_IDLE_PAUSE=1 (live, VideoCore::Nx2Debug::g_idle_pause, off by default; ported
+/// from a build where it is on): Idle's poll runs PAUSE instead of SwitchToThread, so
 /// there is no syscall per iteration (10-16% of each guest core in Castle Town), and reads the
 /// clock only every 16 pauses instead of every iteration. The poll stays bounded by time: 16
 /// pauses are ~2,200 cycles on Intel Skylake and later (~140 each) and far fewer on AMD (~10-60
@@ -55,13 +58,13 @@ void IdlePause() {
 #endif
 }
 
-/// EDEN_NX2_CORE_LOCK=1 (boot switch, off by default; from zortos293/Lichii#641, where it is on):
+/// EDEN_NX2_CORE_LOCK=1 (boot switch, off by default; ported from a build where it is on):
 /// the core context lock is a KSpinLock (spins briefly, then an address wait) instead of a
 /// std::mutex, and Idle sleeps on an address wait on the interrupt flag instead of a condition
 /// variable; Interrupt sets the flag and signals the JIT under the lock and wakes the sleeper
 /// after releasing it. This sits on the scheduler's thread-state path (OnThreadStateChanged ->
 /// scheduler lock Unlock -> RescheduleCores -> Interrupt), 10-16% of each guest core in Castle
-/// Town. #641 also moved the waits to its own WaitOnAddress wrapper because libstdc++'s
+/// Town. The ported change also moved the waits to its own WaitOnAddress wrapper because libstdc++'s
 /// std::atomic::wait goes through winpthreads on MinGW; here std::atomic::wait is used, which on
 /// MSVC's STL (the clang-cl builds) already is WaitOnAddress. Read once per core at kernel setup,
 /// so a core never mixes the two locks.
@@ -114,7 +117,8 @@ private:
 };
 
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
-    : m_core_index{core_index}, m_core_lock{CoreLockEnabled()}
+    : m_core_index{core_index}, m_core_lock{CoreLockEnabled()},
+      m_idle_stats{std::getenv("EDEN_NX2_IDLE_STATS") != nullptr}
 {
     m_is_single_core = !kernel.IsMulticore();
 }
@@ -126,6 +130,12 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
     auto* interface = process->GetArmInterface(m_core_index);
 
     interface->Initialize();
+
+    // FRITCHII_SIM_CPU_SLOW: the guest code and the kernel call it ends in.
+    Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Game);
+    SCOPE_EXIT {
+        Common::LowEndSim::CpuWorkEnd();
+    };
 
     const auto EnterContext = [&]() {
         // Lock the core context.
@@ -208,6 +218,14 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             ExitContext();
         }
 
+        // Fritchii: a requested backtrace (ArmInterface::RequestBacktrace), with the registers
+        // synced now that the JIT returned.
+        if (const char* reason = interface->TakeBacktraceRequest()) [[unlikely]] {
+            LOG_CRITICAL(Core_ARM, "Guest backtrace ({}): core {}, guest thread {}", reason,
+                         m_core_index, thread->GetThreadId());
+            interface->LogBacktrace(process);
+        }
+
         // Determine why we stopped.
         // If a step completed successfully, skip other halt reason handlers
         // the step takes priority (e.g. step may also set InstructionBreakpoint
@@ -238,6 +256,17 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 system.GetDebugger().NotifyThreadStopped(thread);
             } else {
                 interface->LogBacktrace(process);
+                // Without a debugger the thread stays suspended for good: on a console the game
+                // would have crashed here. The hang report names it.
+                Svc::ThreadContext context{};
+                interface->GetContext(context);
+                NoteGuestCrashForHangReport(thread->GetThreadId(), context.pc,
+                                            breakpoint ? "a breakpoint" : "a prefetch abort");
+                LOG_CRITICAL(Core_ARM,
+                             "Guest thread {} stopped for good on core {} after {} at pc {:#x} "
+                             "(the game crashed; without a debugger it stays suspended)",
+                             thread->GetThreadId(), m_core_index,
+                             breakpoint ? "a breakpoint" : "a prefetch abort", context.pc);
             }
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;
@@ -326,6 +355,8 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
 
 void PhysicalCore::Idle(KernelCore& kernel) {
     Common::Nx2Timeline::Span timeline_span{"guest core idle"};
+    // FRITCHII_SIM_CPU_SLOW: the idle poll below is not work.
+    Common::LowEndSim::CpuWorkCancel();
     // EDEN_NX2_JIT_WARM=1: each emulated core has its own JIT, so code one core compiled is
     // compiled again by every other core the first time it runs it there (bursts of 60-180 ms
     // frames after area loads, 2026-11-10). An idle core compiles that code now, a few blocks at
@@ -333,6 +364,34 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     // every 100 ms per core: unbudgeted, the cores never rested while new code poured in at boot
     // and took the host CPU from the GPU thread and shader workers (first load 761 -> 811 ms,
     // hitch time 2.6 -> 3.7 s in the first 100 s; reloads 1.64 -> 1.34 s).
+    // FRITCHII_JIT_HOT_PACK (live test hook, default 0; fable_a_gameceiling_answer 12.3): each new
+    // non-zero value makes every core, at its next idle, clear its code cache and compile Fable
+    // A's hot list (FRITCHII_JIT_HOT_LIST) first in pc order; the rest compiles again as it runs.
+    // Prices the "arriving at a block" share (code layout): compare fps before and after.
+    if (const int pack = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_jit_hot_pack,
+                                                          "FRITCHII_JIT_HOT_PACK");
+        pack != 0 && !m_is_interrupted.load(std::memory_order_acquire)) [[unlikely]] {
+        thread_local int served = 0;
+        if (pack != served) {
+            served = pack;
+            if (KProcess* const process = kernel.ApplicationProcess()) {
+                if (auto* const arm = process->GetArmInterface(m_core_index)) {
+                    const auto start = std::chrono::steady_clock::now();
+                    const std::size_t compiled = arm->PackHotCode(m_is_interrupted);
+                    LOG_INFO(Core_ARM,
+                             "JIT hot pack (FRITCHII_JIT_HOT_PACK={}) core {}: cache cleared, {} hot "
+                             "blocks gone through in {} ms{}",
+                             pack, m_core_index, compiled,
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count(),
+                             m_is_interrupted.load(std::memory_order_acquire)
+                                 ? " (stopped by an interrupt)"
+                                 : "");
+                }
+            }
+        }
+    }
     if (Common::Nx2Hitch::JitWarmEnabled() && !m_is_interrupted.load(std::memory_order_acquire)) {
         if (KProcess* const process = kernel.ApplicationProcess()) {
             if (auto* const arm = process->GetArmInterface(m_core_index)) {
@@ -358,8 +417,8 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         }
     }
     // Guest job systems hand work between cores many times per frame; blocking at once adds the
-    // host's thread wake-up latency to every handoff. EDEN_NX2_IDLE_SPIN_US=<n>: poll for that
-    // many microseconds before blocking. Switch 2 titles poll 100 us by default outside Android
+    // host's thread wake-up latency to every handoff. EDEN_NX2_IDLE_SPIN_US=<n>: poll for up to
+    // that many microseconds before blocking. Switch 2 titles poll 100 us by default outside Android
     // (title 1's frames: 42 ms without, 35 ms with 50 us, 34 ms with 100 us, 36 ms with 300 us).
     static const long long spin_setting = [] {
         const char* text = std::getenv("EDEN_NX2_IDLE_SPIN_US");
@@ -372,36 +431,143 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 #else
         const KProcess* process = kernel.ApplicationProcess();
         spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
+        // EXP113 (live; 1 = no poll, N > 1 = poll at most N us): OoT's guest cores idle many
+        // times a frame, and with SMT each one polling shares a physical core with our GPU
+        // threads. Measured elsewhere on the fountain lap at 1X: 100 us 52.2 fps, 25 us 57.7,
+        // 0 us 60.1 (5 and 10 us level with 0). Only when EDEN_NX2_IDLE_SPIN_US is not set.
+        if (spin_us > 0) {
+            constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+            if (const int exp113 = VideoCore::Nx2Debug::Experiment(113);
+                exp113 > 0 && process->GetProgramId() == OcarinaOfTime) {
+                spin_us = exp113 == 1 ? 0 : exp113;
+            }
+        }
 #endif
     }
-    const auto spin = std::chrono::microseconds{spin_us};
-    if (spin.count() > 0) {
-        const auto deadline = std::chrono::steady_clock::now() + spin;
-        if (IdlePauseOn()) {
-            // EDEN_NX2_IDLE_PAUSE: the interrupt flag after every pause, the clock every 16.
-            for (u32 n = 1; !m_is_interrupted.load(std::memory_order_acquire); ++n) {
-                IdlePause();
-                if ((n & 15) == 0 && std::chrono::steady_clock::now() >= deadline) {
-                    break;
+    if (VideoCore::Nx2Debug::Experiment(79) == 0) {
+        const auto spin = std::chrono::microseconds{spin_us};
+        if (spin.count() > 0) {
+            const auto deadline = std::chrono::steady_clock::now() + spin;
+            if (IdlePauseOn()) {
+                // EDEN_NX2_IDLE_PAUSE: the interrupt flag after every pause, the clock every 16.
+                for (u32 n = 1; !m_is_interrupted.load(std::memory_order_acquire); ++n) {
+                    IdlePause();
+                    if ((n & 15) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                        break;
+                    }
+                }
+            } else {
+                while (!m_is_interrupted.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::yield();
                 }
             }
-        } else {
-            while (!m_is_interrupted.load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::yield();
+        }
+        if (m_core_lock) {
+            // EDEN_NX2_CORE_LOCK: the wait compares the flag before sleeping, so a store made
+            // after the load still wakes it (Interrupt notifies after every store).
+            while (!m_is_interrupted.load(std::memory_order_acquire)) {
+                m_is_interrupted.wait(false, std::memory_order_acquire);
             }
+            return;
         }
-    }
-    if (m_core_lock) {
-        // EDEN_NX2_CORE_LOCK: the wait compares the flag before sleeping, so a store made
-        // after the load still wakes it (Interrupt notifies after every store).
-        while (!m_is_interrupted.load(std::memory_order_acquire)) {
-            m_is_interrupted.wait(false, std::memory_order_acquire);
-        }
+        std::unique_lock lk{m_guard};
+        m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
         return;
     }
-    std::unique_lock lk{m_guard};
-    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+
+    // EXP79: that poll is a hardware wait on the interrupt
+    // flag (Common::WaitForFlag) rather than a spin of yields or pauses, and only as long as
+    // recent idle periods suggest it pays (Common::NextPollWindow): a core that keeps idling past
+    // the limit polls less, and blocks sooner. EDEN_NX2_IDLE_PAUSE does not apply here.
+    const std::chrono::nanoseconds limit = std::chrono::microseconds{spin_us};
+    const auto start = std::chrono::steady_clock::now();
+    bool polled = false;
+    std::chrono::steady_clock::rep interrupt_time{};
+    if (limit.count() > 0) {
+        if (m_idle_poll.count() <= 0 || m_idle_poll > limit) {
+            m_idle_poll = limit;
+        }
+        polled = Common::WaitForFlag(m_is_interrupted, start + m_idle_poll);
+    }
+    if (!polled) {
+        if (m_core_lock) {
+            // EDEN_NX2_CORE_LOCK: the address wait, as on the old path.
+            while (!m_is_interrupted.load(std::memory_order_acquire)) {
+                m_is_interrupted.wait(false, std::memory_order_acquire);
+            }
+            if (m_idle_stats) {
+                ScopedGuard lk{*this};
+                interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
+            }
+        } else {
+            std::unique_lock lk{m_guard};
+            m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+            // Under m_guard, as Interrupt writes it: no later interrupt can replace it yet.
+            interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
+        }
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const auto poll = m_idle_poll;
+    if (limit.count() > 0) {
+        m_idle_poll = Common::NextPollWindow(m_idle_poll, end - start, limit);
+    }
+
+    if (!m_idle_stats) {
+        return;
+    }
+    if (m_stats_start == std::chrono::steady_clock::time_point{}) {
+        m_stats_start = end;
+    }
+    ++m_stats_idles;
+    m_stats_poll_sum += std::min<std::chrono::nanoseconds>(poll, end - start);
+    if (polled) {
+        ++m_stats_polled;
+    } else {
+        const std::chrono::steady_clock::time_point interrupt{
+            std::chrono::steady_clock::duration{interrupt_time}};
+        // Clamped to the period: under EDEN_NX2_CORE_LOCK a later Interrupt can replace the time
+        // before the guard is taken here.
+        m_stats_blocked_wakes.push_back(end - std::clamp(interrupt, start, end));
+    }
+    if (end - m_stats_start < std::chrono::seconds{10}) {
+        return;
+    }
+    auto& wakes = m_stats_blocked_wakes;
+    const auto percentile = [&wakes](size_t percent) {
+        if (wakes.empty()) {
+            return 0.0;
+        }
+        const auto it = wakes.begin() + (wakes.size() - 1) * percent / 100;
+        std::nth_element(wakes.begin(), it, wakes.end());
+        return std::chrono::duration<double, std::micro>{*it}.count();
+    };
+    const double p50 = percentile(50);
+    const double p99 = percentile(99);
+    LOG_INFO(Core_ARM,
+             "Guest core {} idle over {:.1f} s: {} periods, {} woken while polling, {:.1f} us "
+             "polled on average; {} blocked, woken {:.1f} us (p50) {:.1f} us (p99) after the "
+             "interrupt; poll now {:.1f} us",
+             m_core_index, std::chrono::duration<double>{end - m_stats_start}.count(),
+             m_stats_idles, m_stats_polled,
+             std::chrono::duration<double, std::micro>{m_stats_poll_sum}.count() /
+                 static_cast<double>(m_stats_idles),
+             wakes.size(), p50, p99,
+             std::chrono::duration<double, std::micro>{m_idle_poll}.count());
+    m_stats_start = end;
+    m_stats_idles = 0;
+    m_stats_polled = 0;
+    m_stats_poll_sum = {};
+    wakes.clear();
+}
+
+u64 PhysicalCore::RequestBacktrace(const char* reason) {
+    ScopedGuard lk{*this};
+    if (m_arm_interface == nullptr || m_current_thread == nullptr) {
+        return ~u64{0};
+    }
+    m_arm_interface->RequestBacktrace(m_current_thread, reason);
+    return m_current_thread->GetThreadId();
 }
 
 bool PhysicalCore::IsInterrupted() const {
@@ -412,6 +578,10 @@ void PhysicalCore::Interrupt() {
     if (m_core_lock) {
         {
             ScopedGuard lk{*this};
+            if (m_idle_stats) {
+                m_interrupt_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                       std::memory_order_relaxed);
+            }
             m_is_interrupted.store(true, std::memory_order_seq_cst);
             if (m_arm_interface != nullptr) {
                 m_arm_interface->SignalInterrupt(m_current_thread);
@@ -428,6 +598,11 @@ void PhysicalCore::Interrupt() {
     // Load members.
     auto* arm_interface = m_arm_interface;
     auto* thread = m_current_thread;
+
+    if (m_idle_stats) {
+        m_interrupt_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                               std::memory_order_relaxed);
+    }
 
     // Add interrupt flag.
     m_is_interrupted = true;

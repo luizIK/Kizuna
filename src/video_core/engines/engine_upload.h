@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -63,6 +62,21 @@ public:
     ~State();
 
     void SetNativePartialTransfers(bool enabled) { native_partial = enabled; }
+
+    /// EXP124 (KeplerCompute::CallMacroWords): whether a last call's flush writes the words in
+    /// place (native partial transfers, linear, one line), whether words a call left are not
+    /// written yet, and while `on`, a last call's flush goes to AccelerateInlineWords: the words
+    /// since the last flush written as each word's own last call would have.
+    [[nodiscard]] bool FlushesInPlace() const {
+        return native_partial && is_linear && regs.line_count == 1;
+    }
+    [[nodiscard]] bool HasUnflushed() const {
+        return write_offset != flushed_offset;
+    }
+    void SetWordsAsCalls(bool on) {
+        words_as_calls = on;
+    }
+
     void ProcessExec(bool is_linear_);
     void ProcessData(u32 data, bool is_last_call);
     void ProcessData(const u32* data, size_t num_data);
@@ -82,6 +96,7 @@ private:
     void ProcessData(std::span<const u8> read_buffer);
 
     bool native_partial{};
+    bool words_as_calls{};
     u32 flushed_offset{};
     u32 write_offset = 0;
     u32 copy_size = 0;

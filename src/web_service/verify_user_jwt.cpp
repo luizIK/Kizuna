@@ -44,7 +44,7 @@ Network::VerifyUser::UserData VerifyUserJWT::LoadUserData(const std::string& ver
     using namespace jwt::params;
     std::error_code error;
 
-    // We use the Citra backend so the issuer is citra-core
+    // The backend's issuer is citra-core
     auto decoded =
         jwt::decode(token, algorithms({"rs256"}), error, secret(pub_key), issuer("citra-core"),
                     aud(audience), validate_iat(true), validate_jti(true));

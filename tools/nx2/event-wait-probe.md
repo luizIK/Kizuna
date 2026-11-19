@@ -26,9 +26,9 @@ relative to the start of `WaitFor`, not an assumed sleep duration. A signal
 delay of `-1` means no setter thread exists. Preserve the raw CSVs when comparing
 builds; these are wait-correctness measurements, not game frame-rate results.
 
-The six original Event regression tests come from Eglantine
-[#538](https://github.com/Djihads80/Eglantine/pull/538), commit `a51de161ed`.
-That PR replaces the Windows waiting policy with kernel timers. This fix instead
+The six original Event regression tests come from a ported
+change.
+That change replaces the Windows waiting policy with kernel timers. This fix instead
 retains MWAITX and retries nonsignalled wakes against a fixed deadline. Additional
 tests cover deterministic deadline/budget arithmetic, reset-induced wakes and
 extreme timeouts. Untimed `Event::Wait` remains the indefinite-wait API; negative

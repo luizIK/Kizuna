@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -16,6 +15,7 @@
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -95,13 +95,32 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     for (const DescriptorBufferBinding& binding : layout.bindings) {
         for (u32 index = 0; index < binding.count; ++index) {
             const DescriptorUpdateEntry& entry = *(payload++);
-            const VkDescriptorAddressInfoEXT address_info{
+            VkDescriptorAddressInfoEXT address_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
                 .pNext = nullptr,
                 .address = entry.address.address,
                 .range = entry.address.range,
                 .format = entry.address.format,
             };
+            const bool buffer_type = binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+            if (buffer_type && address_info.address < 0x1000 &&
+                (address_info.address != 0 || address_info.range != VK_WHOLE_SIZE))
+                [[unlikely]] {
+                // No buffer lives in the first page: address 0 with a real range (or an offset
+                // added to 0) is a missing buffer. The driver would build a descriptor that
+                // reads and writes at device address 0. The null form instead (address 0, whole
+                // size: what MakeBufferEntry already makes for a buffer without an address).
+                vk::NoteNullTarget(binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                           binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                                       ? "storage descriptor at device address 0, made null"
+                                       : "uniform descriptor at device address 0, made null",
+                                   std::source_location::current());
+                address_info.address = 0;
+                address_info.range = VK_WHOLE_SIZE;
+            }
             VkDescriptorGetInfoEXT get_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
                 .pNext = nullptr,
@@ -150,7 +169,7 @@ public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
     bool CanUsePushDescriptor() const noexcept {
-        if (!device->IsKhrPushDescriptorSupported() ||
+        if (device->PrefersDescriptorSets() || !device->IsKhrPushDescriptorSupported() ||
             num_descriptors > device->MaxPushDescriptors()) {
             return false;
         }
@@ -160,8 +179,8 @@ public:
 
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
-        if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+        if (device->PrefersDescriptorSets() || !device->IsExtDescriptorBufferSupported() ||
+            bindings.empty() || !props.combinedImageSamplerDescriptorSingleArray) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -429,6 +448,10 @@ public:
         return words;
     }
 
+    void Assign(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
+        words = data;
+    }
+
 private:
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
     u32* texture_ptr{words.data()};
@@ -442,6 +465,22 @@ public:
     bool uses_render_area{};
     std::array<f32, 4> words{};
 };
+
+/// Whether a depth-compare sample of image_view is undefined and its handle garbage: its format
+/// has no depth comparison on this device (what the sample returns then differs between vendors)
+/// and it is an integer or block-compressed color texture, or its handle was read from memory (a
+/// handle program). A single-channel color texture with a cbuf handle may be one a game compares
+/// on purpose, and keeps its view. Only with EDEN_NX2_LIGHT_TABLE_ARRAYS.
+[[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
+    if (image_view.SupportsDepthComparison()) {
+        return false;
+    }
+    const VideoCore::Surface::PixelFormat format{image_view.format};
+    return read_from_memory || VideoCore::Surface::IsPixelFormatInteger(format) ||
+           VideoCore::Surface::IsPixelFormatASTC(format) ||
+           VideoCore::Surface::IsPixelFormatBCn(format) ||
+           VideoCore::Surface::IsPixelFormatETC2(format);
+}
 
 /// `texture_rescaled`: when given, each texture descriptor's rescaling bit is also stored at
 /// *texture_rescaled, which advances (EDEN_NX2_EXP32 records them with the descriptors).
@@ -458,8 +497,14 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            if (desc.is_depth && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
+                VideoCore::Nx2Debug::LightTableArrays() &&
+                IsUncomparable(texture_cache.GetImageView(image_view_id),
+                               desc.handle_program != ~0U)) {
+                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {

@@ -1,14 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <utility>
+#include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/settings.h"
 #include "common/nx2_hitch.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -16,12 +23,43 @@
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
+#include "dynarmic/frontend/A64/a64_location_descriptor.h"
 
 namespace Core {
 
 using namespace Common::Literals;
+
+namespace {
+// EDEN_NX2_GUEST_THREAD_STATS: the JIT's dispatcher counters of each core's JITs (one per process).
+std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
+
+// Guest code invalidations (kernel code mapping, nn::ro, gdbstub, guest IC ops) and the page
+// copies one raced. Logged at 1, 2, 4, 8... so a log shows whether code changes.
+std::atomic<u64> g_code_invalidations{};
+std::atomic<u64> g_code_page_races{};
+
+void CountCodeInvalidation(std::size_t core, u64 addr, std::size_t size) {
+    const u64 n = g_code_invalidations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_INFO(Core_ARM, "JIT guest code invalidation #{} (core {}): {:#x}, {:#x} bytes", n, core,
+                 addr, size);
+    }
+}
+
+void CountCodePageRace(u64 page) {
+    const u64 n = g_code_page_races.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_WARNING(Core_ARM,
+                    "JIT code page {:#x} copied while it was invalidated: refetched (invalidation "
+                    "races avoided: {})",
+                    page, n);
+    }
+}
+} // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -42,8 +80,26 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     // With memory aborts ignored the guest keeps running on zeros: say where it read from.
     if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
         unmapped = 0;
+        // 32 lines a burst (reads a second or more after the previous one start a new burst),
+        // and the first 32 bursts each get a guest backtrace from the core's thread once the JIT
+        // returns (the pc here is the block's, the backtrace the real call chain). A tester's
+        // Jabu-Jabu log (2026-11-17) spent the old 32-a-process budget on the first of three
+        // null-object bursts, at area loads; the third ended in the game's crash.
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1) < 32) {
+        static std::atomic<u64> last_ns{};
+        static std::atomic<u32> bursts{};
+        const u64 now_ns = Common::Nx2Hitch::NowNs();
+        if (now_ns - last_ns.exchange(now_ns, std::memory_order_relaxed) > 1'000'000'000ULL) {
+            logged.store(0, std::memory_order_relaxed);
+            const u32 burst = bursts.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG_ERROR(Core_ARM, "Unmapped read burst #{} begins (guest pointer from zeros or "
+                                "wrong data; ignore_memory_aborts keeps the game running)",
+                      burst);
+            if (burst <= 32) {
+                m_parent.RequestBacktrace(nullptr, "unmapped read burst");
+            }
+        }
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
             LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
                       m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
         }
@@ -59,14 +115,22 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     if (direct_code_reads) {
-        return m_memory.Read32(vaddr);
+        return HostCode(vaddr, m_memory.Read32(vaddr));
     }
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
+        if (code_generation.load(std::memory_order_acquire) != generation) [[unlikely]] {
+            // An invalidation landed during the copy: the old reset could be lost here and the
+            // page copy reused with old code; now the next read fetches the page again.
+            CountCodePageRace(aligned_vaddr);
+        }
     }
-    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    const u32 instruction =
+        HostCode(vaddr, cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)]);
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -77,6 +141,51 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     }
     return instruction;
 }
+
+const HostRoutines::Sites& DynarmicCallbacks64::HostSites() {
+    std::call_once(m_host_sites_once, [this] {
+        if (!m_debugger_enabled) {
+            m_host_sites = HostRoutines::SitesFor(m_parent.m_system, *m_process);
+        }
+    });
+    return m_host_sites;
+}
+
+u32 DynarmicCallbacks64::HostCode(u64 vaddr, u32 instruction) {
+    const HostRoutines::Sites& sites = HostSites();
+    if (sites.last == 0 || vaddr < sites.first || vaddr > sites.last) [[likely]] {
+        return instruction;
+    }
+    return HostRoutines::InstructionFor(m_parent.m_system, *m_process, m_memory, vaddr,
+                                        instruction);
+}
+
+namespace {
+/// The running core's registers for a host routine (pinned registers are in the state block
+/// while a callback runs, and reloaded from it after).
+class JitRegisters final : public HostRoutines::Registers {
+public:
+    explicit JitRegisters(Dynarmic::A64::Jit& jit) : m_jit{jit} {}
+    u64 Get(int index) const override {
+        return m_jit.GetRegister(static_cast<std::size_t>(index));
+    }
+    void Set(int index, u64 value) override {
+        m_jit.SetRegister(static_cast<std::size_t>(index), value);
+    }
+    void SetPC(u64 pc) override {
+        m_jit.SetPC(pc);
+    }
+    u32 GetPstate() const override {
+        return m_jit.GetPstate();
+    }
+    void SetPstate(u32 value) override {
+        m_jit.SetPstate(value);
+    }
+
+private:
+    Dynarmic::A64::Jit& m_jit;
+};
+} // Anonymous namespace
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
     if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
@@ -138,6 +247,16 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (exception == Dynarmic::A64::Exception::Breakpoint) {
+        // Fritchii host routines: a BRK compiled in place of a hooked entry's first word.
+        const HostRoutines::Sites& sites = HostSites();
+        if (sites.last != 0 && pc >= sites.first && pc <= sites.last) {
+            JitRegisters regs{*m_parent.m_jit};
+            if (HostRoutines::OnBreakpoint(m_parent.m_system, *m_process, m_memory, regs, pc)) {
+                return;
+            }
+        }
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {
@@ -208,6 +327,13 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
     case Dynarmic::A64::Exception::SendEvent:
     case Dynarmic::A64::Exception::SendEventLocal:
     case Dynarmic::A64::Exception::Yield:
+        if (Kernel::Nx2ThreadStats::g_enabled) {
+            Kernel::Nx2ThreadStats::CountHint(
+                Kernel::Nx2ThreadStats::t_run,
+                static_cast<size_t>(exception) -
+                    static_cast<size_t>(Dynarmic::A64::Exception::WaitForInterrupt),
+                m_parent.m_system.CoreTiming().GetClockTicks(), m_spin_ticks);
+        }
         LOG_TRACE(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, cached = {:08X})", std::size_t(exception), pc, m_memory.Read32(pc), MemoryReadCode(pc).value_or(0));
         return;
     case Dynarmic::A64::Exception::NoExecuteFault:
@@ -247,18 +373,26 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
-u64 DynarmicCallbacks64::GetCNTPCT() {
-    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
-    // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
-    // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
-    // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
-    // other are such a loop: pause, which hands the core's resources to the sibling thread for a
-    // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+namespace {
+// Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
+// times a second while waiting for the GPU) keeps a host core busy at full speed, and the
+// GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
+// other are such a loop: pause, which hands the core's resources to the sibling thread for a
+// moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+bool CntpctPauseOn() {
     static const bool pause_spins = [] {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
+    return pause_spins;
+}
+} // Anonymous namespace
+
+u64 DynarmicCallbacks64::GetCNTPCT() {
+    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
+    if (CntpctPauseOn() && ticks - m_last_cntpct < m_spin_ticks) {
+        // The guest is polling the clock: a wait, not work (FRITCHII_SIM_CPU_SLOW).
+        Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
@@ -267,6 +401,9 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
 #endif
     }
     m_last_cntpct = ticks;
+    if (Kernel::Nx2ThreadStats::g_enabled) {
+        Kernel::Nx2ThreadStats::CountRead(Kernel::Nx2ThreadStats::t_run, ticks, m_spin_ticks);
+    }
     return ticks;
 }
 
@@ -341,6 +478,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
     config.global_monitor = &m_exclusive_monitor.monitor;
+    // Fritchii: where this launch loaded the main image (rtld, then main at +0x20000 in OoT);
+    // set before the interfaces are made (KProcess::Initialize), random per launch.
+    config.image_base = GetInteger(m_cb->m_process->GetEntryPoint());
 
     // System registers
     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;
@@ -357,6 +497,19 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+#if defined(ARCHITECTURE_x86_64)
+    // FRITCHII_JIT_INLINE_CNTPCT (boot, default 0): counter reads in the block, not a host call
+    // (same value; the polling pause kept). Not with guest thread stats, which count reads in
+    // GetCNTPCT.
+    if (m_uses_wall_clock && page_table != nullptr && Core::Timing::InlineCntpctEnabled() &&
+        !Kernel::Nx2ThreadStats::g_enabled) {
+        Core::Timing::RefreshInlineCntpct();
+        config.inline_cntpct_factor =
+            reinterpret_cast<const std::uint64_t*>(&Core::Timing::g_inline_cntpct_factor);
+        config.inline_cntpct_last = CntpctPauseOn() ? &m_cb->m_last_cntpct : nullptr;
+        config.inline_cntpct_spin_ticks = static_cast<std::uint32_t>(m_cb->m_spin_ticks);
+    }
+#endif
 
     // Code cache size
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
@@ -364,6 +517,23 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
+
+    // FRITCHII_JIT_CACHE_MIB (boot, default 0 = 512 MiB; 512-1536): a larger code cache per core.
+    // Precompiles (EDEN_NX2_JIT_WARM, FRITCHII_JIT_BLOCK_LIST) stop while half the space (half
+    // the smaller region with FRITCHII_JIT_FAR_CODE) is free, so a block list larger than that
+    // is compiled at area loads instead, by every core. Memory is committed as code is written.
+    if (const char* value = std::getenv("FRITCHII_JIT_CACHE_MIB"); value != nullptr) {
+        const unsigned long mib = std::strtoul(value, nullptr, 10);
+        if (mib >= 512 && mib <= 1536) {
+            config.code_cache_size = static_cast<std::uint32_t>(mib) << 20;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_INFO(Core_ARM, "FRITCHII_JIT_CACHE_MIB={}: code cache of {} MiB per core", mib,
+                         mib);
+            }
+        }
+    }
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
@@ -376,7 +546,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.code_cache_size = std::uint32_t(8_MiB);
     }
 
-    switch (Settings::values.cpu_accuracy.GetValue()) {
+    switch (Settings::EffectiveCpuAccuracy()) {
     // Debug mode
     case Settings::CpuAccuracy::Debugging:
         if (!Settings::values.cpuopt_page_tables) {
@@ -456,6 +626,27 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     default:
         break;
     }
+    // FRITCHII_JIT_UNSAFE_EXTRA (boot, bits, default 0): Unsafe's float relaxations one at a time on
+    // top of the chosen accuracy (Auto already unfuses FMA and ignores the global monitor; the
+    // Unsafe sizing run was about +1 fps): 1 = reduced-error FP (estimates), 2 = inaccurate NaNs.
+    static const int unsafe_extra = [] {
+        const char* value = std::getenv("FRITCHII_JIT_UNSAFE_EXTRA");
+        const int bits = value != nullptr ? std::atoi(value) : 0;
+        if (bits != 0) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_UNSAFE_EXTRA={}: reduced-error FP {}, inaccurate NaN {}",
+                        bits, (bits & 1) != 0 ? "on" : "off", (bits & 2) != 0 ? "on" : "off");
+        }
+        return bits;
+    }();
+    if (unsafe_extra != 0) {
+        config.unsafe_optimizations = true;
+        if ((unsafe_extra & 1) != 0) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        }
+        if ((unsafe_extra & 2) != 0) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+        }
+    }
     if (!Settings::IsFastmemEnabled()) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
@@ -469,16 +660,36 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                  enabled ? "skipped" : "kept");
         return enabled;
     }();
-    if (fast_compile && Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
-        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+    if (fast_compile && Settings::EffectiveCpuAccuracy() != Settings::CpuAccuracy::Debugging &&
+        Settings::EffectiveCpuAccuracy() != Settings::CpuAccuracy::Paranoid) {
         config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
+    }
+    if (Kernel::Nx2ThreadStats::g_enabled && m_core_index < g_jit_counters.size()) {
+        config.counters = &g_jit_counters[m_core_index];
     }
     m_jit.emplace(config);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    if (!Kernel::Nx2ThreadStats::g_enabled || m_core_index >= g_jit_counters.size()) {
+        return TranslateHaltReason(m_jit->Run());
+    }
+    namespace Stats = Kernel::Nx2ThreadStats;
+    auto& timing = m_system.CoreTiming();
+    Stats::BeginRun();
+    const u64 start = timing.GetClockTicks();
+    const Dynarmic::HaltReason hr = m_jit->Run();
+    const u64 end = timing.GetClockTicks();
+    const Stats::Exit exit = Dynarmic::Has(hr, SupervisorCall) ? Stats::Exit::Svc
+                             : Dynarmic::Has(hr, BreakLoop)    ? Stats::Exit::Interrupt
+                             : Dynarmic::Has(hr, Dynarmic::HaltReason::CacheInvalidation)
+                                 ? Stats::Exit::CacheInvalidation
+                                 : Stats::Exit::Other;
+    const auto& jit = g_jit_counters[m_core_index];
+    Stats::EndRun(thread, m_core_index, start, end, exit, m_svc, jit.block_lookups,
+                  jit.blocks_compiled, jit.cache_clears);
+    return TranslateHaltReason(hr);
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
@@ -512,7 +723,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process) // not movable (atomic code_generation)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -567,7 +778,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -587,11 +798,76 @@ std::size_t ArmDynarmic64::WarmCompile(std::span<const u64> keys, const std::ato
     return done;
 }
 
+namespace {
+/// FRITCHII_JIT_HOT_LIST: a text file of "pc fpcr samples" lines (hex, hex, decimal; Fable A's
+/// work\fable_a_gc\hotlist-300*.txt). The game's image loads at a random address every launch,
+/// so a pc below the image base is an offset from it (the "-rel" lists) and gets this launch's
+/// base added; others are taken as absolute (lists from the launch that made them). "{core}" in
+/// the path is replaced by the core (Fable A's per-core lists). FRITCHII_JIT_HOT_LIST_ORDER=1
+/// keeps the file's order (the per-core lists are hottest tier first), else pc order. Read at
+/// every pack (rare): the blocks' location keys.
+std::vector<u64> HotPackKeys(u64 image_base, std::size_t core) {
+    std::vector<std::pair<u64, u32>> blocks;
+    std::string path;
+    if (const char* text = std::getenv("FRITCHII_JIT_HOT_LIST"); text != nullptr) {
+        path = text;
+    }
+    if (const std::size_t at = path.find("{core}"); at != std::string::npos) {
+        path.replace(at, 6, std::to_string(core));
+    }
+    std::size_t offsets = 0;
+    if (!path.empty()) {
+        std::ifstream file{path};
+        std::string pc_text, fpcr_text;
+        u64 samples = 0;
+        while (file >> pc_text >> fpcr_text >> samples) {
+            u64 pc = std::strtoull(pc_text.c_str(), nullptr, 16);
+            if (pc < image_base) {
+                pc += image_base;
+                ++offsets;
+            }
+            blocks.emplace_back(pc, static_cast<u32>(std::strtoul(fpcr_text.c_str(), nullptr, 16)));
+        }
+    }
+    const char* order = std::getenv("FRITCHII_JIT_HOT_LIST_ORDER");
+    const bool file_order = order != nullptr && std::atoi(order) == 1;
+    if (!file_order) {
+        std::sort(blocks.begin(), blocks.end());
+    }
+    std::vector<u64> result;
+    result.reserve(blocks.size());
+    for (const auto& [pc, fpcr] : blocks) {
+        result.push_back(
+            Dynarmic::A64::LocationDescriptor{pc, Dynarmic::FP::FPCR{fpcr}, false}.UniqueHash());
+    }
+    LOG_INFO(Core_ARM,
+             "FRITCHII_JIT_HOT_LIST: core {} {} hot blocks from {} ({} as offsets from the image "
+             "base {:#x}, {} absolute), {} order",
+             core, result.size(), path, offsets, image_base, result.size() - offsets,
+             file_order ? "file" : "pc");
+    return result;
+}
+} // namespace
+
+std::size_t ArmDynarmic64::PackHotCode(const std::atomic<bool>& stop) {
+    const std::vector<u64> keys =
+        HotPackKeys(GetInteger(m_cb->m_process->GetEntryPoint()), m_core_index);
+    if (keys.empty()) {
+        return 0;
+    }
+    // The clear is performed by the first PrecompileBlock (the JIT runs no code here), so the
+    // hot blocks are the first code in the emptied cache.
+    ClearInstructionCache();
+    return WarmCompile(keys, stop);
+}
+
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
-    // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    // into or removed from that page). Usually called from another core's thread (kernel code
+    // mapping, nn::ro), so it bumps the generation instead of writing the owner's page tag.
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    CountCodeInvalidation(m_core_index, addr, size);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

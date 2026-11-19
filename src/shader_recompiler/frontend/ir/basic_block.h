@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -90,7 +89,7 @@ public:
     }
 
     /// The other variables the SSA pass tracks per block (predicates, flags, the indirect branch
-    /// target), by the pass's own slot numbers (EDEN_NX2_SSA_BLOCK_VALUES=1, zortos293/Lichii#896).
+    /// target), by the pass's own slot numbers (EDEN_NX2_SSA_BLOCK_VALUES=1).
     static constexpr size_t NumSsaOtherValues = 16;
     void SetSsaOtherValue(size_t slot, const Value& value) noexcept {
         ssa_other_values[slot] = value;

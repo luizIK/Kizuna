@@ -80,6 +80,13 @@ public:
         return 0;
     }
 
+    // Fritchii (FRITCHII_JIT_HOT_PACK, a test hook): clears this CPU's code cache and compiles the
+    // hot list (FRITCHII_JIT_HOT_LIST) first, in guest pc order, so the hot code sits together.
+    // Same thread rules as WarmCompile. Returns how many blocks it compiled.
+    virtual std::size_t PackHotCode(const std::atomic<bool>& stop) {
+        return 0;
+    }
+
     // Get the current architecture.
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.
     virtual Architecture GetArchitecture() const = 0;
@@ -105,6 +112,22 @@ public:
     // Stack trace generation.
     void LogBacktrace(Kernel::KProcess* process) const;
 
+    // Fritchii: asks for a backtrace of the guest thread this core runs, logged by the core's
+    // own thread once the JIT returns (PhysicalCore::RunThread), where the registers are synced.
+    // Any thread may ask (the hang report; a burst of unmapped reads from inside the JIT's
+    // callbacks). `reason` must outlive the request (a string literal).
+    void RequestBacktrace(Kernel::KThread* thread, const char* reason) {
+        m_backtrace_reason.store(reason, std::memory_order_release);
+        SignalInterrupt(thread);
+    }
+    /// The pending request's reason (taken), nullptr: none.
+    const char* TakeBacktraceRequest() {
+        if (m_backtrace_reason.load(std::memory_order_relaxed) == nullptr) [[likely]] {
+            return nullptr;
+        }
+        return m_backtrace_reason.exchange(nullptr, std::memory_order_acquire);
+    }
+
     // Debug functionality.
     virtual const Kernel::DebugWatchpoint* HaltedWatchpoint() const = 0;
     virtual void RewindBreakpointInstruction() = 0;
@@ -116,6 +139,7 @@ protected:
 protected:
     const WatchpointArray* m_watchpoints{};
     bool m_uses_wall_clock{};
+    std::atomic<const char*> m_backtrace_reason{};
 };
 
 } // namespace Core

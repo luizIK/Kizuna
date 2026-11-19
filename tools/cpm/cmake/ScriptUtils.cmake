@@ -281,7 +281,7 @@ function(get_latest_tag out)
     return(PROPAGATE ${out})
 endfunction()
 
-# TODO(crueter): Combine these
+# TODO: Combine these
 
 # Update hash and version of a package
 # Outputs the updated object

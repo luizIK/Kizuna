@@ -66,6 +66,36 @@ TEST_CASE("Render targets are recurring only after two cleared frames",
     REQUIRE(DrawTargetClass::FirstTime < DrawTargetClass::Persistent);
 }
 
+TEST_CASE("Targets drawn in every recent frame count as redrawn", "[video_core][async_draw]") {
+    using VideoCommon::IsRedrawnTarget;
+    using VideoCommon::NextWriteStreak;
+    using VideoCommon::REDRAWN_WRITE_FRAMES;
+    constexpr u64 Never = ~u64{0};
+    // The first write starts a run; more writes in the same frame keep it.
+    REQUIRE(NextWriteStreak(Never, 0, 10) == 1);
+    REQUIRE(NextWriteStreak(10, 1, 10) == 1);
+    REQUIRE(NextWriteStreak(10, 0, 10) == 1);
+    // The next frame extends it; a frame without a write, or a clock that went back, restarts it.
+    REQUIRE(NextWriteStreak(10, 1, 11) == 2);
+    REQUIRE(NextWriteStreak(10, 5, 12) == 1);
+    REQUIRE(NextWriteStreak(12, 5, 11) == 1);
+    // Discarded contents (~0) restart it even with a run left over.
+    REQUIRE(NextWriteStreak(Never, 7, 0) == 1);
+
+    u64 last = Never;
+    u32 streak = 0;
+    for (u64 frame = 100; frame < 100 + REDRAWN_WRITE_FRAMES; ++frame) {
+        REQUIRE_FALSE(IsRedrawnTarget(last, streak, frame));
+        streak = NextWriteStreak(last, streak, frame);
+        last = frame;
+    }
+    const u64 now = 100 + REDRAWN_WRITE_FRAMES - 1;
+    REQUIRE(IsRedrawnTarget(last, streak, now));
+    // Not yet written in this frame, or a layer rendered once long ago: not redrawn.
+    REQUIRE_FALSE(IsRedrawnTarget(last, streak, now + 1));
+    REQUIRE_FALSE(IsRedrawnTarget(now - 20, 1, now));
+}
+
 TEST_CASE("Legacy pending draws retain the async heuristic", "[video_core][async_draw]") {
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, true, 0, 0));
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, false, 7, 7));

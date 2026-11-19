@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <atomic>
@@ -11,12 +12,16 @@
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/fritchii_jit_list.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
+#include "common/shutdown_watch.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -42,6 +47,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -75,7 +81,10 @@
 #include "core/tools/renderdoc.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
+#include "core/hle/kernel/k_thread.h"
+#include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_precompile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -306,7 +315,15 @@ struct System::Impl {
 
         kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
-        is_paused.store(false, std::memory_order_relaxed);
+        // A pause shows in the log with its length: a long one looks exactly like a freeze to
+        // players (2026-11-18: 18-35 s "freezes" were pauses; the frontend logs who asked).
+        if (is_paused.exchange(false, std::memory_order_relaxed) &&
+            pause_begin != std::chrono::steady_clock::time_point{}) {
+            LOG_INFO(Core, "Emulation resumed after {:.1f} s paused",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - pause_begin)
+                         .count());
+            pause_begin = {};
+        }
     }
 
     void Pause() {
@@ -314,7 +331,10 @@ struct System::Impl {
 
         core_timing.SyncPause(true);
         kernel.SuspendEmulation(true);
-        is_paused.store(true, std::memory_order_relaxed);
+        if (!is_paused.exchange(true, std::memory_order_relaxed) && is_powered_on) {
+            pause_begin = std::chrono::steady_clock::now();
+            LOG_INFO(Core, "Emulation paused");
+        }
     }
 
     bool IsPaused() const {
@@ -325,14 +345,57 @@ struct System::Impl {
         std::unique_lock<std::mutex> lk(suspend_guard);
         kernel.SuspendEmulation(true);
         core_timing.SyncPause(true);
+        is_stalled.store(true, std::memory_order_relaxed);
         return lk;
     }
 
     void UnstallApplication() {
+        is_stalled.store(false, std::memory_order_relaxed);
         if (!IsPaused()) {
             core_timing.SyncPause(false);
             kernel.SuspendEmulation(false);
         }
+    }
+
+    // Hang report hooks (Common::Nx2Hitch::HangHooks), installed for a running session.
+    // FRITCHII_HANG_REPORT_S (live, default 5, 0 = off): seconds without a frame, while the game
+    // runs, before the one report of a freeze. Not running: powered off, shutting down, paused,
+    // stalled by the frontend, or held by the GDB stub.
+    static int HangArmedSeconds(void* context) {
+        const Impl& impl = *static_cast<const Impl*>(context);
+        if (!impl.is_powered_on.load(std::memory_order_relaxed) ||
+            impl.is_shutting_down.load(std::memory_order_relaxed) ||
+            impl.is_paused.load(std::memory_order_relaxed) ||
+            impl.is_stalled.load(std::memory_order_relaxed) || impl.debugger.has_value()) {
+            return 0;
+        }
+        return (std::max)(VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hang_report_s,
+                                                           "FRITCHII_HANG_REPORT_S", 5),
+                          0);
+    }
+
+    static void HangReport(void* context) {
+        Impl& impl = *static_cast<Impl*>(context);
+        if (impl.gpu_core) {
+            impl.gpu_core->LogHangState();
+        }
+        LOG_CRITICAL(Core, "Hang report: service calls in flight: {}",
+                     Service::DescribeCallsInFlight());
+        LOG_CRITICAL(Core, "Hang report: game threads in kernel waits: {}",
+                     Kernel::DescribeGuestWaits());
+        // The cores that run game code now (a spin on a word, a loop): each core's thread logs
+        // its guest backtrace when its JIT next returns ("Guest backtrace (hang report)" lines
+        // right after this; a tester's second Jabu-Jabu freeze had one core in JIT code).
+        std::string cores;
+        for (std::size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+            const u64 thread_id = impl.kernel.PhysicalCore(core).RequestBacktrace("hang report");
+            cores += fmt::format("{}core {} {}", cores.empty() ? "" : ", ", core,
+                                 thread_id == ~u64{0} ? std::string{"idle"}
+                                                      : fmt::format("runs guest thread {}",
+                                                                    thread_id));
+        }
+        LOG_CRITICAL(Core, "Hang report: cores: {} (backtraces of the running ones follow)",
+                     cores);
     }
 
     void SetNVDECActive(bool is_nvdec_active) {
@@ -352,6 +415,8 @@ struct System::Impl {
 
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
+        // Read after the frontend applied nx2_switches.txt (static initialization runs before).
+        Kernel::Nx2ThreadStats::ReadSwitch();
         kernel.Initialize();
     }
 
@@ -428,6 +493,9 @@ struct System::Impl {
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            // Its destructor finalizes the KProcess through the kernel: free it before the kernel
+            // shuts down, as a normal stop does.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
@@ -457,10 +525,24 @@ struct System::Impl {
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
 
+        // FRITCHII_JIT_BLOCK_LIST (boot): the title's block list, before the cores start. Its
+        // warm-up runs through EDEN_NX2_JIT_WARM's idle compiles (64-bit dynarmic only, several
+        // cores, no debugger); recording alone needs only the recompiler.
+        if (Common::FritchiiJitList::Mode() != 0 && process->GetHandle()->Is64Bit() &&
+            !system.DebuggerEnabled() &&
+            (Common::FritchiiJitList::Mode() != 1 ||
+             (kernel.IsMulticore() && Common::Nx2Hitch::JitWarmEnabled()))) {
+            Kernel::KProcess* const kprocess = process->GetHandle();
+            Common::FritchiiJitList::Begin(
+                params.program_id, build_id, GetInteger(kprocess->GetEntryPoint()),
+                kprocess->GetCodeSize(), Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir));
+        }
+
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            process.reset();
             ShutdownMainProcess();
             return init_result;
         }
@@ -472,7 +554,7 @@ struct System::Impl {
             cheat_engine->Initialize();
         }
 
-        // EDEN_NX2_PRECOMPILE: the game's files, for assembling a precompile recipe (#895) on the
+        // EDEN_NX2_PRECOMPILE: the game's files, for assembling a precompile recipe on the
         // pipeline cache's preparation thread. The RomFS as the process reads it, update included.
         if (VideoCommon::Nx2Precompile::Mode() != 0) {
             const u64 process_id = process->GetHandle()->GetProcessId();
@@ -529,12 +611,20 @@ struct System::Impl {
         }
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
+        Common::Nx2Hitch::SetHangHooks({&HangArmedSeconds, &HangReport, this});
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        // First: no hang report reads anything the teardown below frees.
+        Common::Nx2Hitch::ClearHangHooks(this);
+        // Common::ShutdownWatch steps (a no-op unless the frontend armed the watch).
+        Common::ShutdownWatch::Step("teardown: debug server");
         debug_service.reset();
+        Common::ShutdownWatch::Step("teardown: JIT block list writer");
+        Common::FritchiiJitList::End(); // FRITCHII_JIT_BLOCK_LIST: writes what is left
         // Waits for a call in progress (it opens the RomFS, a quick step).
+        Common::ShutdownWatch::Step("teardown: precompile game files");
         VideoCommon::Nx2Precompile::SetGameFiles(0, {});
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -542,12 +632,25 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
+
+        // Once powered off, services stop writing replies, so a guest thread whose IPC call
+        // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
+        // every stop). Keep guest threads from running again first; the wait for running ones
+        // comes after the GPU has released any that it holds in host code.
+        Common::ShutdownWatch::Step("teardown: suspending guest threads, stopping GPU threads");
+        kernel.RequestSuspendEmulation();
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
         if (gpu_core)
             gpu_core->NotifyShutdown();
 
+        Common::ShutdownWatch::Step("teardown: suspending emulation, closing services");
         stop_event.request_stop();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
@@ -556,24 +659,37 @@ struct System::Impl {
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: guest cores");
         kernel.ShutdownCores();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: services, file system, loader");
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: audio");
         audio_core.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: GPU and renderer (pipeline caches, Vulkan device)");
         gpu_core.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: host1x, CPU manager, kernel");
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
+        {
+            // The general channel's event is a kernel object made on first use. Left for ~Impl,
+            // it closed at exit() on a kernel already shut down. Its queued data stays for the
+            // next kernel, which makes the event again.
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         kernel.Shutdown();
+        Kernel::ClearGuestWaitsForHangReport();
         stop_event = {};
         Network::RestartSocketOperations();
 
@@ -663,6 +779,8 @@ struct System::Impl {
     mutable std::mutex suspend_guard;
     std::mutex general_channel_mutex;
     std::atomic_bool is_paused{};
+    std::chrono::steady_clock::time_point pause_begin{}; ///< Under suspend_guard: the log's length
+    std::atomic_bool is_stalled{}; ///< StallApplication until UnstallApplication (hang report)
     std::atomic_bool is_shutting_down{};
     std::atomic_bool is_powered_on{};
     bool is_multicore : 1 = false;
@@ -677,6 +795,9 @@ struct System::Impl {
         if (!general_channel_event) {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
         }
     }
 };
@@ -1120,9 +1241,10 @@ void System::PushGeneralChannelData(std::vector<u8>&& data) {
 
 bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
     std::scoped_lock lk{impl->general_channel_mutex};
-    if (!impl->general_channel_event || impl->general_channel.empty()) {
+    if (impl->general_channel.empty()) {
         return false;
     }
+    impl->EnsureGeneralChannelInitialized(*this);
     out_data = std::move(impl->general_channel.back());
     impl->general_channel.pop_back();
     if (impl->general_channel.empty()) {
@@ -1163,6 +1285,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 
 void System::ApplySettings() {
     impl->RefreshTime(*this);
+    // FRITCHII_JIT_INLINE_CNTPCT: a changed CPU clock or core speed sync sends counter reads back
+    // to the host call.
+    Core::Timing::RefreshInlineCntpct();
 
     if (IsPoweredOn()) {
         Renderer().RefreshBaseSettings();

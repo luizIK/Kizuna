@@ -1,24 +1,26 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
-#ifdef HAS_LSFG
-#include "video_core/renderer_vulkan/present/lsfg_common.h"
-#endif
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -30,22 +32,24 @@ namespace {
 
 constexpr size_t MAX_FRAMES_IN_FLIGHT = 7;
 constexpr u32 MAX_PRESENT_ATTEMPTS = 3;
-#ifdef HAS_LSFG
-static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
-#endif
-
-bool CanStoreToFrame(const vk::PhysicalDevice& physical_device, VkFormat format) {
-#ifdef HAS_LSFG
-    const VkFormatProperties props{physical_device.GetFormatProperties(format)};
-    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
-#else
-    return false;
-#endif
-}
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat format) {
     const VkFormatProperties props{physical_device.GetFormatProperties(format)};
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+}
+
+/// The host pacer's hold: sleeps until a millisecond before `target`, then yields until it.
+void HoldUntil(std::chrono::steady_clock::time_point target, const std::stop_token* token) {
+    using Clock = std::chrono::steady_clock;
+    for (auto now = Clock::now(); now < target && !(token != nullptr && token->stop_requested());
+         now = Clock::now()) {
+        const auto left = target - now;
+        if (left > std::chrono::microseconds{1500}) {
+            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
+        } else {
+            std::this_thread::yield();
+        }
+    }
 }
 
 [[nodiscard]] VkImageSubresourceLayers MakeImageSubresourceLayers() {
@@ -134,7 +138,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , swapchain{swapchain_}
     , surface{surface_}
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
-    , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
@@ -147,9 +150,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    auto cmdbuffers = cmdpool.Allocate(image_count);
+    // EDEN_NX2_PRESENT_EXTRA_FRAMES (boot, default 2; fable52_answer_acquire 4): render frames
+    // beyond the swapchain's images, so the renderer has a free one while the present thread
+    // holds every queued frame (pacing, or a display stall of 125-190 ms at the night market).
+    size_t extra_frames = use_present_thread ? 2 : 0;
+    if (const char* extra = std::getenv("EDEN_NX2_PRESENT_EXTRA_FRAMES")) {
+        extra_frames = static_cast<size_t>(std::max(0, std::atoi(extra)));
+    }
+    const size_t frame_count = (std::min)(image_count + extra_frames, MAX_FRAMES_IN_FLIGHT);
+    LOG_INFO(Render_Vulkan, "Present frames: {} ({} swapchain images)", frame_count,
+             image_count.load());
+    auto cmdbuffers = cmdpool.Allocate(frame_count);
 
-    frames.resize(image_count);
+    frames.resize(frame_count);
     for (u32 i = 0; i < frames.size(); i++) {
         Frame& frame = frames[i];
         frame.index = i;
@@ -164,13 +177,25 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             .pNext = nullptr,
             .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         });
-        frame.storage_capable = storage_supported;
         free_queue.push_back(&frame);
     }
 
     present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
              present_wait_enabled ? "supported" : "unavailable, frames are not paced");
+    // What the driver offers for a pacer later (probe only, nothing uses them): AMD's Windows
+    // driver has no present wait; a present_wait2 there would let the host pacer run.
+    {
+        const auto& extensions = device.GetAvailableExtensions();
+        const auto has = [&extensions](std::string_view name) {
+            return extensions.contains(name) ? "yes" : "no";
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Host pacing: driver offers VK_KHR_present_wait {}, VK_KHR_present_wait2 {}, "
+                 "VK_KHR_present_id2 {}, VK_AMD_anti_lag {}",
+                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has("VK_KHR_present_wait2"),
+                 has("VK_KHR_present_id2"), has("VK_AMD_anti_lag"));
+    }
     if (present_wait_enabled) {
         present_wait_thread =
             std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
@@ -198,14 +223,51 @@ Frame* PresentManager::GetRenderFrame() {
     Common::Nx2Timeline::Span timeline_span{"present: wait for free frame"};
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
-    free_cv.wait(lock, [this] { return !free_queue.empty(); });
-
-    // Take the frame from the queue
-    Frame* frame = free_queue.front();
-    free_queue.pop_front();
+    Frame* frame = nullptr;
+    // EDEN_NX2_EXP70 (live, ms, 0 = off; fable52_answer_acquire 4): after this long without a
+    // free frame, the renderer takes back the oldest queued frame that is not at the front (the
+    // present thread may be pacing or presenting that one) and drops it: a display that stops
+    // taking frames (vkAcquireNextImageKHR blocked 76-140 ms) no longer stalls emulation.
+    if (const int steal_ms = VideoCore::Nx2Debug::Experiment(70); steal_ms > 0 && use_present_thread) {
+        while (!free_cv.wait_for(lock, std::chrono::milliseconds{steal_ms},
+                                 [this] { return !free_queue.empty(); })) {
+            lock.unlock();
+            Frame* stolen = nullptr;
+            {
+                std::scoped_lock ql{queue_mutex};
+                if (present_queue.size() >= 2) {
+                    stolen = present_queue[1];
+                    present_queue.erase(present_queue.begin() + 1);
+                }
+            }
+            if (stolen != nullptr) {
+                DiscardFrame(stolen);
+                static std::atomic<u32> logged{};
+                const u32 count = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 20 || (count & (count - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Present (EXP70): no free frame for {} ms, dropped a queued frame "
+                             "({} so far)",
+                             steal_ms, count);
+                }
+                frame = stolen;
+                break;
+            }
+            lock.lock();
+        }
+    } else {
+        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    }
+    if (frame == nullptr) {
+        // Take the frame from the queue
+        frame = free_queue.front();
+        free_queue.pop_front();
+    }
 
     // Wait for the presentation to be finished so all frame resources are free
-    frame->present_done.Wait();
+    if (frame->present_done.Wait() == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
     frame->present_done.Reset();
 
     return frame;
@@ -225,31 +287,18 @@ void PresentManager::Present(Frame* frame) {
         });
     } else {
         scheduler.WaitWorker();
+        NoteDisplayRefresh();
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
 }
 
-size_t PresentManager::MaxExtraFrames() const {
-    return image_count - 1;
-}
-
-bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
-    return required && frame->storage_capable && !frame->storage_view;
-}
-
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
-                                   VkRenderPass rd, bool storage) {
+                                   VkRenderPass rd) {
     auto& dld = device.GetLogical();
 
     frame->width = width;
     frame->height = height;
-
-    const bool with_storage = storage && frame->storage_capable;
-    VkImageUsageFlags storage_usage = 0;
-    if (with_storage) {
-        storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
-    }
 
     frame->image = memory_allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -268,7 +317,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | storage_usage,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -298,33 +347,6 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
                 .layerCount = 1,
             },
     });
-
-    frame->storage_view = vk::ImageView{};
-    if (with_storage) {
-        frame->storage_view = dld.CreateImageView({
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .image = *frame->image,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = swapchain.GetImageFormat(),
-            .components =
-                {
-                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
-                },
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-        });
-    }
 
     const VkImageView image_view{*frame->image_view};
     frame->framebuffer = dld.CreateFramebuffer({
@@ -361,7 +383,10 @@ void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
+    int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
     while (!token.stop_requested()) {
+        // FRITCHII_GPU_SIBLINGS_FREE (live): off the GPU threads' cores before the wait.
+        Common::KeepOffGpuCores(siblings_free_applied);
         std::unique_lock lock{queue_mutex};
         // Wait for presentation frames
         {
@@ -369,6 +394,8 @@ void PresentManager::PresentThread(std::stop_token token) {
             frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         }
         if (!token.stop_requested()) {
+            // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to present.
+            Common::NoteCensusCpu(Common::CensusThread::Present);
             bool held = false;
             if (present_wait_enabled) {
                 // Only this thread pops the queue: the frame stays at its front, and WaitPresent
@@ -377,6 +404,8 @@ void PresentManager::PresentThread(std::stop_token token) {
                 lock.unlock();
                 held = PaceFrame(next, token);
                 lock.lock();
+            } else {
+                NoteDisplayRefresh();
             }
             // Take the frame and notify anyone waiting
             Frame* frame = present_queue.front();
@@ -388,6 +417,18 @@ void PresentManager::PresentThread(std::stop_token token) {
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
             last_present_id = 0;
+            // EDEN_NX2_EXP71 (live, ms, test only): a display stall of this length every 10 s,
+            // as the 125-190 ms ones at the night market, to check EXP70 on demand.
+            if (const int stall_ms = VideoCore::Nx2Debug::Experiment(71); stall_ms > 0) [[unlikely]] {
+                static auto last_stall = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_stall > std::chrono::seconds{10}) {
+                    last_stall = now;
+                    LOG_INFO(Render_Vulkan, "Present (EXP71): simulated display stall of {} ms",
+                             stall_ms);
+                    std::this_thread::sleep_for(std::chrono::milliseconds{stall_ms});
+                }
+            }
             CopyToSwapchain(frame);
             if (Common::Nx2Timeline::Active()) {
                 Common::Nx2Timeline::Instant("vkQueuePresentKHR", {"id", last_present_id});
@@ -423,12 +464,24 @@ void PresentManager::PresentThread(std::stop_token token) {
 
 bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     using Clock = std::chrono::steady_clock;
+    deferred_hold.reset();
     pacer.NoteQueued(frame->queued_at);
     const VkPresentModeKHR mode = swapchain.PresentMode();
+    // Mailbox with a game faster than the display (Ocarina of Time's high refresh rate above the
+    // monitor's rate, or with no cap): hold nothing, Mailbox shows the newest frame at each
+    // refresh. Holding one frame per refresh capped the game at the display rate.
+    const long long guest_ns =
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed);
+    const long long display_ns =
+        VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+    const bool faster_than_display =
+        mode == VK_PRESENT_MODE_MAILBOX_KHR &&
+        (VideoCommon::Nx2Perf::g_guest_unpaced.load(std::memory_order_relaxed) ||
+         (guest_ns > 0 && display_ns > 0 && guest_ns * 100 < display_ns * 98));
     const bool allowed =
         (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR ||
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
-        !Settings::FrameGenActive() && Settings::SpeedLimitEnabled() &&
+        !faster_than_display && Settings::SpeedLimitEnabled() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
     // The refresh rate of the display the window is on (the HWND on Windows).
     const auto& window_info = render_window.GetWindowInfo();
@@ -479,15 +532,8 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
             return false;
         }
         Common::Nx2Timeline::Span span{"present: host pacing hold"};
-        for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-            const auto left = target - now;
-            if (left > std::chrono::microseconds{1500}) {
-                std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
-            } else {
-                std::this_thread::yield();
-            }
-        }
-        pacer.NoteHold(Clock::now() - start);
+        HoldUntil(target, &token);
+        pacer.NoteHold(start, Clock::now());
         return true;
     }
     VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
@@ -495,17 +541,25 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     if (target <= start) {
         return false;
     }
-    Common::Nx2Timeline::Span span{"present: host pacing hold"};
-    for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-        const auto left = target - now;
-        if (left > std::chrono::microseconds{1500}) {
-            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
-        } else {
-            std::this_thread::yield();
-        }
+    if ((pacer.Fix() & 2) != 0) {
+        // FRITCHII_PACE_FIX 2: CopyToSwapchainImpl copies and submits first and holds only the
+        // present, so the copy's GPU time and the submit lock are not taken from the lead.
+        deferred_hold = DeferredHold{start, target};
+        return true;
     }
-    pacer.NoteHold(Clock::now() - start);
+    Common::Nx2Timeline::Span span{"present: host pacing hold"};
+    HoldUntil(target, &token);
+    pacer.NoteHold(start, Clock::now());
     return true;
+}
+
+void PresentManager::NoteDisplayRefresh() {
+    // Refresh queries the display at most every 2 s; with `allowed` false it never paces.
+    const auto& window_info = render_window.GetWindowInfo();
+    pacer.Refresh(std::chrono::steady_clock::now(), false,
+                  window_info.type == Core::Frontend::WindowSystemType::Windows
+                      ? window_info.render_surface
+                      : nullptr);
 }
 
 void PresentManager::PresentWaitThread(std::stop_token token) {
@@ -593,17 +647,8 @@ void PresentManager::SetImageCount() {
     // We cannot have more than 7 images in flight at any given time.
     // FRAMES_IN_FLIGHT is 8, and the cache TICKS_TO_DESTROY is 8.
     // Mali drivers will give us 6.
-#ifdef HAS_LSFG
-    const size_t generations = Settings::FrameGenMaxGenerations();
-    const size_t queued_composites = Settings::values.frame_gen_queue_target.GetValue() + 1;
-    image_count =
-        std::clamp<size_t>((generations + 1) * queued_composites, swapchain.GetImageCount(),
-                           MAX_FRAMES_IN_FLIGHT);
-#else
     image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
-#endif
     swapchain_image_count = swapchain.GetImageCount();
-    swapchain_image_format = swapchain.GetImageFormat();
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
@@ -622,7 +667,20 @@ void PresentManager::DiscardFrame(Frame* frame) {
     };
 
     std::scoped_lock submit_lock{scheduler.submit_mutex};
-    void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
+    const VkResult result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
+    if (result == VK_SUCCESS) {
+        return;
+    }
+    if (result == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
+    // Nothing will signal the fence now, and the next use of this frame waits on it for good.
+    LOG_ERROR(Render_Vulkan, "Discarding a frame failed ({})", string_VkResult(result));
+    frame->present_done = device.GetLogical().CreateFence({
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    });
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
@@ -802,7 +860,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
+        const auto lock_stall =
+            Common::Nx2Hitch::StallEnter("present: wait for the submit lock (copy)");
         std::scoped_lock submit_lock{scheduler.submit_mutex};
+        Common::Nx2Hitch::StallLeave(lock_stall);
+        const Common::Nx2Hitch::StallScope submit_stall{"present: submit the copy"};
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
@@ -814,6 +876,17 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             vk::Check(result);
             break;
         }
+    }
+
+    // FRITCHII_PACE_FIX 2: the host pacer's hold, now that the copy is on the GPU.
+    if (deferred_hold) {
+        const DeferredHold hold = *deferred_hold;
+        deferred_hold.reset();
+        {
+            Common::Nx2Timeline::Span span{"present: host pacing hold"};
+            HoldUntil(hold.target, nullptr);
+        }
+        pacer.NoteHold(hold.start, std::chrono::steady_clock::now());
     }
 
     // Present

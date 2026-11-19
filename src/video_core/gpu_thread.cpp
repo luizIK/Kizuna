@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -21,6 +25,10 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
+#include "video_core/memstage_stats.h"
+#include "video_core/nx2_fastdraw_count.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -38,6 +46,17 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
         std::scoped_lock lk{state.write_lock};
         state.cv.notify_all();
     }
+}
+
+// One spin-wait hint (EXP114's pending poll gap).
+void PollPause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
 }
 
 } // Anonymous namespace
@@ -62,18 +81,40 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         CommandDataContainer next;
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
+        // EDEN_NX2_GPU_WAKE: for PendingPoll after that the thread waits in hardware, then it
+        // blocks in the OS PendingSleepTime at a time. In hardware it looks at the words the
+        // channels wait on every WordCheckPeriod and polls the channels in full every
+        // PendingPollPeriod.
+        constexpr std::chrono::nanoseconds PendingPoll = std::chrono::microseconds{500};
+        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{20};
+        constexpr std::chrono::nanoseconds WordCheckPeriod = std::chrono::microseconds{2};
+        constexpr std::chrono::nanoseconds PendingSleepTime = std::chrono::microseconds{500};
+        auto& wake = Tegra::Nx2PendingWake::Get();
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
         namespace Profile = VideoCommon::Nx2Profile;
         // Before the split's back thread starts, which reads it too.
         Profile::Initialize();
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            // FRITCHII_SIM_CPU_SLOW: the command just handled ends here.
+            Common::LowEndSim::CpuWorkEnd();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                // EDEN_NX2_GPU_WAKE: a new command or a GPU release
+                // wakes the wait below at once (Nx2PendingWake), so arm it before looking.
+                const bool gpu_wake = VideoCore::Nx2Debug::GpuWake();
+                wake.SetEnabled(gpu_wake);
+                if (gpu_wake) {
+                    wake.Arm();
+                }
+                bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
-                    scheduler.ResumePending(system.GPU());
+                    // FRITCHII_LAGGED_DEFER: the checks this poll puts off, only.
+                    Tegra::Engines::LaggedDefer::Clear();
+                    resumed = scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
                     // EDEN_NX2_EXP27 & 1: what the resumed channels sent goes to the back before
@@ -81,17 +122,73 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     if (split.Active()) {
                         split.PublishBeforeWait();
                     }
+                    // FRITCHII_LAGGED_DEFER: lagged checks put off while the back was short of
+                    // their targets wait here, where the front has nothing else to do, then
+                    // the channels are polled again (the checks run with the back there).
+                    if (Tegra::Engines::LaggedDefer::Pending()) {
+                        Tegra::Engines::LaggedDefer::WaitBeforeSleep();
+                        continue;
+                    }
+                    if (gpu_wake) {
+                        if (resumed) {
+                            last_progress = std::chrono::steady_clock::now();
+                        }
+                        if (!scheduler.HasPendingChannels()) {
+                            continue;
+                        }
+                        // The CPU usually releases the semaphore soon after: for half a
+                        // millisecond after the last progress wait in hardware, watching the
+                        // semaphore words, then block in the OS for 500 us at a time. A full poll
+                        // every 20 us catches what sends no wake and changes no word, such as a
+                        // release a shader wrote to the caches.
+                        Profile::Scope scope{Profile::Zone::PendingSleep};
+                        const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
+                        const VideoCommon::OneFollower::DryStallScope dry_stall;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - last_progress < PendingPoll) {
+                            const auto poll_end =
+                                std::min(now + PendingPollPeriod, last_progress + PendingPoll);
+                            auto until = now;
+                            do {
+                                until = std::min(std::chrono::steady_clock::now() +
+                                                     WordCheckPeriod,
+                                                 poll_end);
+                                if (wake.Poll(until) || waiters.WordStored()) {
+                                    break;
+                                }
+                            } while (until < poll_end);
+                        } else {
+                            wake.Sleep(PendingSleepTime);
+                        }
+                        continue;
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
-                    // EDEN_NX2_EXP6 (zortos293/Lichii#446): 1 = 50 us sleeps (Ocarina waits here
+                    // EDEN_NX2_EXP6: 1 = 50 us sleeps (Ocarina waits here
                     // ~330 times a second and its present waits for the work behind them; on
                     // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
+                    const VideoCommon::OneFollower::DryStallScope dry_stall;
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
                     if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
                                          std::chrono::microseconds{500}) {
-                        std::this_thread::yield();
+                        // EXP114 (live; 0 = yield, N > 0 = N us): between polls, wait with PAUSE
+                        // instead of a yield per poll. ResumePending ran hundreds of thousands of
+                        // times a second at the market; the PAUSE wait leaves the core's SMT
+                        // sibling (often the back thread or a guest core) free.
+                        if (const int gap_us = VideoCore::Nx2Debug::Experiment(114); gap_us > 0) {
+                            const auto until = std::chrono::steady_clock::now() +
+                                               std::chrono::microseconds{gap_us};
+                            do {
+                                for (int i = 0; i < 16; ++i) {
+                                    PollPause();
+                                }
+                            } while (std::chrono::steady_clock::now() < until);
+                        } else {
+                            std::this_thread::yield();
+                        }
                     } else if (poll == 1) {
                         std::this_thread::sleep_for(std::chrono::microseconds{50});
                     } else {
@@ -101,17 +198,23 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Idle};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
                 break;
             }
             last_progress = std::chrono::steady_clock::now();
+            // FRITCHII_SIM_CPU_SLOW: the wait for this command was not work, handling it is.
+            Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Front);
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    // EDEN_NX2_MEMSTAGE_STATS: command lists per channel.
+                    VideoCommon::MemStageStats::ListSubmitted(
+                        submit_list->channel, submit_list->entries.command_lists.size());
                     const bool timeline = Common::Nx2Timeline::Active();
                     if (timeline) {
                         // The list's sequence number (PushCommand's "submit list") on each
@@ -122,7 +225,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                             [seq = next.fence] {
                                 Common::Nx2Timeline::Instant("back: list", {"seq", seq});
                             },
-                            VideoCommon::GpuSplit::Effect::None);
+                            VideoCommon::GpuSplit::Effect::None,
+                            VideoCommon::Nx2FastDrawCount::Neutral() |
+                                VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
                     }
                     {
                         Profile::Scope scope{Profile::Zone::Push};
@@ -133,7 +238,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         Common::Nx2Timeline::Instant("front: list end", {"seq", next.fence});
                     }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                    // TickWork ends delta draw reuse itself when it runs a request.
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
+                                VideoCommon::GpuSplit::Effect::Unknown,
+                                VideoCommon::Nx2FastDrawCount::Neutral());
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -144,13 +252,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.NoteMemoryWrite();
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
-                        rasterizer_ptr->FlushRegion(addr, size);
-                    });
+                    // Delta draw count: FlushRegion and the collected write below are neutral
+                    // (a download changes no draw; a write breaks where it lands).
+                    split.Defer(
+                        [rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                            rasterizer_ptr->FlushRegion(addr, size);
+                        },
+                        VideoCommon::GpuSplit::Effect::Unknown,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                        rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    split.Defer(
+                        [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                            rasterizer_ptr->OnCacheInvalidation(addr, size);
+                        },
+                        VideoCommon::GpuSplit::Effect::Unknown,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
                 } else {
                     ASSERT(false);
                 }
@@ -158,11 +274,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     [state_ptr = &state, fence = next.fence, block = next.block] {
                         SignalCommand(*state_ptr, fence, block);
                     },
-                    VideoCommon::GpuSplit::Effect::None);
+                    VideoCommon::GpuSplit::Effect::None,
+                    VideoCommon::Nx2FastDrawCount::Neutral() |
+                        VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
                 split.Publish();
                 continue;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                VideoCommon::MemStageStats::ListSubmitted(
+                    submit_list->channel, submit_list->entries.command_lists.size());
                 const bool timeline = Common::Nx2Timeline::Active();
                 if (timeline) {
                     Common::Nx2Timeline::Instant("front: list begin", {"seq", next.fence},
@@ -253,6 +373,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
         }
     }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    // EDEN_NX2_GPU_WAKE: ends the GPU thread's wait for suspended channels (returns at once
+    // while the switch is off).
+    Tegra::Nx2PendingWake::Get().Notify();
 
     if (block) {
         // With the split, SignalCommand runs on the back.

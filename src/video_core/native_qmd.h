@@ -109,7 +109,7 @@ public:
             if (!read(request.address, state.descriptor)) return "unmapped QMD";
             const auto qmd = state.descriptor;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
-            // A program Eden can't run is skipped, but the QMD still completes: its releases
+            // A program the emulator can't run is skipped, but the QMD still completes: its releases
             // are what other queues and the CPU wait on (the console never fails a launch).
             const bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
             if (!dispatched) error = "native shader dispatch required";
@@ -150,7 +150,7 @@ public:
     using StateTable = std::unordered_map<Address, State>;
     /// The table this scheduler runs on: the shared one, or the GPU thread split's front copy
     /// (EXP13=2: KeplerCompute's QMD release prediction mirrors the back's scheduling with it;
-    /// from zortos293/Lichii#717).
+    /// ported).
     StateTable* table = &states;
     /// The shared table (read only while no other thread signals).
     static const StateTable& SharedStates() { return states; }

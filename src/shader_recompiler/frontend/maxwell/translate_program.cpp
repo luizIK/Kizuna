@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -119,6 +118,22 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
         throw InvalidArgument("Invalid stage {}", program.stage);
     }()};
     auto& descs{program.info.storage_buffers_descriptors};
+    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the extras follow the descriptors (a global
+    // store may land anywhere in a driver buffer)
+    auto& extras{program.info.storage_write_extras};
+    const bool global_stores{program.info.stores_global_memory};
+    const StorageWriteExtra global_extra{
+        .write_unknown = ExtentUnknownWhy{.kind = ExtentUnknown::GlobalStore}};
+    if ((global_stores || !extras.empty()) && extras.size() != descs.size()) {
+        extras.assign(descs.size(), StorageWriteExtra{});
+    }
+    if (global_stores) {
+        // FRITCHII_STORE_FOOTPRINT: a global store may land in any written buffer
+        for (StorageWriteExtra& extra : extras) {
+            extra.footprint = StorageStoreFootprint{};
+            extra.footprint.why = StoreFootprintWhy::GlobalStore;
+        }
+    }
     for (u32 index = 0; index < num_buffers; ++index) {
         if (!program.info.nvn_buffer_used[index]) {
             continue;
@@ -132,6 +147,7 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
             if (program.info.stores_global_memory) {
                 // A global store may land anywhere in it
                 it->write_extent = {};
+                extras[static_cast<size_t>(it - descs.begin())] = global_extra;
             }
             continue;
         }
@@ -146,6 +162,9 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
             .count = 1,
             .is_written = program.info.stores_global_memory,
         });
+        if (!extras.empty() || global_stores) {
+            extras.push_back(global_stores ? global_extra : StorageWriteExtra{});
+        }
     }
     // A global access is left: it is routed by address into any bound buffer at any offset, so no
     // read extent of the program is known.
@@ -407,6 +426,18 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
             }
 
             if (!normalized_host_info.support_geometry_shader_passthrough) {
+                if (normalized_host_info.trim_lowered_geometry_passthrough) {
+                    // Ported fix: the lowered shader copies only
+                    // Position and the generics; the mask's other bits (InstanceId, VertexId,
+                    // FrontFace...) would declare stage inputs a geometry shader can't have.
+                    // AMD's Windows driver closed the emulator compiling such a shader.
+                    for (size_t i = 0; i < program.info.passthrough.mask.size(); ++i) {
+                        if (i < static_cast<size_t>(IR::Attribute::PositionX) ||
+                            i > static_cast<size_t>(IR::Attribute::Generic31W)) {
+                            program.info.passthrough.mask[i] = false;
+                        }
+                    }
+                }
                 program.output_vertices = GetOutputTopologyVertices(program.output_topology);
                 LowerGeometryPassthrough(program, normalized_host_info);
             }
@@ -541,10 +572,24 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.loads.mask |= vertex_b.info.loads.mask;
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
-    Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    // The two halves are one stage: their storage buffers share its limit.
-    Optimization::JoinStorageInfo(result.info, vertex_b.info,
-                                  Optimization::StorageBufferLimit(host_info));
+    if (host_info.support_handle_table_arrays) {
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS: Vertex B's descriptors and storage
+        // buffers join Vertex A's, which keep their indices; its handle programs and the
+        // instructions of its blocks read them where they are here. The two halves are one
+        // stage: their storage buffers share its limit.
+        const auto storage_bindings{Optimization::JoinStorageInfo(
+            result.info, vertex_b.info, Optimization::StorageBufferLimit(host_info))};
+        const auto descriptors{
+            Optimization::JoinTextureInfo(result.info, vertex_b.info, storage_bindings)};
+        Optimization::RemapTextureDescriptors(vertex_b, descriptors);
+        Optimization::RemapStorageBindings(vertex_b, storage_bindings);
+    } else {
+        // As before the port.
+        Optimization::JoinTextureInfoLegacy(result.info, vertex_b.info);
+        // The two halves are one stage: their storage buffers share its limit.
+        Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                      Optimization::StorageBufferLimit(host_info));
+    }
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

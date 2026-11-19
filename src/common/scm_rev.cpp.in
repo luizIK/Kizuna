@@ -35,6 +35,7 @@ constexpr const char g_build_name[] = BUILD_NAME;
 constexpr const char g_build_date[] = BUILD_DATE;
 constexpr const char g_build_fullname[] = BUILD_FULLNAME;
 constexpr const char g_build_version[] = BUILD_VERSION;
+constexpr const char g_build_label[] = "@BUILD_LABEL@";
 constexpr const char g_build_id[] = BUILD_ID;
 constexpr const char g_build_release_tag[] = "@LICHII_BUILD_TAG@";
 constexpr const char g_build_release_platform[] = "@LICHII_BUILD_PLATFORM@";

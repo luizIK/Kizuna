@@ -178,6 +178,17 @@ std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* 
     return std::nullopt;
 }
 
+u32 PrimaryDisplayHeight() {
+#ifdef _WIN32
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsHeight > 0) {
+        return static_cast<u32>(mode.dmPelsHeight);
+    }
+#endif
+    return 0;
+}
+
 void HostPacer::NoteQueued(Clock::time_point queued) {
     if (last_queued) {
         // A load screen's or a stall's gap would take seconds to forget: clamp each sample.
@@ -210,14 +221,37 @@ void HostPacer::Refresh(Clock::time_point now, bool allowed, void* native_window
     pacing = allowed && refresh_known && !broken &&
              VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_host_pace,
                                               "EDEN_NX2_HOST_PACE", 1) != 0;
+    if (const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_pace_fix,
+                                                           "FRITCHII_PACE_FIX", 0);
+        value != fix) [[unlikely]] {
+        LOG_INFO(Render_Vulkan, "Host pacing: FRITCHII_PACE_FIX {} (was {})", value, fix);
+        fix = value;
+        guard_extra_ns = 0.0;
+    }
     VideoCommon::Nx2Perf::g_host_refresh_ns.store(
         pacing ? static_cast<long long>(refresh_ns) : 0, std::memory_order_relaxed);
     VideoCommon::Nx2Perf::g_display_refresh_ns.store(
         refresh_known ? static_cast<long long>(refresh_ns) : 0, std::memory_order_relaxed);
 }
 
+double HostPacer::LeadNs() const {
+    if ((fix & 1) == 0) {
+        return lead_ns;
+    }
+    // FRITCHII_PACE_FIX 1: present just after the refresh before the intended one. The frame
+    // cannot be taken at that refresh any more (vblank follows when frames were shown, which is
+    // after the refresh), so it is shown at the intended one, and the copy and the compositor
+    // get nearly a whole refresh instead of the ~3 ms the adaptive lead settles at.
+    const double guard =
+        (std::min)(std::clamp(refresh_ns * 0.15, 1e6, 3e6) + guard_extra_ns, refresh_ns * 0.5);
+    return refresh_ns - guard;
+}
+
 HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
     pending_intended.reset();
+    pending_target.reset();
+    pending_woke.reset();
+    pending_catch_up = false;
     if (!pacing || !vblank || outstanding != 0) {
         return now;
     }
@@ -233,25 +267,40 @@ HostPacer::Clock::time_point HostPacer::Target(Clock::time_point now) {
             ? (std::max<s64>)(1, static_cast<s64>(std::floor(guest_ns / refresh_ns + 0.02)))
             : 1;
     auto intended = *vblank + ToNs(static_cast<double>(k) * refresh_ns);
+    const double lead = LeadNs();
     // A late frame moves the schedule a refresh later for good, and the frames after it then
     // wait that refresh in the queue (input lag). Once frames could have been shown a refresh
     // earlier for 2 s (1 s at 30 fps and below) in a row, show one a refresh early (one short
     // frame) to drop that wait. At 30 fps without it, Ocarina's frames waited ~30 ms each after
     // a few hitches: nearly a frame of extra input lag.
-    if (k >= 2 && intended - ToNs(refresh_ns + lead_ns + 1e6) > now) {
+    // FRITCHII_PACE_FIX 1: by when the frame reached the present thread; the thread itself only
+    // looks after the previous frame was shown, too late for the early lead's earlier target.
+    const auto ready = (fix & 1) != 0 && last_queued ? (std::min)(*last_queued, now) : now;
+    if (k >= 2 && intended - ToNs(refresh_ns + lead + 1e6) > ready) {
         if (++early_streak >= (k == 2 ? 120U : 30U)) {
             early_streak = 0;
             intended -= ToNs(refresh_ns);
             ++caught_up;
+            pending_catch_up = true;
         }
     } else {
         early_streak = 0;
     }
-    const auto target = intended - ToNs(lead_ns);
+    if (now >= intended - ToNs(1e6)) {
+        ++game_late; // Reached the present thread too late for its refresh
+    }
+    const auto target = intended - ToNs(lead);
     if (target <= now) {
+        // FRITCHII_PACE_FIX 1: presented at once, but still in time: keep it for the miss count
+        // (the early target makes this common, and those frames must not drop out of it).
+        if ((fix & 1) != 0 && now < intended - ToNs(1e6)) {
+            pending_intended = intended;
+            pending_woke = now;
+        }
         return now;
     }
     pending_intended = intended;
+    pending_target = target;
     return target;
 }
 
@@ -268,13 +317,27 @@ void HostPacer::NoteSubmitted(u64 id, Clock::time_point submitted_at, bool was_h
     if (id == 0) {
         outstanding = 0;
         pending_intended.reset();
+        pending_target.reset();
+        pending_woke.reset();
         return;
     }
-    submitted.push_back({id, submitted_at, was_held ? pending_intended : std::nullopt});
+    // Held frames, and with FRITCHII_PACE_FIX 1 the ones presented at once but in time (Target
+    // left no target for them).
+    const bool tracked = was_held || (pending_intended && !pending_target);
+    submitted.push_back({id, submitted_at, tracked ? pending_intended : std::nullopt,
+                         pending_target, pending_woke, pending_catch_up});
     while (submitted.size() > 16) {
         submitted.pop_front();
     }
+    if (tracked && pending_woke) {
+        const double copy = Ms{submitted_at - *pending_woke}.count();
+        ++copies;
+        copy_sum_ms += copy;
+        copy_max_ms = (std::max)(copy_max_ms, copy);
+    }
     pending_intended.reset();
+    pending_target.reset();
+    pending_woke.reset();
     outstanding = id;
 }
 
@@ -328,8 +391,30 @@ void HostPacer::NoteShown(u64 id, Clock::time_point shown, bool was_lost) {
         if (shown > *entry->intended + ToNs(refresh_ns * 0.5)) {
             ++missed;
             lead_ns = (std::min)(lead_ns + 0.5e6, refresh_ns * 0.75);
+            // Where its lead went: the hold woke late, the copy and present calls took it, or
+            // the frame was handed over in time and the GPU copy or the compositor was late.
+            const double left = Ms{*entry->intended - entry->submitted}.count();
+            if (entry->catch_up) {
+                ++missed_catch_up;
+            } else if (entry->target && entry->woke &&
+                       *entry->woke > *entry->target + std::chrono::milliseconds{1}) {
+                ++missed_woke;
+            } else if (left < 0.5) {
+                ++missed_copy;
+            } else {
+                ++missed_after;
+                missed_left_sum_ms += left;
+                missed_left_max_ms = (std::max)(missed_left_max_ms, left);
+            }
         } else {
             lead_ns = (std::max)(lead_ns - 0.01e6, 0.5e6);
+            if (shown < *entry->intended - ToNs(refresh_ns * 0.5)) {
+                // Shown a refresh before the one it was held for.
+                ++early;
+                if ((fix & 1) != 0) {
+                    guard_extra_ns = (std::min)(guard_extra_ns + 0.25e6, refresh_ns * 0.25);
+                }
+            }
         }
     }
     last_shown = shown;
@@ -351,9 +436,10 @@ void HostPacer::NoteShownWait(bool shown) {
     }
 }
 
-void HostPacer::NoteHold(Ns hold) {
+void HostPacer::NoteHold(Clock::time_point start, Clock::time_point woke) {
     ++held;
-    hold_sum_ms += Ms{hold}.count();
+    hold_sum_ms += Ms{woke - start}.count();
+    pending_woke = woke;
 }
 
 void HostPacer::Report(Clock::time_point now) {
@@ -368,16 +454,23 @@ void HostPacer::Report(Clock::time_point now) {
              "Host pacing {}: {} frames at {:.3f} Hz; shown for 1/2/3/4/5+ refreshes: "
              "{}/{}/{}/{}/{} (same refresh {}); interval mean {:.2f} ms, max {:.2f}; held {} "
              "(mean {:.2f} ms, missed {}), lead {:.2f} ms; present to shown {:.2f} ms; game "
-             "frame {:.2f} ms; {} lost; caught up {}",
+             "frame {:.2f} ms; {} lost; caught up {}; misses: {} catch-up, {} woke late, {} slow "
+             "copy, {} after present (time left {:.2f} ms mean, {:.2f} max); copy to present "
+             "{:.2f} ms mean, {:.2f} max; game late {}; early {}; fix {}",
              pacing ? "on" : "off", frames, 1e9 / refresh_ns, refreshes_shown[1],
              refreshes_shown[2], refreshes_shown[3], refreshes_shown[4], refreshes_shown[5],
              refreshes_shown[0], intervals ? interval_sum_ms / intervals : 0.0, interval_max_ms,
-             held, held ? hold_sum_ms / held : 0.0, missed, lead_ns / 1e6,
-             latency_sum_ms / frames, content_ns / 1e6, lost, caught_up);
+             held, held ? hold_sum_ms / held : 0.0, missed, LeadNs() / 1e6,
+             latency_sum_ms / frames, content_ns / 1e6, lost, caught_up, missed_catch_up,
+             missed_woke, missed_copy, missed_after,
+             missed_after ? missed_left_sum_ms / missed_after : 0.0, missed_left_max_ms,
+             copies ? copy_sum_ms / copies : 0.0, copy_max_ms, game_late, early, fix);
     report_start = now;
     refreshes_shown = {};
     frames = held = missed = lost = caught_up = 0;
     interval_sum_ms = interval_max_ms = hold_sum_ms = latency_sum_ms = 0;
+    missed_catch_up = missed_woke = missed_copy = missed_after = game_late = early = copies = 0;
+    missed_left_sum_ms = missed_left_max_ms = copy_sum_ms = copy_max_ms = 0;
 }
 
 } // namespace Vulkan

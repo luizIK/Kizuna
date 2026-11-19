@@ -4,10 +4,13 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
 #include <QBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QScreen>
+#include <QTimer>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -125,7 +128,29 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
         ui->selectorList->setFixedWidth(180);
         layout()->setSizeConstraint(QLayout::SetNoConstraint);
         setMinimumSize(640, 460);
-        resize(940, 680);
+        // Wide enough for the Controls page's button columns and controller preview, but never
+        // bigger than the screen it opens on (2026-11-16: it opened taller than a 1080p screen):
+        // after the first layout pass, fit it into 90% x 85% of that screen and center it on
+        // the main window.
+        resize(1080, 700);
+        QTimer::singleShot(0, this, [this] {
+            QScreen* const screen = parentWidget() != nullptr && parentWidget()->screen() != nullptr
+                                        ? parentWidget()->screen()
+                                        : this->screen();
+            if (screen == nullptr) {
+                return;
+            }
+            const QRect area = screen->availableGeometry();
+            const int w = std::min({1080, area.width() * 9 / 10, std::max(this->width(), 640)});
+            const int h = std::min({760, area.height() * 85 / 100, std::max(this->height(), 460)});
+            resize(w, h);
+            const QRect anchor =
+                parentWidget() != nullptr ? parentWidget()->frameGeometry() : area;
+            QPoint top_left = anchor.center() - QPoint(w / 2, h / 2);
+            top_left.setX(std::clamp(top_left.x(), area.left(), area.right() - w));
+            top_left.setY(std::clamp(top_left.y(), area.top(), area.bottom() - h));
+            move(top_left);
+        });
 
         // OoT's own values (Configure Game) beat these, the usual "my settings didn't apply".
         if (const QStringList overrides = FritchiiUi::OcarinaGameOverrides();

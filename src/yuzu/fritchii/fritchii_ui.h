@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <QColor>
+
 #include <functional>
 #include <string>
 #include <utility>
@@ -20,20 +22,16 @@ class MainWindow;
 }
 
 // The Fritchii look ("Graphite"): dark, one violet accent, Inter, a home screen for Ocarina of
-// Time and plain menus. Everything here is switched on only for Fritchii builds, so a Lichii build
-// keeps the upstream UI and merges from Lichii stay clean. Shared files only call in here.
+// Time and plain menus. Everything here is switched on only for Fritchii builds, so any other build
+// keeps the original UI and merges stay clean. Shared files only call in here.
 namespace FritchiiUi {
 
-/// Fritchii builds (g_build_name "Fritchii"). FRITCHII_CLASSIC_UI=1 shows the upstream UI.
+/// Fritchii builds (g_build_name "Fritchii"). FRITCHII_CLASSIC_UI=1 shows the original UI.
 [[nodiscard]] bool Enabled();
 
 /// Fusion style, the Graphite palette, Inter and the stylesheet. Does nothing (and returns false)
 /// when the Fritchii UI is off.
 bool ApplyTheme();
-
-/// Settings the Fritchii settings pages leave out (frame generation's dev options; Fritchii
-/// builds hide frame generation itself, Kizuna builds show it).
-[[nodiscard]] bool HidesSetting(const std::string& label);
 
 /// Kizuna: a short notice over the game (fullscreen too), centred near the top of `anchor`, gone
 /// after a moment. For hotkeys that change something while playing (Ctrl+U: 30 / 60 FPS).
@@ -41,6 +39,8 @@ void ShowNotice(QWidget* anchor, const QString& text);
 
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.
 [[nodiscard]] QIcon Icon(const QString& name, int px = 22);
+/// One colour for every state (a filled button whose own colour is not the palette's).
+[[nodiscard]] QIcon IconTinted(const QString& name, const QColor& color, int px = 22);
 /// The same icon in one fixed colour (e.g. the dark play glyph on the violet button).
 [[nodiscard]] QIcon Glyph(const QString& name, unsigned rgb, int px);
 
@@ -65,8 +65,7 @@ struct GraphicsHooks {
     std::function<bool()> game_running;     ///< Kizuna: a game runs (upscaler: next start)
     std::function<void(const QString&)> notice; ///< Kizuna: a line in the status bar / over the game
 };
-/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, the
-/// Ocarina upscaler (AMD FSR), frame generation (Kizuna), effects.
+/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, effects.
 [[nodiscard]] QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks);
 
 /// A settings page as the settings dialog shows it: inside a scroll area in Fritchii builds, so
@@ -78,7 +77,7 @@ struct GraphicsHooks {
 
 /// The Fritchii Discord server and the owner's donation page, opened in the browser.
 inline constexpr const char* DiscordInvite = "https://discord.gg/fritchii";
-inline constexpr const char* DonateLink = "https://paypal.me/frizti";
+inline constexpr const char* DonateLink = "https://buymeacoffee.com/frizti";
 void OpenDiscord();
 void OpenDonate();
 /// Help > Copy Data from Eden or Lichii (v5.8.1): asks, then restarts into the import.

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -462,7 +461,7 @@ void FixedPipelineState::DynamicState::Refresh3(const Maxwell& regs,
     }
 }
 
-// From zortos293/Lichii#895. Not called by draws or the disk cache loader in Fritchii yet: keying
+// Ported. Not called by draws or the disk cache loader in Fritchii yet: keying
 // draws canonically changes the hashes the used list and the prebuild look up, which waits for
 // review (see port_895_report.md). Our draws already key attribute types by the input map
 // (VideoCommon::KeyedAttributeTypes), which is the first part of this.

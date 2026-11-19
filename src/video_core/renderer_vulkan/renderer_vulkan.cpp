@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,6 +41,7 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/one_follower.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -54,50 +52,10 @@
 namespace Vulkan {
 namespace {
 
-// Kizuna: an exception nobody catches (a Vulkan allocation that failed on the GPU thread, say)
-// ends the process through std::terminate, and the log stops without a word. Say what it was,
-// flush the log, then abort as before.
-[[noreturn]] void LogUncaughtAndAbort() {
-    try {
-        if (std::current_exception()) {
-            throw;
-        }
-        LOG_CRITICAL(Render_Vulkan, "Fatal: std::terminate called without an exception");
-    } catch (const vk::Exception& e) {
-        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught Vulkan error {} ({})",
-                     static_cast<int>(e.GetResult()), e.what());
-    } catch (const std::exception& e) {
-        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught exception: {}", e.what());
-    } catch (...) {
-        LOG_CRITICAL(Render_Vulkan, "Fatal: uncaught exception of an unknown type");
-    }
-    Common::Log::Stop();
-    std::abort();
-}
-
-[[maybe_unused]] const bool terminate_logger_installed = (std::set_terminate(LogUncaughtAndAbort), true);
-
 constexpr VkExtent2D CaptureImageSize{
     .width = VideoCore::Capture::LinearWidth,
     .height = VideoCore::Capture::LinearHeight,
 };
-
-#ifdef HAS_LSFG
-[[nodiscard]] VkExtent2D GuestExtent(std::span<const Tegra::FramebufferConfig> framebuffers) {
-    if (framebuffers.empty()) {
-        return VkExtent2D{};
-    }
-
-    const auto& framebuffer = framebuffers.front();
-    if (framebuffer.crop_rect.IsEmpty()) {
-        return VkExtent2D{.width = framebuffer.width, .height = framebuffer.height};
-    }
-    return VkExtent2D{
-        .width = static_cast<u32>(framebuffer.crop_rect.GetWidth()),
-        .height = static_cast<u32>(framebuffer.crop_rect.GetHeight()),
-    };
-}
-#endif
 
 constexpr VkExtent3D CaptureImageExtent{
     .width = VideoCore::Capture::LinearWidth,
@@ -141,10 +99,29 @@ std::string BuildCommaSeparatedExtensions(
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
-    const u32 device_index = Settings::values.vulkan_device.GetValue();
-    if (device_index >= u32(devices.size())) {
-        LOG_ERROR(Render_Vulkan, "Invalid device index {}!", device_index);
+    if (devices.empty()) {
+        LOG_ERROR(Render_Vulkan, "No Vulkan device found");
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    const u32 saved_index = Settings::values.vulkan_device.GetValue();
+    const std::string saved_name = Settings::values.vulkan_device_name.GetValue();
+    const auto summaries = SummarizePhysicalDevices(dld, devices);
+    const PhysicalDevicePick pick = PickPhysicalDevice(summaries, saved_index, saved_name);
+    const size_t device_index = pick.index;
+    {
+        std::string list;
+        for (size_t i = 0; i < summaries.size(); ++i) {
+            const char* type =
+                summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? "discrete"
+                : summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                                                                              : "other";
+            list += fmt::format("{}{}: {} ({}, {} MiB)", i == 0 ? "" : "; ", i, summaries[i].name,
+                                type, summaries[i].local_memory >> 20);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Graphics card: {} ({}), {}; saved index {}, saved name \"{}\"{}; devices: {}",
+                 summaries[device_index].name, device_index, pick.reason, saved_index, saved_name,
+                 Settings::values.vulkan_device.UsingGlobal() ? "" : " (game setting)", list);
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
     return Device(*instance, physical_device, surface, dld);
@@ -172,6 +149,7 @@ try
     // Create debug messenger if debug is enabled
     , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
                                                     : vk::DebugUtilsMessenger{})
+    , va_report_messenger(VaReport::CreateMessenger(instance))
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))
@@ -209,14 +187,27 @@ try
                   scheduler,
                   PresentFiltersForAppletCapture)
     , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
-#ifdef HAS_LSFG
-    , frame_gen(memory_allocator, scheduler)
-#endif
 {
 
-    if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
-        turbo_mode.emplace(instance, dld);
-        scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+    // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
+    // failing to start skips it instead of failing the whole renderer ("Vulkan initialization
+    // error" and no boot).
+    if (!Settings::values.renderer_force_max_clock.GetValue()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: off");
+    } else if (!device.ShouldBoostClocks()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: skipped (driver not on the list, Steam "
+                                "Deck, or a debugging tool attached)");
+    } else {
+        try {
+            turbo_mode.emplace(instance, dld);
+            scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+            LOG_INFO(Render_Vulkan, "Force maximum clocks: running (costs power; not for laptops "
+                                    "on battery)");
+        } catch (const std::exception& exception) {
+            turbo_mode.reset();
+            LOG_WARNING(Render_Vulkan, "Force maximum clocks: skipped (its device failed: {})",
+                        exception.what());
+        }
     }
 
 #ifdef HAS_RESHADE
@@ -242,6 +233,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
+    // One follower: the frame fence's syncpoint can run this on E while R still plays the frame.
+    // The scheduler is R's: wait for R before the first record (before 2026-11-18 a lend inside
+    // AccelerateDisplay did that by accident; FRITCHII_SLOW_GPU's present-pass records ran before
+    // it and raced R's DispatchWork, a null chunk on GPUBack; helper EC).
+    if (VideoCommon::OneFollower::OnEngineThread()) {
+        VideoCommon::OneFollower::Drain();
+    }
+
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
@@ -261,22 +260,6 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
 
-#ifdef HAS_LSFG
-    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
-
-    frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
-                      GuestExtent(framebuffers));
-
-    const size_t generated_frames = frame_gen.GeneratedFrameCount();
-    for (size_t generation = 0; generation < generated_frames; ++generation) {
-        Frame* generated = present_manager.GetRenderFrame();
-        blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
-        frame_gen.GenerateInto(device, generated, generation);
-        generated->render_tick = scheduler.Flush(*generated->render_ready);
-        present_manager.Present(generated);
-    }
-#endif
-
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
@@ -287,9 +270,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     present_manager.Present(frame);
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-#ifdef HAS_LSFG
+    // Hand the work recorded so far to the worker right after the present.
     scheduler.DispatchWork();
-#endif
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
@@ -332,7 +314,29 @@ void RendererVulkan::Report() const {
     LOG_INFO(Render_Vulkan, "Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "Device: {}", model_name);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
-    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
+    // The caches' memory limit, not the card's size: with Conservative VRAM use it is capped at
+    // 6 GiB + 1 GiB per resolution scale step, so a 16 GB card reads 7.00 GiB at 1x.
+    std::string vram_limit;
+    if (device.IsIntegrated()) {
+        vram_limit = "integrated GPU: a share of system memory";
+    } else if (Settings::values.vram_usage_mode.GetValue() ==
+               Settings::VramUsageMode::Aggressive) {
+        vram_limit = "Aggressive: the driver's budget less up to 1 GiB";
+    } else {
+        vram_limit = fmt::format("Conservative cap: 6 GiB + 1 GiB x {}",
+                                 Settings::values.resolution_info.ScaleUp(1));
+    }
+    u64 main_usage = 0;
+    u64 main_budget = 0;
+    const std::string main_heap =
+        device.MainHeapUsage(main_usage, main_budget)
+            ? fmt::format("main heap {}: budget {:.2f} GiB, usage {:.2f} GiB",
+                          device.GetMainHeap(), static_cast<f64>(main_budget) / f64{1_GiB},
+                          static_cast<f64>(main_usage) / f64{1_GiB})
+            : fmt::format("main heap {}", device.GetMainHeap());
+    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB (memory limit for the caches; {}; {})",
+             available_vram, vram_limit, main_heap);
+    device.LogMemoryHeaps();
     if (VideoCommon::RenderTrace::Enabled()) {
         LOG_INFO(Render_Vulkan, "Render trace enabled: interval=600 frames, log_filter={}",
                  Settings::values.log_filter.GetValue());
@@ -393,6 +397,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
     using namespace VideoCore::Capture;
+
+    // Same as Composite: the scheduler is R's (this Finish ran on E too).
+    if (VideoCommon::OneFollower::OnEngineThread()) {
+        VideoCommon::OneFollower::Drain();
+    }
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);
 

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -36,6 +35,18 @@ public:
         /* Do Nothing */
     }
 
+    /// EXP119 (fritchii_report_runs.h): ResetCounter without queuing its amend reset, which the
+    /// caller queues in a report run instead (ResetAmend). False: not split, nothing done.
+    virtual bool ResetCounterWithoutOperation() {
+        return false;
+    }
+
+    /// The operation ResetCounter queues (EXP119 runs it from a report run).
+    void ResetAmend() {
+        amend_value = 0;
+        accumulation_value = 0;
+    }
+
     virtual void CloseCounter() {
         /* Do Nothing */
     }
@@ -60,6 +71,12 @@ public:
 
     virtual size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                                 std::optional<u32> subreport = std::nullopt) = 0;
+
+    /// One follower (fable_b 16.2's mirror check): whether a report written now would make a
+    /// pending sync (the samples streamer: a query is running since the last reset).
+    virtual bool ReportMakesPendingSync() const {
+        return false;
+    }
 
     virtual bool HasUnsyncedQueries() const {
         return false;

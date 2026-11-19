@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "yuzu/util/export_log.h"
+#include "yuzu/util/profiling_mode.h"
 
+#include <algorithm>
 #include <thread>
 #include <utility>
 
@@ -35,7 +37,9 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
+#include "common/build_stamp.h"
 #include "common/settings.h"
+#include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/vk.h"
 
@@ -118,8 +122,59 @@ QString Gigabytes(u64 bytes) {
                                       'f', 1);
 }
 
+/// The card the last game of these logs ran on: the renderer's "Device: <name>" line, newest
+/// log first. Empty when no game started in them.
+QString LastUsedGpu(const QStringList& logs) {
+    static const QRegularExpression device_line(
+        QStringLiteral("renderer_vulkan\\.cpp:\\d+:Report: Device: ([^\\r\\n]+)"));
+    for (const QString& log : logs) {
+        QString last;
+        auto matches = device_line.globalMatch(log);
+        while (matches.hasNext()) {
+            last = matches.next().captured(1).trimmed();
+        }
+        if (!last.isEmpty()) {
+            return last;
+        }
+    }
+    return {};
+}
+
+/// OoT's own vulkan_device (Configure Game), or -1 when it uses the global one.
+int GameGpuIndex(const QString& game_ini_path, QString* game_name) {
+    QFile file(game_ini_path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return -1;
+    }
+    bool own = false;
+    int index = -1;
+    QString section;
+    while (!file.atEnd()) {
+        const QString line = QString::fromUtf8(file.readLine()).trimmed();
+        if (line.startsWith(QLatin1Char('[')) && line.endsWith(QLatin1Char(']'))) {
+            section = line.mid(1, line.size() - 2);
+            continue;
+        }
+        if (section != QStringLiteral("Renderer")) {
+            continue;
+        }
+        if (line == QStringLiteral("vulkan_device\\use_global=false")) {
+            own = true;
+        } else if (line.startsWith(QStringLiteral("vulkan_device="))) {
+            index = line.mid(14).toInt();
+        } else if (line.startsWith(QStringLiteral("vulkan_device_name="))) {
+            *game_name = line.mid(19);
+            if (game_name->size() >= 2 && game_name->startsWith(QLatin1Char('"')) &&
+                game_name->endsWith(QLatin1Char('"'))) {
+                *game_name = game_name->mid(1, game_name->size() - 2);
+            }
+        }
+    }
+    return own ? index : -1;
+}
+
 QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records,
-                      const QStringList& included) {
+                      const QStringList& included, const QStringList& logs) {
     QString text;
     text += QStringLiteral("Kizuna log export, made %1\n\n")
                 .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
@@ -130,6 +185,12 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
                                               .arg(QString::fromUtf8(Common::g_build_fullname),
                                                    QString::fromUtf8(Common::g_build_date),
                                                    QString::fromUtf8(Common::g_compiler_id)));
+    if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
+        text += Line(QStringLiteral("Build hash"), QString::fromStdString(stamp));
+    }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        text += Line(QStringLiteral("Build tag"), QString::fromStdString(tag));
+    }
     text += Line(QStringLiteral("Tuned settings revision"),
                  QStringLiteral("%1 (applied: %2)")
                      .arg(Settings::Frizti::Revision)
@@ -141,6 +202,18 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
     }
     text += Line(QStringLiteral("Portable"),
                  data_dir.filename() == "user" ? QStringLiteral("yes") : QStringLiteral("no"));
+    // Help > Profiling Mode: on in this start (with the switches it added), and the saved
+    // setting when the next start differs.
+    QString profiling = ProfilingMode::Active() ? QStringLiteral("on") : QStringLiteral("off");
+    if (ProfilingMode::Active() && !ProfilingMode::Applied().empty()) {
+        profiling += QStringLiteral(" (%1)").arg(QString::fromStdString(ProfilingMode::Applied()));
+    }
+    if (UISettings::values.profiling_mode.GetValue() != ProfilingMode::Active()) {
+        profiling += UISettings::values.profiling_mode.GetValue()
+                         ? QStringLiteral(", on from the next start")
+                         : QStringLiteral(", off from the next start");
+    }
+    text += Line(QStringLiteral("Profiling mode"), profiling);
 
     text += QStringLiteral("\n== PC ==\n");
     text += Line(QStringLiteral("OS"), QtCommon::PrettyProductName());
@@ -162,14 +235,60 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
     text += Line(QStringLiteral("RAM"), QStringLiteral("%1 (page file %2)")
                                             .arg(Gigabytes(memory.TotalPhysicalMemory),
                                                  Gigabytes(memory.TotalSwapMemory)));
-    const u32 selected_gpu = Settings::values.vulkan_device.GetValue();
+    // "GPU (used)" is the card the last game in these logs ran on (OoT's game settings can pick
+    // another one than the global setting: an Arc B580 PC showed its iGPU here, 2026-11-16).
+    // The global and game picks are marked; without a game in the logs, the global pick is used.
+    const size_t global_gpu = VkDeviceInfo::PickedIndex(
+        vk_device_records, Settings::values.vulkan_device.GetValue(true),
+        Settings::values.vulkan_device_name.GetValue(true));
+    QString game_gpu_name;
+    const int game_gpu_index = GameGpuIndex(
+        QString::fromStdString(Common::FS::PathToUTF8String(
+            Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom" /
+            "0400486024DEC000.ini")),
+        &game_gpu_name);
+    const size_t game_gpu =
+        game_gpu_index < 0
+            ? vk_device_records.size()
+            : VkDeviceInfo::PickedIndex(vk_device_records, static_cast<u32>(game_gpu_index),
+                                        game_gpu_name.toStdString());
+    const QString last_used = LastUsedGpu(logs);
+    size_t used_gpu = global_gpu;
+    for (size_t i = 0; i < vk_device_records.size(); ++i) {
+        if (!last_used.isEmpty() &&
+            QString::fromStdString(vk_device_records[i].device_name) == last_used) {
+            used_gpu = i;
+            break;
+        }
+    }
     for (size_t i = 0; i < vk_device_records.size(); ++i) {
         const auto& record = vk_device_records[i];
         QString gpu = QString::fromStdString(record.name);
         if (!record.driver_version.empty()) {
             gpu += QStringLiteral(", driver %1").arg(QString::fromStdString(record.driver_version));
         }
-        text += Line(i == selected_gpu ? QStringLiteral("GPU (used)") : QStringLiteral("GPU"), gpu);
+        QStringList marks;
+        if (i == used_gpu) {
+            marks << (last_used.isEmpty() ? QStringLiteral("no game in these logs")
+                                          : QStringLiteral("the last game ran on it"));
+        }
+        if (i == global_gpu) {
+            marks << QStringLiteral("global setting");
+        }
+        if (i == game_gpu) {
+            marks << QStringLiteral("OoT game setting");
+        }
+        if (!marks.isEmpty()) {
+            gpu += QStringLiteral(" [%1]").arg(marks.join(QStringLiteral(", ")));
+        }
+        text += Line(i == used_gpu ? QStringLiteral("GPU (used)") : QStringLiteral("GPU"), gpu);
+    }
+    if (!last_used.isEmpty() && std::none_of(vk_device_records.begin(), vk_device_records.end(),
+                                             [&](const auto& record) {
+                                                 return QString::fromStdString(
+                                                            record.device_name) == last_used;
+                                             })) {
+        text += Line(QStringLiteral("GPU (the last game ran on)"), last_used);
     }
     if (vk_device_records.empty()) {
         text += Line(QStringLiteral("GPU"), QStringLiteral("no Vulkan device found"));
@@ -320,6 +439,7 @@ void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_
 
     const Scrubber scrubber;
     QStringList included;
+    QStringList logs; ///< Newest first, for the GPU the last game ran on
     std::vector<std::pair<QString, QByteArray>> files;
     const auto add_log = [&](const QString& source, const QString& name, const QString& what) {
         qint64 size = 0;
@@ -327,6 +447,7 @@ void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_
         if (size == 0) {
             return;
         }
+        logs << text;
         files.emplace_back(name, scrubber.Apply(text).toUtf8());
         included << QStringLiteral("%1: %2 (%3 KB)").arg(name, what).arg((size + 1023) / 1024);
     };
@@ -344,7 +465,7 @@ void Export(QWidget* parent, const std::vector<VkDeviceInfo::Record>& vk_device_
     }
     included.prepend(QStringLiteral("system-info.txt: this summary"));
     files.emplace(files.begin(), QStringLiteral("system-info.txt"),
-                  scrubber.Apply(SystemSummary(vk_device_records, included)).toUtf8());
+                  scrubber.Apply(SystemSummary(vk_device_records, included, logs)).toUtf8());
 
     bool ok = false;
     {

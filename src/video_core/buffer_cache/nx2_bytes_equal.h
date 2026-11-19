@@ -17,7 +17,7 @@ namespace VideoCommon {
 
 /// Whether [a, a + size) and [b, b + size) hold the same bytes. Inline, 128 bytes per step with an
 /// early exit: memcmp is an out-of-line ucrt call that clang does not expand for 4 KiB pages
-/// (zortos293/Lichii#717 Nx2BufCache::BytesEqual, EDEN_NX2_PAGE_CMP). SSE2 only, so any x86-64
+/// (the original's Nx2BufCache::BytesEqual, EDEN_NX2_PAGE_CMP). SSE2 only, so any x86-64
 /// CPU; other hosts use memcmp.
 [[nodiscard]] inline bool Nx2BytesEqual(const u8* a, const u8* b, std::size_t size) {
 #ifdef NX2_BYTES_EQUAL_SSE2

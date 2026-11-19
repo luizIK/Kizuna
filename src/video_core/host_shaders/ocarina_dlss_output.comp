@@ -5,16 +5,40 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D dlss_color;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D guest_color;
 
+// The guest upscaler squares its encoded RGB before writing the linear target.
+vec3 decode(vec3 encoded) {
+    vec3 color = max(encoded, vec3(0.0));
+    return color * color;
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 extent = imageSize(guest_color);
     if (any(greaterThanEqual(pixel, extent))) {
         return;
     }
-    // The guest upscaler squares its encoded RGB before writing the linear target.
-    vec3 sampled = all(equal(textureSize(dlss_color, 0), extent))
-        ? texelFetch(dlss_color, pixel, 0).rgb
-        : textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(extent), 0).rgb;
-    vec3 color = max(sampled, vec3(0.0));
-    imageStore(guest_color, pixel, vec4(color * color, 1.0));
+    ivec2 source_size = textureSize(dlss_color, 0);
+    vec3 color;
+    if (all(equal(source_size, extent))) {
+        color = decode(texelFetch(dlss_color, pixel, 0).rgb);
+    } else if (any(greaterThan(source_size, extent))) {
+        // The upscaler ran at a scaled scene's size, larger than the target (FRITCHII_DLSS_SCALED
+        // above the target's size): average the pixel's whole footprint in linear colour. Each
+        // bilinear tap covers two source pixels a side.
+        vec2 ratio = vec2(source_size) / vec2(extent);
+        ivec2 taps = clamp(ivec2(ceil(ratio * 0.5)), ivec2(1), ivec2(4));
+        vec2 step_size = ratio / vec2(taps);
+        vec2 origin = vec2(pixel) * ratio;
+        vec3 sum = vec3(0.0);
+        for (int y = 0; y < taps.y; ++y) {
+            for (int x = 0; x < taps.x; ++x) {
+                vec2 position = origin + (vec2(x, y) + 0.5) * step_size;
+                sum += decode(textureLod(dlss_color, position / vec2(source_size), 0).rgb);
+            }
+        }
+        color = sum / float(taps.x * taps.y);
+    } else {
+        color = decode(textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(extent), 0).rgb);
+    }
+    imageStore(guest_color, pixel, vec4(color, 1.0));
 }

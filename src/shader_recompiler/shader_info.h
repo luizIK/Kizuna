@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -185,6 +184,26 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF / FRITCHII_STORE_FOOTPRINT: what the store
+/// analysis found for a written storage buffer (Info::storage_write_extras).
+struct StorageWriteExtra {
+    /// Why write_extent is unknown (Known when proven)
+    ExtentUnknownWhy write_unknown{};
+    /// The store extent with constant buffer words in it (unbounded when none was found)
+    StorageCbufExtent cbuf_extent{};
+    /// FRITCHII_STORE_FOOTPRINT: the bytes its stores can land on, as residues (none unless
+    /// written and every store's offset is the pointer plus a known congruence)
+    StorageStoreFootprint footprint{};
+    /// FRITCHII_EXTENT_SHARED: Known when cbuf_extent was proven by following offsets through
+    /// shared memory slots (cbuf_extent.via_shared), else why that try failed (Unrecorded: not
+    /// tried, the plain or cbuf extent already held or no shared load was involved)
+    ExtentUnknownWhy shared_why{};
+    /// FRITCHII_EXTENT_GUARD: Known when cbuf_extent was proven with the branch conditions on the
+    /// stores' paths (cbuf_extent.via_guard), else why that try failed (Unrecorded: not tried,
+    /// an earlier extent already held)
+    ExtentUnknownWhy guard_why{};
+};
+
 struct TextureBufferDescriptor {
     bool has_secondary;
     u32 cbuf_index;
@@ -235,8 +254,26 @@ struct TextureDescriptor {
     u32 count;
     u32 size_shift;
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
-    /// storage buffer), ~0 when it is the constant buffer word above.
+    /// storage buffer), ~0 when it is the constant buffer word above. With a count above 1 the
+    /// program computes the handle of each element (HandleOp::Index): a handle the shader reads
+    /// from a table at an index only each invocation knows, the shader indexing the array.
     u32 handle_program{~0U};
+    /// Whether the shader indexes the descriptor: an array, whose count the descriptor limits set
+    /// (LimitSampledTextureArrays). It stays one when they cut it to a single element.
+    bool is_descriptor_array{};
+    /// Whether the constant buffer word above reaches the handle only as the address of a load:
+    /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
+    bool handle_is_pointer_word{};
+    /// EDEN_NX2_DEPTH_CENSUS (fable52_answer_potroom 4): how the shader reads the texture, the
+    /// Census* bits of every instruction on it. Not stored with the info (info_serialize.cpp):
+    /// 0 for an info from the precompiled cache, CensusKnown unset. In the struct's padding.
+    u8 census_use{};
+    static constexpr u8 CensusKnown = 1;  ///< Set by the texture pass
+    static constexpr u8 CensusFetch = 2;  ///< texelFetch
+    static constexpr u8 CensusQuery = 4;  ///< textureSize (ImageQueryDimensions)
+    static constexpr u8 CensusOffset = 8; ///< a sample, fetch or gather with texel offsets
+    static constexpr u8 CensusGather = 16;
+    static constexpr u8 CensusRect = 32;  ///< a rectangle texture sampled (normalized by size)
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -359,6 +396,10 @@ struct Info {
     bool uses_global_memory{};
     bool requires_coherent_global_memory{};
     bool requires_coherent_image_memory{};
+    /// A texture descriptor's handle word is a pointer the program doesn't bind as a storage
+    /// buffer: the capture saw that pointer null or unmapped, and a capture with it mapped
+    /// translates differently (a handle table instead of the word)
+    bool binds_unmapped_pointer_word{};
     /// Set by the SPIR-V backend when HMMA runs on cooperative matrices, which need full subgroups
     bool uses_cooperative_matrix{};
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
@@ -390,6 +431,13 @@ struct Info {
     /// One per storage_buffers_descriptors entry, same order: how far the program's loads and
     /// atomics reach past the pointer. A size other than the descriptors' means unknown.
     std::vector<StorageWriteExtent> storage_read_extents;
+    /// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: one per storage_buffers_descriptors entry,
+    /// same order, or empty (no written buffer with an unknown extent, or not recorded). A size
+    /// other than the descriptors' means none. Not stored with the info (info_serialize.cpp): empty
+    /// for an info from the precompiled cache.
+    std::vector<StorageWriteExtra> storage_write_extras;
+    // (FRITCHII_STORE_FOOTPRINT keeps its footprints in the extras too: they are there for every
+    // program with a written storage buffer now.)
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
@@ -408,6 +456,26 @@ u32 NumDescriptors(const Descriptors& descriptors) {
     return num;
 }
 
+/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: storage descriptor `index`'s extra, or null
+/// when the info has none (every BindComputeStorageBuffer caller passes this).
+[[nodiscard]] inline const StorageWriteExtra* StorageWriteExtraOf(const Info& info,
+                                                                  size_t index) {
+    return info.storage_write_extras.size() == info.storage_buffers_descriptors.size() &&
+                   index < info.storage_write_extras.size()
+               ? &info.storage_write_extras[index]
+               : nullptr;
+}
+
+/// FRITCHII_FEEDER_LANE: storage descriptor `index`'s read extent (its loads and atomics), or null
+/// when the info has none.
+[[nodiscard]] inline const StorageWriteExtent* StorageReadExtentOf(const Info& info,
+                                                                   size_t index) {
+    return info.storage_read_extents.size() == info.storage_buffers_descriptors.size() &&
+                   index < info.storage_read_extents.size()
+               ? &info.storage_read_extents[index]
+               : nullptr;
+}
+
 
 /// Operations of a handle program, a stack machine over 32-bit words. Operands follow the
 /// operation code in the program; values are popped right operand first.
@@ -423,13 +491,15 @@ enum class HandleOp : u32 {
     Select, ///< condition, true value, false value
     Tee,    ///< slot: keeps the top value in the slot (shared subexpressions)
     Load,   ///< slot: the value kept there
+    Index,  ///< the element of the descriptor array being computed (see TextureDescriptor)
 };
 
 /// Runs a handle program; read_cbuf(index, offset) and read_storage(binding, offset) return the
-/// words it reads. Returns nothing for a malformed program.
+/// words it reads, and element is the descriptor array element computed (HandleOp::Index).
+/// Returns nothing for a malformed program.
 template <typename ReadCbuf, typename ReadStorage>
 std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
-                                         ReadStorage&& read_storage) {
+                                         ReadStorage&& read_storage, u32 element = 0) {
     std::array<u32, 64> stack{};
     std::array<u32, 256> slots{};
     size_t size = 0;
@@ -472,6 +542,10 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
         if (op == HandleOp::Load) {
             const u32 slot = operand();
             push(slot < slots.size() ? slots[slot] : 0U);
+            continue;
+        }
+        if (op == HandleOp::Index) {
+            push(element);
             continue;
         }
         if (op == HandleOp::Select) {

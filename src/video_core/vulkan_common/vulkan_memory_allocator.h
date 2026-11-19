@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -10,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -95,10 +95,11 @@ namespace Vulkan {
          * Construct memory allocator
          *
          * @param device_  Device to allocate from
+         * @param buffers  Use the device's buffer allocator (Device::GetBufferAllocator)
          *
          * @throw vk::Exception on failure
          */
-        explicit MemoryAllocator(const Device &device_);
+        explicit MemoryAllocator(const Device &device_, bool buffers = false);
 
         ~MemoryAllocator();
 
@@ -142,22 +143,33 @@ namespace Vulkan {
             return failed_images.load(std::memory_order_relaxed);
         }
 
+        /// EDEN_NX2_IMAGE_ALLOC_TIMING=1 (boot, off by default): images are made in vmaCreateImage's
+        /// three steps, each timed (ns, all images so far), so "Slow clear" lines can say where a
+        /// new image's create time went (NPC-pass dips: 0.15-1.5 ms per per-object depth target).
+        struct ImageTiming {
+            u64 images{};
+            u64 create_ns{}; ///< vkCreateImage
+            u64 alloc_ns{};  ///< vmaAllocateMemoryForImage (requirements, block search, new blocks)
+            u64 bind_ns{};   ///< vmaBindImageMemory
+            /// Of the images: those whose create added a VMA memory object (a new block or
+            /// dedicated memory; VMA's count across the create, so another thread's allocation
+            /// in between can count too), their whole create time, and the dedicated ones.
+            u64 new_block_images{};
+            u64 new_block_ns{};
+            u64 dedicated_images{};
+        };
+        static ImageTiming ReadImageTiming() noexcept;
+        static bool ImageTimingEnabled() noexcept;
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
 
-        /// Kizuna: takes a block of device memory (192 MiB) that nothing uses, if there is
-        /// room within the budget and none is held. A buffer that does not fit gives it back
-        /// (ReleaseReserve) instead of ending the process: a 16 MiB buffer killed build 6 with
-        /// the card at its budget. The texture cache calls this when it has room again.
-        void RestoreReserve() const;
-
-        /// Gives the reserve back to the driver. True when there was one.
-        bool ReleaseReserve() const;
-
-        /// True while the reserve is held.
-        [[nodiscard]] bool HasReserve() const;
+        /// CreateBuffer without the memory budget, for a buffer the game can't go on without once
+        /// what could be freed was freed: the driver pages rather than the emulator stopping.
+        vk::Buffer CreateBufferOverBudget(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                          VkDeviceSize min_alignment = 1) const;
 
         /**
          * Commits a memory with the specified requirements.
@@ -184,6 +196,10 @@ namespace Vulkan {
             }
         }
 
+        /// The buffer through VMA's aligned create, within the memory budget or not.
+        vk::Buffer CreateAlignedBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                       VkDeviceSize min_alignment, bool within_budget) const;
+
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
@@ -196,9 +212,6 @@ namespace Vulkan {
         u32 valid_memory_types{~0u};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::atomic<u32> failed_images{0};
-        mutable std::mutex reserve_mutex;
-        mutable VkBuffer reserve_buffer{};         ///< RestoreReserve's block, null when given back.
-        mutable VmaAllocation reserve_allocation{};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;
@@ -222,5 +235,26 @@ namespace Vulkan {
         u64 local_blocks{};
     };
     [[nodiscard]] HeapTotals GetHeapTotals(const Device& device);
+
+    /// FRITCHII_VRAM_OWNERS: where the unused space in `owner`'s blocks on `heap` lies: the
+    /// memory types' default blocks, then each custom pool (depth, colour, sparse, buffer), each
+    /// with its blocks, holes and largest hole. Walks every block: only the allocator's user may
+    /// call it (the back for the main allocator; MemoryStageLink::IsCacheUser for the buffer one).
+    [[nodiscard]] std::string VramSlackText(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_VRAM_TRIM: gives back the empty block VMA keeps in each of `owner`'s block
+    /// vectors on `heap` (default blocks and custom pools). Returns the bytes given back. Only the
+    /// allocator's user may call it.
+    u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_DEPTH_POOL_FIT: what it placed and the padding its live images hold; empty while
+    /// it is off and placed nothing.
+    [[nodiscard]] std::string DepthFitText();
+
+    /// FRITCHII_VRAM_HOLES: per block vector of `owner` on `heap` (default blocks per memory type,
+    /// each named pool), the holes and the allocations by size, and what holds the blocks that
+    /// are at least half free (kind, size, age). Builds VMA's detailed map: several ms with
+    /// thousands of allocations, so only on request; only the allocator's user may call it.
+    [[nodiscard]] std::string VramHolesText(VmaAllocator owner, u32 heap);
 
 } // namespace Vulkan

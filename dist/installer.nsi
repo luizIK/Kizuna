@@ -52,7 +52,7 @@ Page custom desktopShortcutPageCreate desktopShortcutPageLeave
 ; Instfiles page
 !insertmacro MUI_PAGE_INSTFILES
 ; Finish page
-!define MUI_FINISHPAGE_RUN "$INSTDIR\lichii.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\fritchii.exe"
 !insertmacro MUI_PAGE_FINISH
 
 ; Uninstaller pages
@@ -124,9 +124,9 @@ Section "Base"
   File /r "${BINARY_SOURCE_DIR}\*"
 
   ; Create start menu and desktop shortcuts
-  CreateShortCut "$SMPROGRAMS\$(^Name).lnk" "$INSTDIR\lichii.exe"
+  CreateShortCut "$SMPROGRAMS\$(^Name).lnk" "$INSTDIR\fritchii.exe"
   ${If} $DesktopShortcut == 1
-    CreateShortCut "$DESKTOP\$(^Name).lnk" "$INSTDIR\lichii.exe"
+    CreateShortCut "$DESKTOP\$(^Name).lnk" "$INSTDIR\fritchii.exe"
   ${EndIf}
 SectionEnd
 
@@ -135,12 +135,12 @@ SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\uninst.exe"
 
-  WriteRegStr HKCU "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\lichii.exe"
+  WriteRegStr HKCU "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\fritchii.exe"
 
   ; Write metadata for add/remove programs applet
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayName" "$(^Name)"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninst.exe"
-  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\lichii.exe"
+  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\fritchii.exe"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation" "$INSTDIR"
@@ -152,8 +152,8 @@ Section -Post
   WriteRegStr HKCU "Software\Classes\.xci" "" "$(^Name)"
   WriteRegStr HKCU "Software\Classes\.nro" "" "$(^Name)"
   WriteRegStr HKCU "Software\Classes\.kip" "" "$(^Name)"
-  WriteRegStr HKCU "Software\Classes\$(^Name)\DefaultIcon" "" "$INSTDIR\lichii.exe,0"
-  WriteRegStr HKCU "Software\Classes\$(^Name)\Shell\open\command" "" '"$INSTDIR\lichii.exe" %1'
+  WriteRegStr HKCU "Software\Classes\$(^Name)\DefaultIcon" "" "$INSTDIR\fritchii.exe,0"
+  WriteRegStr HKCU "Software\Classes\$(^Name)\Shell\open\command" "" '"$INSTDIR\fritchii.exe" %1'
 SectionEnd
 
 Section Uninstall
@@ -161,6 +161,7 @@ Section Uninstall
   Delete "$SMPROGRAMS\$(^Name).lnk"
 
   ; Be a bit careful to not delete files a user may have put into the install directory.
+  Delete "$INSTDIR\fritchii.exe"
   Delete "$INSTDIR\lichii.exe"
   Delete "$INSTDIR\eden-cli.exe"
   Delete "$INSTDIR\uninst.exe"

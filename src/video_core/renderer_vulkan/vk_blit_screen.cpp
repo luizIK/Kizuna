@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vulkan/vulkan_core.h>
@@ -87,22 +86,6 @@ void BlitScreen::SetWindowAdaptPass(const Device& device) {
     }
 }
 
-void BlitScreen::PrepareFrame(const Device& device, Frame* frame,
-                              const Layout::FramebufferLayout& layout) {
-    if (!window_adapt) {
-        return;
-    }
-
-    if (frame->width != layout.width || frame->height != layout.height) {
-        WaitIdle(device);
-    } else if (!present_manager.NeedsStorage(frame, true)) {
-        return;
-    }
-
-    present_manager.RecreateFrame(frame, layout.width, layout.height, swapchain_view_format,
-                                  window_adapt->GetRenderPass(), true);
-}
-
 void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
                              std::span<const Tegra::FramebufferConfig> framebuffers,
                              const Layout::FramebufferLayout& layout,
@@ -127,20 +110,16 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         swapchain_view_format = current_swapchain_view_format;
     }
 
-    const bool storage_required = Settings::FrameGenActive();
     if (resource_update_required) {
         WaitIdle(device);
         SetWindowAdaptPass(device);
 
         if (presentation_recreate_required) {
             present_manager.RecreateFrame(frame, layout.width, layout.height, swapchain_view_format,
-                                          window_adapt->GetRenderPass(), storage_required);
+                                          window_adapt->GetRenderPass());
         }
 
         image_index = 0;
-    } else if (present_manager.NeedsStorage(frame, storage_required)) {
-        present_manager.RecreateFrame(frame, layout.width, layout.height, swapchain_view_format,
-                                      window_adapt->GetRenderPass(), true);
     }
 
     const VkExtent2D window_size{
@@ -156,7 +135,12 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         }
     }
 
-    window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout, frame);
+    // FRITCHII_SLOW_GPU: the frame's presentation passes (window adapt, upscalers, anti-aliasing)
+    // count apart, bracketed in recording order on the worker (one TLS load each while off).
+    scheduler.Record([](vk::CommandBuffer) { vk::NotePresentPass(true); });
+    window_adapt->Draw(device, memory_allocator, rasterizer, scheduler, image_index, layers,
+                       framebuffers, layout, frame);
+    scheduler.Record([](vk::CommandBuffer) { vk::NotePresentPass(false); });
 
     if (++image_index >= image_count) {
         image_index = 0;

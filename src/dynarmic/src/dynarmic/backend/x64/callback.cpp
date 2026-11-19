@@ -21,19 +21,29 @@ void SimpleCallback::EmitCallWithReturnPointer(BlockOfCode& code, std::function<
     code.CallFunction(fn);
 }
 
+void ArgCallback::EmitArg(BlockOfCode& code, const Xbyak::Reg64& reg) const {
+    // Fritchii (FRITCHII_JIT_STATE_REFS): a per-core object (callbacks, JIT, config) comes from
+    // the state block, so the code does not hold this core's address.
+    if (const u32 offset = code.CoreRefArgOffset(arg); offset != 0) {
+        code.mov(reg, code.qword[code.ABI_JIT_PTR + offset]);
+    } else {
+        code.mov(reg, arg);
+    }
+}
+
 void ArgCallback::EmitCall(BlockOfCode& code, std::function<void(RegList)> l) const {
     l({code.ABI_PARAM2, code.ABI_PARAM3, code.ABI_PARAM4});
-    code.mov(code.ABI_PARAM1, arg);
+    EmitArg(code, code.ABI_PARAM1);
     code.CallFunction(fn);
 }
 
 void ArgCallback::EmitCallWithReturnPointer(BlockOfCode& code, std::function<void(Xbyak::Reg64, RegList)> l) const {
 #if defined(WIN32) && !defined(__MINGW64__)
     l(code.ABI_PARAM2, {code.ABI_PARAM3, code.ABI_PARAM4});
-    code.mov(code.ABI_PARAM1, arg);
+    EmitArg(code, code.ABI_PARAM1);
 #else
     l(code.ABI_PARAM1, {code.ABI_PARAM3, code.ABI_PARAM4});
-    code.mov(code.ABI_PARAM2, arg);
+    EmitArg(code, code.ABI_PARAM2);
 #endif
     code.CallFunction(fn);
 }

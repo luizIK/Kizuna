@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -63,6 +64,28 @@ std::optional<std::string> Lookup(const void* address) {
         return std::nullopt;
     }
     return it->second.name;
+}
+
+// The sample profile (EDEN_NX2_SAMPLE_PROFILE) records raw addresses; this table at the end of
+// a recording lets the report name the guest code JIT samples ran (blocks compiled before the
+// last code cache clear only).
+bool DumpTo(const std::string& path) {
+    if (!Enabled()) {
+        return false;
+    }
+    std::FILE* file = std::fopen(path.c_str(), "w");
+    if (file == nullptr) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& [start, range] : ranges) {
+            std::fprintf(file, "%llx %llx %s\n", static_cast<unsigned long long>(start),
+                         static_cast<unsigned long long>(range.end), range.name.c_str());
+        }
+    }
+    std::fclose(file);
+    return true;
 }
 
 } // namespace Common::JitSymbols

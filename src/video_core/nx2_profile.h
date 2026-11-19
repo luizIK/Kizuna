@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
@@ -89,6 +90,79 @@ enum class Zone : u32 {
     UniformBuffers,  ///< Of bind stage buffers: the uniform buffers
     GeometryBuffers, ///< Of update buffers: index and vertex buffer binds
     StorageBindings, ///< Of read handles: storage buffer addresses from constant buffers
+    // Of bind stage buffers (BufferCache::BindHostStageBuffers): where its ~140 ms/s at the
+    // Castle Town market go. "uniform buffers" keeps the per-slot rest (touch, offset, tracker).
+    UniformBank,     ///< Of uniform buffers: the native 64 KiB bank check (page compares)
+    UniformStream,   ///< Of uniform buffers: small buffers streamed (rebound or copied)
+    UniformClassic,  ///< Of uniform buffers: the host buffer synchronized and bound
+    StageStorage,    ///< Of bind stage buffers: the storage buffers
+    StageTexBuffers, ///< Of bind stage buffers: the texture buffers
+    // Of stage storage buffers (BufferCache::BindHostGraphicsStorageBuffers): a sample capture
+    // put 91% of it in SynchronizeBuffer's tracker walk. The rest (touch, usage, host bind) stays
+    // in "stage storage buffers".
+    StorageSync,     ///< Of stage storage buffers: SynchronizeBuffer (tracker walk and uploads)
+    StorageMark,     ///< Of stage storage buffers: written bindings marked GPU-modified
+    // Texture cache images (fable52_answer_potroom 4): made and destroyed on the back.
+    ImageCreate,        ///< A VkImage made for a texture cache image (not taken from the pool)
+    PoolDestroyHere,    ///< An evicted pool image destroyed on the spot (TickFrame, eviction)
+    PoolDestroyIdle,    ///< EXP99=1: evicted pool images destroyed in the back's idle hook
+    PoolDestroyBacklog, ///< EXP110: the idle backlog destroyed at the frame's end
+    MemoryFill,
+    MemoryPlay,
+    MemoryHandOff,
+    MemorySyncWait,
+    StageWait,
+    LevelRun,
+    StageEntries, ///< GPUMem's entry loop, the entries themselves (fine zone)
+    StageCbWords, ///< ... their constant buffer words (fine zone, inside StageEntries)
+    // Of stage entries (fine zones): what GPUMem's entry loop spends per kind of entry. What
+    // stays in "stage entries" is the per-entry bookkeeping (classify, the copy's lookup, runs,
+    // counters) and the closures.
+    StagePairs,     ///< Pairs and StateDelta blocks' writes on the copy
+    StageMethods,   ///< Method and Multi entries' handlers on the copy (words and draws excluded)
+    StagePackets,   ///< Writes-tagged draw packets and DrawBatch entries on the copy
+    StageDrawSetup, ///< A draw the copy issued: serve or level it (its fill excluded)
+    // Of draw, the back with FRITCHII_MEMSTAGE_THREAD=2 (fine zones):
+    RingTake,     ///< The ring B packet's take (TakeRingDraw: peek, counters, wakes, ticks)
+    RingTakeCopy, ///< ... the packet's bytes copied out of ring B (inside RingTake)
+    DrawLocks,    ///< The caches' locks taken for the draw (the texture cache's when served)
+    DrawAfter,    ///< From Configure's end to dynamic state: trackers, traces, dumps
+    RingFacts,    ///< Of draw setup, THREAD=2: the facts published under the stage's key
+    RestTail,     ///< Of draw: PlayRest after the play (held flags, ticks mark, the watch count)
+    // The three halves of a dispatch (fable_memstage_compute_brief 3; fine zones):
+    InlineUpload, ///< Of method: an inline upload's write (AccelerateInlineToMemoryImpl)
+    DispatchFill, ///< Of compute: the dispatch's buffer fill (MemStage::FillDispatchHere)
+    QmdSignal,    ///< Of method: a QMD signal (scheduler, releases; the dispatch is "compute")
+    // fable_stage_levelpoints 15.7 (fine zones). GPUMem's draw setup (StageFillDraw, inside
+    // "stage draw setup"):
+    SetupWindow,  ///< The window and ring B's room tested before the fill (StageBeforeFill)
+    SetupProgram, ///< The program id and the facts lookup (or FRITCHII_MEMSTAGE_SETUP_KEEP's keep)
+    SetupLevel,   ///< The window's tests: a writing draw, the ranges over GPU-written data
+    SetupLock,    ///< The buffer cache's lock taken (a served call in the wait is its own zone)
+    SetupInputs,  ///< The copy's cache inputs, the repack layout, the draw's number
+    SetupHandles, ///< The draw's raw handle values read (SEAM 3, FillGraphicsHandleValues)
+    // The fill (MemStage::FillDrawHere, inside "memory fill"; the brackets stay there):
+    FillRanges,    ///< The stage's collected constant buffer ranges applied (ring_pre)
+    FillBindSetup, ///< The uniform state, the storage binds, the texture buffer unbinds
+    FillGeometry,  ///< The vertex and index buffers (UpdateGraphicsBuffers, BindHostGeometryBuffers)
+    FillStages,    ///< Each stage's buffers (BindHostStageBuffers; its uniform and storage zones out)
+    FillPacket,    ///< The trackers' record and the packet's push (PushRingDraw)
+    // The front (15.5 row 5: its "push" doubles with the stage on):
+    FrontMethods, ///< Of push and resume pending: a GP entry's methods (ProcessCommands; macros out)
+    Publish,      ///< The split's publishes (GpuSplit::Publish; the wakes out)
+    PublishWake,  ///< Of publish: a wake of the sleeping back or GPUMem (notify)
+    OnefParked,   ///< One follower: E parked in a lend (it waits for R to play the call)
+    // FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h):
+    ESplitJob,      ///< E2 runs a piece of E's work E1 handed over
+    ESplitWait,     ///< E2 waits for work
+    ESplitHandOver, ///< E1 hands work to E2 and waits for it, or for E2's room (S2)
+    // Helper CP (Kakariko): E's draw method outside the fill (0x585's "method" share, 1.1 us a
+    // draw), fine zones. E's lookup is "pipeline lookup", its TickWork "tick work".
+    DrawRoute,     ///< E: RouteDraw's tests before the fill (Classify, the mask, UnlentBlocker)
+    DrawFlush,     ///< E: the stream's invalidations before the fill (FlushCaching)
+    DrawHandles,   ///< E: the draw's raw handle values read (FillGraphicsHandleValues)
+    DrawFillSetup, ///< E: FillRing's own work (facts, room tests, the cache lock, repack, record)
+    DrawPush,      ///< E: R's packet packed and pushed (OneFollower::PushDraw)
     Count,
 };
 
@@ -107,6 +181,19 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "cb bind", "cb upload", "query report", "counter reset", "render enable", "sink",
     "macro end", "draw setup", "draw queries", "tick work", "uniform buffers",
     "geometry buffers", "storage bindings",
+    "uniform bank check", "uniform stream", "uniform classic", "stage storage buffers",
+    "stage texture buffers", "storage synchronize", "storage written marks",
+    "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
+    "memory fill", "memory play", "memory hand-off", "memory sync wait",
+    "stage wait", "level run", "stage entries", "stage cb words",
+    "stage pairs", "stage methods", "stage packets", "stage draw setup",
+    "ring take", "ring take copy", "draw locks", "draw after configure", "ring facts",
+    "rest tail", "inline upload", "dispatch fill", "qmd signal",
+    "setup window", "setup program", "setup level tests", "setup lock", "setup inputs",
+    "setup handle values", "fill ranges", "fill bind setup", "fill geometry", "fill stage buffers",
+    "fill packet", "front methods", "publish", "publish wake", "parked in lends",
+    "e split job", "e split E2 wait", "e split hand-over",
+    "draw route", "draw flush caching", "draw handle values", "draw fill setup", "draw push",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
@@ -124,6 +211,14 @@ inline void Initialize() {
                 std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr;
     const char* value = std::getenv("EDEN_NX2_GPU_PROFILE");
     g_fine = g_enabled && value != nullptr && value[0] == '2';
+    // Scope's entry test (one load for the profiler and the timeline).
+    if (g_enabled) {
+        Common::Nx2Timeline::g_zone_gate.fetch_or(Common::Nx2Timeline::ZoneGateProfile,
+                                                  std::memory_order_release);
+    } else {
+        Common::Nx2Timeline::g_zone_gate.fetch_and(
+            static_cast<u8>(~Common::Nx2Timeline::ZoneGateProfile), std::memory_order_release);
+    }
 }
 
 inline bool Enabled() {
@@ -183,18 +278,143 @@ enum class FineCounter : u32 {
     UniformBytes,    ///< Bytes of the uniform buffers bound (all paths)
     StorageBinds,    ///< Graphics storage buffers bound
     TextureHandles,  ///< Graphics texture handles read
+    StorageKiB,      ///< KiB of the graphics storage bindings synchronized (one range each)
+    StorageWritten,  ///< Graphics storage bindings marked GPU-written
+    StorageMulti,    ///< Graphics storage bindings bound as several ranges (BindMultiRangeStorage)
+    StorageNoUpload, ///< Graphics storage synchronizes that uploaded nothing
+    StorageUploads,  ///< Graphics storage synchronizes that uploaded something
+    StorageMemoHits, ///< Graphics storage synchronizes skipped (EDEN_NX2_STORAGE_SYNC_MEMO)
+    // fable_memstage_compute_brief 3 (compute and the upload words):
+    UploadWordsMacro,  ///< Front: compute upload data words a macro emitted
+    UploadWordsMethod, ///< Front: compute upload data words sent by FrontCallMethod
+    UploadWordsMulti,  ///< Front: compute upload data words sent by FrontCallMultiMethod
+    InlineSize4,       ///< Inline uploads (AccelerateInlineToMemoryImpl) of 4 bytes or less
+    InlineSize64,      ///< ... of 5-64 bytes
+    InlineSize256,     ///< ... of 65-256 bytes
+    InlineSizeMore,    ///< ... of more
+    InlineNeverWritten, ///< ... to pages never GPU-written (EXP85's branch: no cache lock)
+    InlineInPlace,     ///< ... uploaded in place into GPU-written buffer data
+    InlineNotUploaded, ///< ... under the cache's lock, not uploaded (invalidations follow)
+    InlineUnmapped,    ///< ... to an unmapped destination
+    DispatchMarksBuffer, ///< Dispatches whose fill marks a buffer GPU-written
+    DispatchMarkBytes,   ///< ... the bytes those marks cover
+    DispatchImagesOnly,  ///< Dispatches that mark no buffer but write images
+    DispatchMarksNothing, ///< Dispatches that mark no buffer and write no image
+    DispatchIndirect,    ///< Indirect dispatches
+    DispatchTexelBuffers, ///< Dispatches with texel buffers (their fill comes late)
+    DispatchSkipped,     ///< Dispatches DispatchCompute ended before the record
+    DispatchReplaced,    ///< Dispatches the upscaler replaced
+    DispatchListCopies,  ///< Dispatches whose written command list pages were copied
+    DispatchExtentProbes, ///< Dispatches that left extent probes to record
+    // Served calls made inside a dispatch (OnStage), in MemoryStageLink::Served's order.
+    ServedInDispatch,
+    ServedInDispatchForRead,
+    ServedInDispatchGather,
+    ServedInDispatchInvalidation,
+    ServedInDispatchInner,
+    ServedInDispatchMustFlush,
+    ServedInDispatchFallback,
+    // EXP124 (fable_memstage_compute_brief 4.4): a macro's upload words as one entry.
+    UploadEntries,        ///< Front: word batches sent (FrontSendUploadWords; GpuSplit::MacroWords
+                          ///< makes one ring entry per 8,192 words of a batch)
+    UploadEntryWords,     ///< Front: ... their data words
+    InlinePiecesOne,      ///< Back: pieces (a 4 KiB page each) written in one call
+    InlinePiecesWritten,  ///< Back: pieces word by word, the page may be GPU-written (or EXP85 off)
+    InlinePiecesUnmapped, ///< Back: pieces word by word, unmapped or on sparse memory
+    InlineWordsGrid,      ///< Back: flushes word by word, a grid placeholder live
+    InlineWordsUnaligned, ///< Back: flushes word by word, not on a 4-byte boundary
+    InlinePiecesChecked,  ///< Back, EXP124=2: one-call pieces whose words were each asked
+    InlinePiecesDisagree, ///< Back, EXP124=2: ... whose words disagreed (must be 0)
+    // fable_stage_compute 14: QMD releases by kind (KeplerCompute's release callback, in its
+    // branch order) and QMD signals by the dispatches each one ran.
+    QmdReleaseReduction, ///< Releases with the reduction bit (26)
+    QmdReleaseFourWords, ///< ... else four-word (report) releases
+    QmdReleaseMaximum,   ///< ... else maximum releases (bit 19)
+    QmdReleasePlain,     ///< ... else plain one-word releases
+    QmdSignalDispatches0, ///< Signals that ran no dispatch
+    QmdSignalDispatches1, ///< ... one
+    QmdSignalDispatches2, ///< ... 2-3
+    QmdSignalDispatches4, ///< ... 4-7
+    QmdSignalDispatches8, ///< ... 8 or more
+    // fable_stage_levelpoints 15.7, for 15.3 row 4's census: the 3D register writes GPUMem's copy
+    // follows (memstage_shadow.cpp, CountWriteGroup), by register group, in this order.
+    StageWritesProgram,     ///< pipelines, program_region
+    StageWritesVertexStreams, ///< vertex_streams, vertex_stream_limits, _instances, _substitute
+    StageWritesVertexAttribs, ///< vertex_attrib_format
+    StageWritesIndexBuffer, ///< index_buffer and its first/subsequent words
+    StageWritesDrawParams,  ///< draw, vertex_buffer, bases, instances, topology, inline indices
+    StageWritesCbBind,      ///< const_buffer's address, size and offset, bind_groups
+    StageWritesCbData,      ///< const_buffer.buffer (the constant buffer data words)
+    StageWritesTextures,    ///< tex_header, tex_sampler, sampler_binding, the bindless slot
+    StageWritesRenderTargets, ///< rt, zeta, surface clip, rt_control, layers, color masks
+    StageWritesViewports,   ///< viewport_transform, viewports, windows, scissors, window origin
+    StageWritesBlend,       ///< blend, blend_per_target, blend color, logic op
+    StageWritesDepthStencil, ///< depth, stencil, depth bias, depth bounds, polygon offset
+    StageWritesRaster,      ///< cull, front face, polygon modes, point and line, alpha test
+    StageWritesTransformFeedback, ///< transform_feedback, stream_out_layout, its enable
+    StageWritesShadowScratch, ///< shadow_scratch, falcon
+    StageWritesOther,       ///< everything else below the macro registers
+    StageWritesExecutable,  ///< Of the above: executable methods (CallMethod's handlers)
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)>
     fine_counter_names{
         "uniform rebinds", "uniform streamed", "uniform cached",  "uniform other",
-        "uniform bytes",   "storage binds",    "texture handles",
+        "uniform bytes",   "storage binds",    "texture handles", "storage KiB",
+        "storage written binds", "storage multi-range binds", "storage syncs without upload",
+        "storage syncs uploading", "storage sync memo hits",
+        "upload words (macro emit)", "upload words (method)", "upload words (multi-method)",
+        "inline uploads 4 B", "inline uploads 5-64 B", "inline uploads 65-256 B",
+        "inline uploads over 256 B", "inline uploads to never GPU-written pages",
+        "inline uploads uploaded in place", "inline uploads not uploaded",
+        "inline uploads unmapped", "dispatches marking a buffer GPU-written",
+        "dispatch marked bytes", "dispatches writing images only",
+        "dispatches marking nothing", "indirect dispatches", "dispatches with texel buffers",
+        "dispatches skipped", "dispatches replaced", "dispatches copying list pages",
+        "dispatches with extent probes", "served in a dispatch: FlushRegion",
+        "served in a dispatch: FlushRegionForRead", "served in a dispatch: gather",
+        "served in a dispatch: single invalidation", "served in a dispatch: InnerInvalidation",
+        "served in a dispatch: MustFlushRegion", "served in a dispatch: fallback fill",
+        "upload word batches (EXP124)", "upload batch words", "upload pieces in one call",
+        "upload pieces word by word (page may be GPU-written)",
+        "upload pieces word by word (unmapped or sparse)",
+        "upload flushes word by word (grid placeholder live)",
+        "upload flushes word by word (not word-aligned)", "upload pieces checked (EXP124=2)",
+        "upload pieces whose words disagree (must be 0)",
+        "qmd releases reduction", "qmd releases four words", "qmd releases maximum",
+        "qmd releases plain", "qmd signals with 0 dispatches", "qmd signals with 1 dispatch",
+        "qmd signals with 2-3 dispatches", "qmd signals with 4-7 dispatches",
+        "qmd signals with 8+ dispatches",
+        "stage writes: program", "stage writes: vertex streams", "stage writes: vertex attributes",
+        "stage writes: index buffer", "stage writes: draw parameters",
+        "stage writes: constant buffer binds", "stage writes: constant buffer data",
+        "stage writes: textures and samplers", "stage writes: render targets",
+        "stage writes: viewports and scissors", "stage writes: blend",
+        "stage writes: depth and stencil", "stage writes: raster", "stage writes: transform feedback",
+        "stage writes: shadow scratch", "stage writes: other",
+        "stage writes: of them executable",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 
+/// fable_stage_levelpoints 15.7: what the front did while GPUMem waited for its next publish.
+/// The drain sites first (the front finished a wait for the back at that site), then these.
+enum class FrontDid : u32 {
+    Idle = static_cast<u32>(DrainSite::Count), ///< finished an idle wait (no command list)
+    Pending,     ///< finished a pending sleep (a suspended channel's poll gap)
+    WorkingInto, ///< no wait; published as it began a wait for the back (Drain, WaitFor)
+    Working,     ///< no wait; published while working
+    Count,
+};
+inline constexpr size_t FrontWaitKinds = static_cast<size_t>(FrontDid::Count);
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
+    /// GPUMem's waits for the front by FrontDid (StageInputWaited): ns, waits; and those
+    /// in which the front finished more than one wait.
+    std::array<u64, FrontWaitKinds> front_wait_ns{};
+    std::array<u64, FrontWaitKinds> front_wait_count{};
+    u64 front_wait_several{};
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
     std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
@@ -234,26 +454,114 @@ inline thread_local ThreadData t_data;
     case Zone::ListGpuWait:
     case Zone::QueryDmaWait:
     case Zone::ReadFlush:
+    case Zone::ImageCreate:
+    case Zone::PoolDestroyHere:
         return true;
     default:
         return false;
     }
 }
 
+/// The zones that mark EDEN_NX2_STALL_SNAPSHOT's span slot: the ones that can hold a thread up
+/// (waits, sleeps, host GPU waits, read flushes, host image creates and destroys) and the front's
+/// per-list push, so a busy front reads "push" rather than "(no span)". Per-draw, per-dispatch,
+/// per-macro and per-fence work zones (draw, compute, macro, fence, flush work...) do not: with
+/// the profile off they cost the inline gate check only, as with the snapshot off (fable_front_
+/// drains 8.4). Waits inside them have zones or timeline spans of their own (split drain, "wait
+/// for host GPU", "fence: wait for fence", "wait for Vulkan worker"). The split's wait for work
+/// ("split wait") is marked by its timeline span.
+[[nodiscard]] constexpr bool IsStallZone(Zone zone) {
+    switch (zone) {
+    case Zone::Idle:
+    case Zone::PendingSleep:
+    case Zone::Push:
+    case Zone::SplitDrain:
+    case Zone::WriterWait:
+    case Zone::ListSubmitWait:
+    case Zone::ListGpuWait:
+    case Zone::QueryDmaWait:
+    case Zone::ReadFlush:
+    case Zone::ImageCreate:
+    case Zone::PoolDestroyHere:
+        return true;
+    default:
+        return false;
+    }
+}
+
+#if defined(_MSC_VER)
+#define NX2_PROFILE_FORCEINLINE __forceinline
+#define NX2_PROFILE_NOINLINE __declspec(noinline)
+#else
+#define NX2_PROFILE_FORCEINLINE inline __attribute__((always_inline))
+#define NX2_PROFILE_NOINLINE __attribute__((noinline))
+#endif
+
+/// A zone. With the profiler off and no timeline recording (every normal run), entering one is
+/// one relaxed load of Common::Nx2Timeline::g_zone_gate and a not-taken branch, inlined at the
+/// call site; leaving it tests one byte of the object. The timing and the timeline span are in
+/// Begin and End, out of line. A stall zone (IsStallZone) also loads Nx2Hitch::t_stall_slot and,
+/// with the stall snapshot on, writes the slot without reading a clock.
 class Scope {
 public:
-    explicit Scope(Zone zone_) : Scope{zone_, Enabled(), true} {}
+    NX2_PROFILE_FORCEINLINE explicit Scope(Zone zone_) {
+        if (Common::Nx2Timeline::ZoneGateOpen()) [[unlikely]] {
+            Begin(zone_, Enabled(), true);
+        } else if (IsStallZone(zone_)) {
+            // A constant at every call site: no code at all for the other zones.
+            BeginStall(zone_);
+        }
+    }
 
     /// A zone timed only if `on` (a profiled run's choice, such as Fine()); on the timeline only
     /// if `timeline_on` too.
-    Scope(Zone zone_, bool on, bool timeline_on)
-        : zone{zone_}, enabled{on},
-          timeline{timeline_on && Common::Nx2Timeline::Active() &&
-                   (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
+    NX2_PROFILE_FORCEINLINE Scope(Zone zone_, bool on, bool timeline_on) {
+        if (on || (timeline_on && Common::Nx2Timeline::ZoneGateOpen())) [[unlikely]] {
+            Begin(zone_, on, timeline_on);
+        } else if (timeline_on && IsStallZone(zone_)) {
+            BeginStall(zone_);
+        }
+    }
+
+    NX2_PROFILE_FORCEINLINE ~Scope() {
+        if (state != 0) [[unlikely]] {
+            End();
+        }
+    }
+
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    static constexpr u8 StateTimed = 1;
+    static constexpr u8 StateTimeline = 2;
+    static constexpr u8 StateStall = 4;
+
+    /// EDEN_NX2_STALL_SNAPSHOT with the gate closed (profile off, no recording): a wait zone marks
+    /// the thread's span slot, if it has one. No clock read (Nx2Hitch::StallTickNs).
+    NX2_PROFILE_FORCEINLINE void BeginStall(Zone zone_) {
+        Common::Nx2Hitch::StallSlot* const slot = Common::Nx2Hitch::t_stall_slot;
+        if (slot != nullptr) {
+            stall_mark = Common::Nx2Hitch::StallEnterSlow(
+                slot, zone_names[static_cast<size_t>(zone_)]);
+            state = StateStall;
+        }
+    }
+
+    NX2_PROFILE_NOINLINE void Begin(Zone zone_, bool on, bool timeline_on) {
+        zone = zone_;
+        const bool timeline = timeline_on && Common::Nx2Timeline::Active() &&
+                              (Common::Nx2Timeline::Detail() || IsCoarse(zone_));
+        state = static_cast<u8>((on ? StateTimed : 0) | (timeline ? StateTimeline : 0));
+        // EDEN_NX2_STALL_SNAPSHOT: the wait zones also mark the thread's span slot.
+        if (Common::Nx2Hitch::t_stall_slot != nullptr && IsStallZone(zone_)) [[unlikely]] {
+            stall_mark = Common::Nx2Hitch::StallEnter(zone_names[static_cast<size_t>(zone_)]);
+            state = static_cast<u8>(state | StateStall);
+        }
         if (timeline) {
             timeline_start = Common::Nx2Timeline::Now();
         }
-        if (!enabled) {
+        if (!on) {
             return;
         }
         auto& data = t_data;
@@ -263,12 +571,15 @@ public:
         start = Ticks();
     }
 
-    ~Scope() {
-        if (timeline) {
+    NX2_PROFILE_NOINLINE void End() {
+        if ((state & StateTimeline) != 0) {
             Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
                                         Common::Nx2Timeline::Now());
         }
-        if (!enabled) {
+        if ((state & StateStall) != 0) {
+            Common::Nx2Hitch::StallLeave(stall_mark);
+        }
+        if ((state & StateTimed) == 0) {
             return;
         }
         const u64 elapsed = Ticks() - start;
@@ -280,16 +591,13 @@ public:
         --data.depth;
     }
 
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
-
-private:
+    // Only `state` is written on the off path; the rest is set by Begin before End reads it.
+    u8 state{}; ///< StateTimed | StateTimeline | StateStall; 0: nothing to do on exit
     Zone zone;
-    bool enabled;
-    bool timeline;
-    u64 start{};
-    u64 parent_child_ns{};
-    u64 timeline_start{};
+    u64 start;
+    u64 parent_child_ns;
+    u64 timeline_start;
+    Common::Nx2Hitch::StallMark stall_mark; ///< Set by Begin with StateStall only
 };
 
 /// TEST: a fine zone (EDEN_NX2_GPU_PROFILE=2), on the timeline only then too.
@@ -518,12 +826,75 @@ inline void AddFine(FineCounter counter, u64 amount) {
     }
 }
 
+/// fable_stage_levelpoints 15.7 (profile on): the front's last finished wait, as
+/// (waits finished << 8) | FrontDid, and the site + 1 of a wait for the back it is in (0: none).
+/// Written by the front alone; GPUMem reads them around its waits for the front.
+inline std::atomic<u64> g_front_wait_mark{0};
+inline std::atomic<u32> g_front_in_wait{0};
+
+/// The front: a wait for the back at `site` begins (before the publish that goes with it).
+inline void FrontWaitBegin(DrainSite site) {
+    if (Enabled()) {
+        g_front_in_wait.store(static_cast<u32>(site) + 1, std::memory_order_relaxed);
+    }
+}
+
+/// The front: a wait ended (`kind`: a DrainSite or FrontDid::Idle, ::Pending).
+inline void FrontWaitEnd(u32 kind) {
+    if (Enabled()) {
+        g_front_in_wait.store(0, std::memory_order_relaxed);
+        const u64 waits = (g_front_wait_mark.load(std::memory_order_relaxed) >> 8) + 1;
+        g_front_wait_mark.store((waits << 8) | kind, std::memory_order_release);
+    }
+}
+
+/// The front: marks the end of an idle or pending wait (gpu_thread.cpp) at scope exit.
+class FrontWaitScope {
+public:
+    explicit FrontWaitScope(FrontDid kind_) : kind{kind_} {}
+    ~FrontWaitScope() {
+        FrontWaitEnd(static_cast<u32>(kind));
+    }
+    FrontWaitScope(const FrontWaitScope&) = delete;
+    FrontWaitScope& operator=(const FrontWaitScope&) = delete;
+
+private:
+    FrontDid kind;
+};
+
+/// GPUMem, before a wait for the front: the mark to compare with after it.
+[[nodiscard]] inline u64 FrontWaitMark() {
+    return Enabled() ? g_front_wait_mark.load(std::memory_order_acquire) : 0;
+}
+
+/// GPUMem waited `ns` for the front's publish; `before`: FrontWaitMark() at the wait's start.
+/// The front finished a wait since: that wait's kind (the last one, if several). None: it was
+/// working, and it published either as it began a wait for the back or while working.
+inline void StageInputWaited(u64 before, u64 ns) {
+    if (!Enabled()) {
+        return;
+    }
+    const u64 after = g_front_wait_mark.load(std::memory_order_acquire);
+    size_t kind;
+    if ((after >> 8) != (before >> 8)) {
+        kind = (std::min)(static_cast<size_t>(after & 0xff), FrontWaitKinds - 1);
+        t_data.front_wait_several += (after >> 8) - (before >> 8) > 1 ? 1 : 0;
+    } else if (g_front_in_wait.load(std::memory_order_relaxed) != 0) {
+        kind = static_cast<size_t>(FrontDid::WorkingInto);
+    } else {
+        kind = static_cast<size_t>(FrontDid::Working);
+    }
+    t_data.front_wait_ns[kind] += ns;
+    ++t_data.front_wait_count[kind];
+}
+
 /// The front waited for the back since `start` (Ticks) for `site`.
 inline void AddDrain(DrainSite site, u64 start) {
     if (Enabled()) {
         const auto index = static_cast<size_t>(site);
         t_data.drain_ns[index] += Ticks() - start;
         ++t_data.drain_count[index];
+        FrontWaitEnd(static_cast<u32>(site));
     }
 }
 
@@ -681,6 +1052,33 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    if (std::ranges::any_of(data.front_wait_count, [](u64 count) { return count != 0; })) {
+        // fable_stage_levelpoints 15.7 (GPUMem): its waits for the front's next publish by what
+        // the front did meanwhile (StageInputWaited).
+        static constexpr std::array<const char*, 4> own{
+            "idle (no command list)", "pending sleep", "working, published as it began a wait for "
+            "the back", "working"};
+        static_assert(own.size() == FrontWaitKinds - static_cast<size_t>(DrainSite::Count));
+        std::string kinds;
+        for (size_t i = 0; i < FrontWaitKinds; ++i) {
+            if (data.front_wait_count[i] == 0) {
+                continue;
+            }
+            constexpr size_t Sites = static_cast<size_t>(DrainSite::Count);
+            const std::string name = i < Sites ? fmt::format("waited for the back at {}",
+                                                             drain_site_names[i])
+                                               : std::string{own[i - Sites]};
+            kinds += fmt::format(" {} {:.1f} ms ({:.0f}/s),", name,
+                                 static_cast<double>(data.front_wait_ns[i]) * 1000.0 / window,
+                                 static_cast<double>(data.front_wait_count[i]) * 1e9 / window);
+        }
+        kinds.pop_back();
+        LOG_INFO(HW_GPU,
+                 "{} waits for the front by what the front did before its publish, per second:{}; "
+                 "{:.0f}/s spanned several front waits (the last one counted)",
+                 thread_name, kinds,
+                 static_cast<double>(data.front_wait_several) * 1e9 / window);
+    }
     if (Fine()) {
         // TEST: the fine counters.
         std::string fine;

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -153,8 +153,19 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
         if (events[slot].fails > 2) {
             {
                 auto lk = system.StallApplication();
+                const auto stall_begin = std::chrono::steady_clock::now();
                 host1x_syncpoint_manager.WaitHost(fence_id, target_value);
                 system.UnstallApplication();
+                // The whole game holds here: a long one is a freeze to players.
+                const double stall_ms = std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - stall_begin)
+                                            .count();
+                if (stall_ms >= 100.0) {
+                    LOG_WARNING(Service_NVDRV,
+                                "Game stalled {:.0f} ms waiting for syncpoint {} to reach {} "
+                                "(a wait that failed 3 times)",
+                                stall_ms, fence_id, target_value);
+                }
             }
             params.value.raw = target_value;
             return true;

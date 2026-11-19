@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -20,6 +21,7 @@
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan.h"
+#include "video_core/vulkan_common/vulkan_cmd_stats.h"
 
 #ifdef _MSC_VER
 #pragma warning(disable : 26812) // Disable prefer enum class over enum
@@ -29,6 +31,13 @@ VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan::vk {
+
+/// A transfer, query copy or indirect command was handed VK_NULL_HANDLE as its buffer and was
+/// not recorded. A null buffer there is never valid: with nullDescriptor on (NVIDIA, AMD) the
+/// buffer cache's null buffer has no VkBuffer, and the driver turns the null handle into device
+/// address 0 (a GPU page fault at 0x0, then a device loss). Counts every skip and logs the first
+/// ones with the recording site; cold.
+void NoteNullTarget(const char* command, const std::source_location& site) noexcept;
 
 /**
  * Span for Vulkan arrays.
@@ -220,6 +229,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
+    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
     PFN_vkCmdCopyImage vkCmdCopyImage{};
@@ -235,6 +245,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount{};
     PFN_vkCmdDrawIndirectByteCountEXT vkCmdDrawIndirectByteCountEXT{};
     PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT{};
+    PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT{};
     PFN_vkCmdEndConditionalRenderingEXT vkCmdEndConditionalRenderingEXT{};
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
@@ -298,11 +309,6 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCreateFence vkCreateFence{};
     PFN_vkCreateFramebuffer vkCreateFramebuffer{};
     PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines{};
-    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
-    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
-    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
-    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
-    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkCreateImage vkCreateImage{};
     PFN_vkCreateImageView vkCreateImageView{};
     PFN_vkCreatePipelineCache vkCreatePipelineCache{};
@@ -326,6 +332,12 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkDestroyImage vkDestroyImage{};
     PFN_vkDestroyImageView vkDestroyImageView{};
     PFN_vkDestroyPipeline vkDestroyPipeline{};
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY, vk_pipeline_binary.h)
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkDestroyPipelineCache vkDestroyPipelineCache{};
     PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout{};
     PFN_vkDestroyQueryPool vkDestroyQueryPool{};
@@ -354,6 +366,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkWaitForPresentKHR vkWaitForPresentKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
+    PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
     PFN_vkMapMemory vkMapMemory{};
     PFN_vkQueueBindSparse vkQueueBindSparse{};
@@ -383,6 +396,10 @@ bool Load(InstanceDispatch&) noexcept;
 /// Loads instance function pointers.
 /// @return True on success, false on error.
 bool Load(VkInstance, InstanceDispatch&) noexcept;
+
+/// FRITCHII_RAM_VK_HOST_ALLOC (boot, default 0; docs/fritchii/switches.md): the allocation
+/// callbacks the instance and the device are created and destroyed with, or null when off.
+[[nodiscard]] const VkAllocationCallbacks* HostAllocator() noexcept;
 
 void Destroy(VkInstance, const InstanceDispatch&) noexcept;
 void Destroy(VkDevice, const InstanceDispatch&) noexcept;
@@ -691,6 +708,14 @@ public:
     }
 };
 
+/// Image allocations' VMA user data (MemoryAllocator::AllocateImage): bit 63 set, bits 32-62 the
+/// padding FRITCHII_DEPTH_POOL_FIT added to the allocation in 256-byte units, bits 0-31 when it
+/// was made, in 100 ms steps since the first image (FRITCHII_VRAM_HOLES reads the age).
+inline constexpr u64 ImageUserDataTag = u64{1} << 63;
+/// FRITCHII_DEPTH_POOL_FIT: the padding of the live images, so the owners line can count it as
+/// unused (the allocator counts it as allocated). Image::Release takes it off.
+inline std::atomic<u64> g_image_padding_bytes{0};
+
 class Image {
 public:
     explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
@@ -758,6 +783,17 @@ public:
     /// True when the image's memory is device local (not placed in host memory over budget).
     [[nodiscard]] bool IsDeviceLocal() const noexcept;
 
+    /// EDEN_NX2_IMAGE_ALLOC_TIMING: what destroying the image took, in vmaDestroyImage's two
+    /// steps, and whether VMA gave device memory back (its count of memory objects fell: an
+    /// emptied block, or the image's own dedicated memory).
+    struct DestroyTiming {
+        u64 destroy_ns{}; ///< vkDestroyImage
+        u64 free_ns{};    ///< vmaFreeMemory
+        bool block_freed{};
+    };
+    /// Destroys the image now (as Release does) with each step timed; the image is empty after.
+    DestroyTiming DestroyTimed() noexcept;
+
 private:
     void Release() const noexcept;
 
@@ -768,6 +804,10 @@ private:
     VmaAllocation allocation = nullptr;
     const DeviceDispatch* dld = nullptr;
 };
+
+/// The device memory objects VMA holds (blocks and dedicated allocations, all heaps), for
+/// EDEN_NX2_IMAGE_ALLOC_TIMING's "new block" and "block freed" counts.
+[[nodiscard]] u64 VmaMemoryObjectCount(VmaAllocator allocator) noexcept;
 
 struct MemoryLocation {
     VkDeviceMemory memory{};
@@ -1078,6 +1118,7 @@ public:
                                        DeviceDispatch& dispatch);
 
     [[nodiscard]] Queue GetQueue(u32 family_index) const noexcept;
+    [[nodiscard]] Queue GetQueue(u32 family_index, u32 queue_index) const noexcept;
 
     [[nodiscard]] BufferView CreateBufferView(const VkBufferViewCreateInfo& ci) const;
 
@@ -1282,6 +1323,10 @@ public:
 
     void BeginRenderPass(const VkRenderPassBeginInfo& renderpass_bi,
                          VkSubpassContents contents) const noexcept {
+        // FRITCHII_SLOW_GPU's counts (vulkan_cmd_stats.h): a thread_local load while off.
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->render_passes;
+        }
         dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
     }
 
@@ -1290,19 +1335,31 @@ public:
     }
 
     void BeginQuery(VkQueryPool query_pool, u32 query, VkQueryControlFlags flags) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdBeginQuery(handle, query_pool, query, flags);
     }
 
     void EndQuery(VkQueryPool query_pool, u32 query) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdEndQuery(handle, query_pool, query);
     }
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
     void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
                         u32 query) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
@@ -1319,6 +1376,9 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Bind(bind_point, pipeline);
+        }
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
     }
 
@@ -1338,38 +1398,90 @@ public:
 
     void Draw(u32 vertex_count, u32 instance_count, u32 first_vertex,
               u32 first_instance) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDraw(handle, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     void DrawIndexed(u32 index_count, u32 instance_count, u32 first_index, u32 vertex_offset,
                      u32 first_instance) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDrawIndexed(handle, index_count, instance_count, first_index, vertex_offset,
                               first_instance);
     }
 
-    void DrawIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                      u32 stride) const noexcept {
+    void DrawIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count, u32 stride,
+                      const std::source_location site =
+                          std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndirect on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                             u32 stride) const noexcept {
+                             u32 stride,
+                             const std::source_location site =
+                                 std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndexedIndirect on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
     void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
     }
 
+    void DrawMeshTasksIndirectEXT(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
+                                  u32 stride) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
+        dld->vkCmdDrawMeshTasksIndirectEXT(handle, src_buffer, src_offset, draw_count, stride);
+    }
+
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,
-                           VkDeviceSize count_offset, u32 draw_count, u32 stride) const noexcept {
+                           VkDeviceSize count_offset, u32 draw_count, u32 stride,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || count_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndirectCount on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndirectCount(handle, src_buffer, src_offset, count_buffer, count_offset,
                                     draw_count, stride);
     }
 
     void DrawIndexedIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset,
                                   VkBuffer count_buffer, VkDeviceSize count_offset, u32 draw_count,
-                                  u32 stride) const noexcept {
+                                  u32 stride,
+                                  const std::source_location site =
+                                      std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || count_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndexedIndirectCount on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndexedIndirectCount(handle, src_buffer, src_offset, count_buffer,
                                            count_offset, draw_count, stride);
     }
@@ -1377,39 +1489,76 @@ public:
     void DrawIndirectByteCountEXT(u32 instance_count, u32 first_instance, VkBuffer counter_buffer,
                                   VkDeviceSize counter_buffer_offset, u32 counter_offset,
                                   u32 stride) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndirectByteCountEXT(handle, instance_count, first_instance, counter_buffer,
                                            counter_buffer_offset, counter_offset, stride);
     }
 
     void ClearAttachments(Span<VkClearAttachment> attachments,
                           Span<VkClearRect> rects) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
                          Span<VkImageSubresourceRange> ranges) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
+    }
+
+    void ClearDepthStencilImage(VkImage image, VkImageLayout layout,
+                                VkClearDepthStencilValue value,
+                                Span<VkImageSubresourceRange> ranges) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
+        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
+                                         ranges.data());
     }
 
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageBlit> regions,
                    VkFilter filter) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdBlitImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data(), filter);
     }
 
     void ResolveImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                       VkImageLayout dst_layout, Span<VkImageResolve> regions) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdResolveImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                                regions.data());
     }
 
     void Dispatch(u32 x, u32 y, u32 z) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Dispatch(false);
+        }
         dld->vkCmdDispatch(handle, x, y, z);
     }
 
-    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset) const noexcept {
+    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset,
+                          const std::source_location site =
+                              std::source_location::current()) const noexcept {
+        if (indirect_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDispatchIndirect on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Dispatch(true);
+        }
         dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
     }
 
@@ -1417,6 +1566,11 @@ public:
                          VkDependencyFlags dependency_flags, Span<VkMemoryBarrier> memory_barriers,
                          Span<VkBufferMemoryBarrier> buffer_barriers,
                          Span<VkImageMemoryBarrier> image_barriers) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->barriers;
+            stats->barrier_items += static_cast<u32>(
+                memory_barriers.size() + buffer_barriers.size() + image_barriers.size());
+        }
         static constexpr u32 MaxBarriers = 16;
         if (dld->vkCmdPipelineBarrier2 && memory_barriers.size() <= MaxBarriers &&
             buffer_barriers.size() <= MaxBarriers && image_barriers.size() <= MaxBarriers) {
@@ -1525,37 +1679,91 @@ public:
     }
 
     void CopyBufferToImage(VkBuffer src_buffer, VkImage dst_image, VkImageLayout dst_image_layout,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyBufferToImage on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_uploads;
+        }
         dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
                                     regions.data());
     }
 
-    void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer,
-                    Span<VkBufferCopy> regions) const noexcept {
+    void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer, Span<VkBufferCopy> regions,
+                    const std::source_location site =
+                        std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget(dst_buffer == VK_NULL_HANDLE
+                               ? "vkCmdCopyBuffer into a null buffer, skipped"
+                               : "vkCmdCopyBuffer from a null buffer, skipped",
+                           site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->buffer_copies;
+            for (const VkBufferCopy& region : regions) {
+                stats->buffer_copy_bytes += region.size;
+            }
+        }
         dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
     }
 
     void CopyImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageCopy> regions) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdCopyImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data());
     }
 
     void CopyImageToBuffer(VkImage src_image, VkImageLayout src_layout, VkBuffer dst_buffer,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyImageToBuffer on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_downloads;
+        }
         dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
                                     regions.data());
     }
 
     void CopyQueryPoolResults(VkQueryPool query_pool, u32 first_query, u32 query_count,
                               VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
-                              VkQueryResultFlags flags) const noexcept {
+                              VkQueryResultFlags flags,
+                              const std::source_location site =
+                                  std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyQueryPoolResults on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
                                        dst_offset, stride, flags);
     }
 
-    void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
-                    u32 data) const noexcept {
+    void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size, u32 data,
+                    const std::source_location site =
+                        std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdFillBuffer on a null buffer, skipped", site);
+            return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->fills;
+            // VK_WHOLE_SIZE counts as 0 bytes (the buffer's size is not known here).
+            stats->fill_bytes += size == VK_WHOLE_SIZE ? 0 : size;
+        }
         dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
     }
 
@@ -1757,7 +1965,17 @@ public:
 
     void BindTransformFeedbackBuffersEXT(u32 first, u32 count, const VkBuffer* buffers,
                                          const VkDeviceSize* offsets,
-                                         const VkDeviceSize* sizes) const noexcept {
+                                         const VkDeviceSize* sizes,
+                                         const std::source_location site =
+                                             std::source_location::current()) const noexcept {
+        for (u32 i = 0; i < count; ++i) {
+            if (buffers[i] == VK_NULL_HANDLE) [[unlikely]] {
+                // The runtime binds its own null buffer instead; a null here is a stale handle.
+                NoteNullTarget("vkCmdBindTransformFeedbackBuffersEXT on a null buffer, skipped",
+                               site);
+                return;
+            }
+        }
         dld->vkCmdBindTransformFeedbackBuffersEXT(handle, first, count, buffers, offsets, sizes);
     }
 

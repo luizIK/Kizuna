@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -385,7 +384,7 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         if (program.info.stores_frag_depth) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
-        if (ctx.runtime_info.force_early_z) {
+        if (ctx.runtime_info.force_early_z || ctx.UsesOcclFlagStore()) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
         }
         if (ctx.profile.support_shader_quad_control && program.info.uses_quad_shuffles) {
@@ -486,14 +485,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         }
         ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
     }
-    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport) {
+    // A mesh program emulated as compute stores its Layer and ViewportIndex in its output buffer.
+    const bool stores_viewport_layer{!ctx.runtime_info.mesh_as_compute};
+    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport &&
+        stores_viewport_layer) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         ctx.AddExtension("SPV_NV_viewport_array2");
         ctx.AddCapability(spv::Capability::ShaderViewportMaskNV);
     }
-    if (info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) {
+    if ((info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) &&
+        stores_viewport_layer) {
         if (profile.support_viewport_index_layer_non_geometry && ctx.stage != Stage::Geometry) {
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
@@ -598,7 +601,8 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
             return;
         }
         if (opcode == spv::Op::OpGroupNonUniformShuffleXor ||
-            opcode == spv::Op::OpGroupNonUniformQuadBroadcast) {
+            opcode == spv::Op::OpGroupNonUniformQuadBroadcast ||
+            opcode == spv::Op::OpAtomicFMaxEXT) {
             const auto it{std::ranges::find(rewrites, code[offset + 2],
                                             &std::pair<u32, spv::Op>::first)};
             if (it != rewrites.end()) {

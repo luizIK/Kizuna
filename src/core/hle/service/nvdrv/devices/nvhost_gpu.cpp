@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+#include <immintrin.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -14,6 +16,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scratch_buffer.h"
 #include "common/nx2_timeline.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -30,6 +33,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -82,7 +86,7 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         case 0x3:
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeout, input, output);
         case 0x8:
-            return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, false);
+            return SubmitGPFIFOIoctl1(input, output, fd, false);
         case 0x9:
             return WrapFixed(this, &nvhost_gpu::AllocateObjectContext, input, output);
         case 0xb:
@@ -96,7 +100,7 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         case 0x1a:
             return WrapFixed(this, &nvhost_gpu::AllocGPFIFOEx2, input, output, fd);
         case 0x1b:
-            return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, true);
+            return SubmitGPFIFOIoctl1(input, output, fd, true);
         case 0x1d:
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeslice, input, output);
         default:
@@ -127,8 +131,7 @@ NvResult nvhost_gpu::Ioctl2(DeviceFD fd, Ioctl command, std::span<const u8> inpu
     case 'H':
         switch (command.cmd) {
         case 0x1b:
-            return WrapFixedInlIn(this, &nvhost_gpu::SubmitGPFIFOBase2, input, inline_input,
-                                  output);
+            return SubmitGPFIFOIoctl2(input, inline_input, output);
         }
         break;
     }
@@ -411,6 +414,36 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementW
     return result;
 }
 
+namespace {
+// EXP101 counters, every 5 s while it is on: submits, entries, reads made, loop time.
+void NotePbSnapshot(int mode, size_t entries, u64 reads, std::chrono::steady_clock::duration took) {
+    static std::atomic<u64> submits{}, entry_count{}, read_count{}, ns{};
+    static std::atomic<s64> next_report{};
+    submits.fetch_add(1, std::memory_order_relaxed);
+    entry_count.fetch_add(entries, std::memory_order_relaxed);
+    read_count.fetch_add(reads, std::memory_order_relaxed);
+    ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count()),
+                 std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 next = next_report.load(std::memory_order_relaxed);
+    if (next == 0) {
+        next_report.compare_exchange_strong(next, now + 5'000'000'000);
+        return;
+    }
+    if (now < next || !next_report.compare_exchange_strong(next, now + 5'000'000'000)) {
+        return;
+    }
+    const u64 s = submits.exchange(0), e = entry_count.exchange(0), r = read_count.exchange(0),
+              t = ns.exchange(0);
+    LOG_INFO(Service_NVDRV,
+             "Pushbuffer snapshot (EXP101={}, 5 s, per second): {:.0f} submits, {:.0f} entries, "
+             "{:.0f} reads ({:.1f} entries each), loop {:.2f} ms/s",
+             mode, s / 5.0, e / 5.0, r / 5.0, r != 0 ? static_cast<double>(e) / r : 0.0, t / 5e6);
+}
+} // namespace
+
 NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandList&& entries) {
     LOG_TRACE(Service_NVDRV, "called, gpfifo={:X}, num_entries={:X}, flags={:X}", params.address,
               params.num_entries, params.flags.raw);
@@ -461,7 +494,100 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             entries.submitted_words.resize(words);
             entries.submitted_offsets.reserve(entries.command_lists.size());
             size_t offset = 0;
-            for (u32 i = 0; i < entries.command_lists.size(); ++i) {
+            // EDEN_NX2_EXP101 (live; fable52_answer_presenter): entries whose GPU addresses follow
+            // each other are read with one ReadBlockUnsafe per run instead of one per entry (OoT:
+            // ~6,500 entries a frame, a few words each, on the thread that presents). The words
+            // land where the per-entry reads put them; any entry a queued map touches takes the
+            // per-entry path as before.
+            const int run_mode = VideoCore::Nx2Debug::Experiment(101);
+            const auto loop_begin = run_mode != 0 ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+            u64 runs_read = 0;
+            if (run_mode == 2) {
+                // EXP101=2 (fable52_answer_presenter 2.1): an entry inside one 4 KiB GPU page is
+                // copied from MemoryManager's per-thread page pointer cache (it drops stale
+                // entries on any map serial or translation change), and the first and last
+                // lines of the entry 8 ahead are prefetched. Same bytes as ReadBlockUnsafe.
+                const auto& lists = entries.command_lists;
+                auto& gmmu = *channel_state->memory_manager;
+                const auto host_of = [&](u32 index) -> const u8* {
+                    const u64 addr = static_cast<u64>(lists[index].addr);
+                    const u64 bytes = static_cast<u64>(lists[index].size) * sizeof(u32);
+                    if (bytes == 0 || bytes > 0x1000 || (addr & 0xFFF) + bytes > 0x1000) {
+                        return nullptr;
+                    }
+                    return gmmu.GetPointerForDescriptor(addr);
+                };
+                for (u32 i = 0; i < lists.size(); ++i) {
+                    if (i + 8 < lists.size()) {
+                        if (const u8* ahead = host_of(i + 8)) {
+                            const u64 ahead_bytes =
+                                static_cast<u64>(lists[i + 8].size) * sizeof(u32);
+                            _mm_prefetch(reinterpret_cast<const char*>(ahead), _MM_HINT_T0);
+                            _mm_prefetch(reinterpret_cast<const char*>(ahead + ahead_bytes - 1),
+                                         _MM_HINT_T0);
+                        }
+                    }
+                    const auto& entry = lists[i];
+                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                    const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                    if (system.GPU().IsMapPending(entry.addr, bytes)) {
+                        entries.deferred_entries.push_back(i);
+                    } else if (const u8* host = host_of(i)) {
+                        std::memcpy(entries.submitted_words.data() + offset, host, bytes);
+                        ++runs_read;
+                    } else {
+                        gmmu.ReadBlockUnsafe(entry.addr, entries.submitted_words.data() + offset,
+                                             bytes);
+                        ++runs_read;
+                    }
+                    offset += entry.size;
+                }
+                NotePbSnapshot(run_mode, lists.size(), runs_read,
+                               std::chrono::steady_clock::now() - loop_begin);
+            } else if (run_mode != 0) {
+                const auto& lists = entries.command_lists;
+                for (u32 i = 0; i < lists.size();) {
+                    u32 end = i + 1;
+                    u64 run_bytes = static_cast<u64>(lists[i].size) * sizeof(u32);
+                    while (end < lists.size() &&
+                           static_cast<u64>(lists[end].addr) ==
+                               static_cast<u64>(lists[i].addr) + run_bytes) {
+                        run_bytes += static_cast<u64>(lists[end].size) * sizeof(u32);
+                        ++end;
+                    }
+                    if (end - i > 1 && !system.GPU().IsMapPending(lists[i].addr, run_bytes)) {
+                        for (u32 j = i; j < end; ++j) {
+                            entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                            offset += lists[j].size;
+                        }
+                        channel_state->memory_manager->ReadBlockUnsafe(
+                            lists[i].addr,
+                            entries.submitted_words.data() + entries.submitted_offsets[i],
+                            run_bytes);
+                        ++runs_read;
+                        i = end;
+                        continue;
+                    }
+                    // One entry (or a run a queued map touches): as before.
+                    const auto& entry = lists[i];
+                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                    const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                    if (system.GPU().IsMapPending(entry.addr, bytes)) {
+                        entries.deferred_entries.push_back(i);
+                    } else {
+                        channel_state->memory_manager->ReadBlockUnsafe(
+                            entry.addr, entries.submitted_words.data() + offset,
+                            entry.size * sizeof(u32));
+                        ++runs_read;
+                    }
+                    offset += entry.size;
+                    ++i;
+                }
+                NotePbSnapshot(run_mode, lists.size(), runs_read,
+                               std::chrono::steady_clock::now() - loop_begin);
+            }
+            for (u32 i = 0; run_mode == 0 && i < entries.command_lists.size(); ++i) {
                 const auto& entry = entries.command_lists[i];
                 entries.submitted_offsets.push_back(static_cast<u32>(offset));
                 // GMMU maps run on the GPU thread (GPU::MapInOrder): an entry on addresses a
@@ -476,6 +602,13 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                         entry.size * sizeof(u32));
                 }
                 offset += entry.size;
+            }
+            // submitted_words is not zero-filled when sized: the entries copied above wrote
+            // theirs; a deferred entry's words stay zero, as before, until DmaPusher::Push copies
+            // them after the map.
+            for (const u32 index : entries.deferred_entries) {
+                std::memset(entries.submitted_words.data() + entries.submitted_offsets[index], 0,
+                            static_cast<size_t>(entries.command_lists[index].size) * sizeof(u32));
             }
         }
     }
@@ -594,7 +727,9 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    // Every entry is written below (copied, or read from guest memory, which zero-fills
+    // unmapped bytes): no zero fill first.
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
     if (kickoff) {
         this->GetSessionMemory(fd).ReadBlock(params.address, entries.command_lists.data(),
                                              params.num_entries * sizeof(Tegra::CommandListHeader));
@@ -606,6 +741,60 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
     return SubmitGPFIFOImpl(params, std::move(entries));
 }
 
+namespace {
+/// The submit's entries, reused per thread (WrapGeneric made a zero-filled vector each time).
+Common::ScratchBuffer<Tegra::CommandListHeader>& SubmitEntriesBuffer(std::span<const u8> bytes) {
+    thread_local Common::ScratchBuffer<Tegra::CommandListHeader> buffer;
+    const size_t count = bytes.size() / sizeof(Tegra::CommandListHeader);
+    buffer.resize_destructive(count);
+    if (count > 0) {
+        std::memcpy(buffer.data(), bytes.data(), count * sizeof(Tegra::CommandListHeader));
+    }
+    return buffer;
+}
+} // namespace
+
+NvResult nvhost_gpu::SubmitGPFIFOIoctl1(std::span<const u8> input, std::span<u8> output,
+                                        DeviceFD fd, bool kickoff) {
+    // As WrapGeneric<IoctlSubmitGpfifo, CommandListHeader, Null, Null>.
+    IoctlSubmitGpfifo fixed{};
+    const size_t var_offset = (std::min)(sizeof(IoctlSubmitGpfifo), input.size());
+    if (var_offset > 0) {
+        std::memcpy(&fixed, input.data(), var_offset);
+    }
+    auto& entries = SubmitEntriesBuffer(input.subspan(var_offset));
+    const size_t count = (input.size() - var_offset) / sizeof(Tegra::CommandListHeader);
+    const NvResult result = SubmitGPFIFOBase1(
+        fixed, std::span<Tegra::CommandListHeader>(entries.data(), count), fd, kickoff);
+    if (output.size() > 0) {
+        std::memcpy(output.data(), &fixed, (std::min)(output.size(), sizeof(IoctlSubmitGpfifo)));
+    }
+    if (count > 0 && output.size() > var_offset) {
+        std::memcpy(output.data() + var_offset, entries.data(),
+                    (std::min)(output.size() - var_offset,
+                               count * sizeof(Tegra::CommandListHeader)));
+    }
+    return result;
+}
+
+NvResult nvhost_gpu::SubmitGPFIFOIoctl2(std::span<const u8> input,
+                                        std::span<const u8> inline_input, std::span<u8> output) {
+    // As WrapGeneric<IoctlSubmitGpfifo, Null, CommandListHeader, Null>.
+    IoctlSubmitGpfifo fixed{};
+    const size_t fixed_bytes = (std::min)(sizeof(IoctlSubmitGpfifo), input.size());
+    if (fixed_bytes > 0) {
+        std::memcpy(&fixed, input.data(), fixed_bytes);
+    }
+    auto& entries = SubmitEntriesBuffer(inline_input);
+    const size_t count = inline_input.size() / sizeof(Tegra::CommandListHeader);
+    const NvResult result = SubmitGPFIFOBase2(
+        fixed, std::span<const Tegra::CommandListHeader>(entries.data(), count));
+    if (output.size() > 0) {
+        std::memcpy(output.data(), &fixed, (std::min)(output.size(), sizeof(IoctlSubmitGpfifo)));
+    }
+    return result;
+}
+
 NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
                                        std::span<const Tegra::CommandListHeader> commands) {
     if (params.num_entries > commands.size()) {
@@ -613,7 +802,9 @@ NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    // Every entry is written below (copied, or read from guest memory, which zero-fills
+    // unmapped bytes): no zero fill first.
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
     std::memcpy(entries.command_lists.data(), commands.data(),
                 params.num_entries * sizeof(Tegra::CommandListHeader));
     return SubmitGPFIFOImpl(params, std::move(entries));

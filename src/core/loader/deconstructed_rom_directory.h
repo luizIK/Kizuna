@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -18,6 +17,10 @@ class System;
 }
 
 namespace Loader {
+
+/// The RomFS image of a loose romfs/ directory, built once and shared by every loader of that
+/// directory while any of them holds it.
+FileSys::VirtualFile BuildLooseRomFS(const FileSys::VirtualDir& romfs_dir);
 
 /**
  * This class loads a "deconstructed ROM directory", which are the typical format we see for Switch

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -54,21 +53,26 @@ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
 // The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
 // version tag that isolates this experimental ABI.
-// Constant buffer slots that held a null pointer when the program was translated and were
-// therefore not bound as storage buffers. A later non-null value makes the translation stale.
-static std::vector<std::pair<u32, u32>> NullStoragePointerSlots(
+// Pointer slots that held null or an unmapped address when the program was translated and were
+// therefore not bound as storage buffers: plain constant buffer slots whose two words translation
+// read, and pointer-table entries (keys of MakeIndirectCbufKey). A later mapped address makes the
+// translation stale. Watching only exactly-null plain slots left out OoT's foliage culling list
+// (unmapped, or a table entry, when the attack variant was captured): far trees, grass and
+// pebbles vanished on every sword swing.
+static std::vector<Shader::StoragePointerSlot> UnboundStoragePointerSlots(
     const ::Common::unordered_map<u64, u32>& cbuf_values,
     const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
-    std::vector<std::pair<u32, u32>> slots;
+    std::vector<Shader::StoragePointerSlot> slots;
     for (const auto& [key, type] : storage_pointer_types) {
-        if (type != 0 || (key >> 63) != 0) {
+        if (type != 0) {
             continue;
         }
-        const auto low = cbuf_values.find(key);
-        const auto high = cbuf_values.find(key + 4);
-        if (low != cbuf_values.end() && high != cbuf_values.end() && low->second == 0 &&
-            high->second == 0) {
-            slots.emplace_back(static_cast<u32>(key >> 32), static_cast<u32>(key));
+        const u32 index = static_cast<u32>(key >> 32) & 0xff;
+        const u32 offset = static_cast<u32>(key);
+        if ((key >> 63) != 0) {
+            slots.push_back({index, offset, static_cast<u32>(key >> 40) & 0x3fffff});
+        } else if (cbuf_values.contains(key) && cbuf_values.contains(key + 4)) {
+            slots.push_back({index, offset, std::nullopt});
         }
     }
     return slots;
@@ -336,8 +340,8 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
     return mapped;
 }
 
-std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() const {
-    return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+std::vector<Shader::StoragePointerSlot> GenericEnvironment::UnboundStoragePointerSlots() const {
+    return VideoCommon::UnboundStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
 std::vector<u64> GenericEnvironment::MappedStoragePointerKeys() const {
@@ -391,7 +395,7 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
     // A trap guard is checked against live constants on every dispatch (ComputeShader), so a
-    // cached pipeline is only used once its guard passes (zortos293/Lichii#192, SinCuri0).
+    // cached pipeline is only used once its guard passes (ported).
     return !has_unbound_instructions;
 }
 
@@ -1582,7 +1586,7 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
     }
     // Fritchii: the bound texture buffer is the constant buffer bindless handles are read from
     // (texture_pass), and compute programs take their workgroup and shared memory sizes from the
-    // environment; #896 leaves them to the key.
+    // environment; the original leaves them to the key.
     if (live.TextureBoundBuffer() != texture_bound) {
         return fail("bound texture buffer");
     }
@@ -1678,8 +1682,8 @@ bool FileEnvironment::IsNativeProgram() const {
     return Shader::Ampere::HasNativeAddressMap(code);
 }
 
-std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {
-    return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+std::vector<Shader::StoragePointerSlot> FileEnvironment::UnboundStoragePointerSlots() const {
+    return VideoCommon::UnboundStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
 std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {

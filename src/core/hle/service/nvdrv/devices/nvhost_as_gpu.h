@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -251,6 +250,13 @@ private:
     // A tile of a sparse region (nx2:gpu 216): its device pages show process memory, or nothing.
     void Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size);
     std::map<u64, std::pair<u64, DAddr>> nx2_sparse_ranges; ///< GPU address -> (size, device)
+    /// Sparse blocks Nx2BackSparse mapped behind their region's device pages: GPU address ->
+    /// (CPU address, size), under `mutex`. A block reaches here both from BackSparse and from
+    /// Nx2Sparse's replay of the recorded blocks; the SMMU keeps a duplicate map, so each is
+    /// mapped once. Dropped with the region and under a tile.
+    std::map<u64, std::pair<u64, u64>> nx2_backed_blocks;
+    /// Needs `mutex`: forgets the backed blocks overlapping [gpu_address, +size).
+    void Nx2ForgetBackedBlocks(u64 gpu_address, u64 size);
 };
 
 } // namespace Service::Nvidia::Devices

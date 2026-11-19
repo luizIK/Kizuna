@@ -19,7 +19,6 @@ log.txt
 
 # Generated source files
 src/common/scm_rev.cpp
-dist/english_plurals/generated_en.ts
 
 # Project/editor files
 *.swp

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/hle/service/glue/time/static.h"
@@ -626,7 +625,7 @@ Result NfcDevice::Restore() {
         }
     }
 
-    // Restore mii data in case is corrupted by previous instances of yuzu
+    // Restore mii data in case is corrupted by previous instances of the emulator
     if (tag_data.settings.settings.amiibo_initialized && !tag_data.owner_mii.IsValid()) {
         LOG_ERROR(Service_NFP, "Regenerating mii data");
         Mii::StoreData new_mii{};

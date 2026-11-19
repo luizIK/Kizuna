@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -56,7 +55,7 @@ namespace Kernel {
 
 namespace {
 
-// EDEN_NX2_FAST_TLS=1 (boot switch, off by default; from zortos293/Lichii#641, where it is on):
+// EDEN_NX2_FAST_TLS=1 (boot switch, off by default; ported from a build where it is on):
 // plain (constinit, trivially destructible) copies of the hot fields of ThreadLocalData.
 // ThreadLocalData holds an optional KThread, so its thread_local has a non-trivial destructor
 // and every access may go through the TLS init guard or wrapper; SVCs, scheduler locks and memory
@@ -1286,25 +1285,32 @@ const Kernel::KSharedMemory& KernelCore::GetHidBusSharedMem() const {
     return *impl->hidbus_shared_mem;
 }
 
+void KernelCore::RequestSuspendEmulation() {
+    for (auto& process : GetProcessList()) {
+        KScopedLightLock ll{process->GetListLock()};
+
+        for (auto& thread : process->GetThreadList()) {
+            thread.RequestSuspend(*this, SuspendType::System);
+        }
+    }
+}
+
 void KernelCore::SuspendEmulation(bool suspended) {
     const bool should_suspend{exception_exited || suspended};
     auto processes = GetProcessList();
 
-    for (auto& process : processes) {
-        KScopedLightLock ll{process->GetListLock()};
+    if (!should_suspend) {
+        for (auto& process : processes) {
+            KScopedLightLock ll{process->GetListLock()};
 
-        for (auto& thread : process->GetThreadList()) {
-            if (should_suspend) {
-                thread.RequestSuspend(*this, SuspendType::System);
-            } else {
+            for (auto& thread : process->GetThreadList()) {
                 thread.Resume(*this, SuspendType::System);
             }
         }
-    }
-
-    if (!should_suspend) {
         return;
     }
+
+    RequestSuspendEmulation();
 
     // Wait for process execution to stop.
     // KernelCore::SuspendEmulation must be called from locked context,

@@ -11,8 +11,8 @@
 # without the converter.
 #
 # The static library is linked into the executable, so there is no shared
-# library to ship: a missing one stopped Lichii from starting. Its variant
-# without Zstandard is used, so the converter runs on Lichii's own bundled zstd
+# library to ship: a missing one stopped the emulator from starting. Its variant
+# without Zstandard is used, so the converter runs on the emulator's own bundled zstd
 # and the executable holds a single copy of it.
 #
 # Defines nxformat::static_nozstd when the converter is built.

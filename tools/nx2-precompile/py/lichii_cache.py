@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Reader/writer for Lichii (Eden/yuzu fork, nx2 branch) Vulkan shader-environment disk caches.
+"""Reader/writer for Fritchii Vulkan shader-environment disk caches.
 
-Layout derived from Lichii commit 588bfa611b (VulkanPipelineCacheVersion = 53):
+Layout derived from the cache writer (VulkanPipelineCacheVersion = 53):
   src/video_core/shader_environment.cpp  GenericEnvironment::Serialize (292-353),
                                          FileEnvironment::Deserialize (1048-1126),
                                          SerializePipeline (1235-1265), LoadPipelines (1267-1322)
@@ -30,7 +30,7 @@ Env:    u64 code_size, n_texture_types, n_texture_pixel_formats, n_cbuf_values,
         else: ProgramHeader sph (80 B)
               if stage == Geometry(3): u32 gp_passthrough_mask[8]
               if stage in (Task(7), Mesh(8)): u32 mesh_registers[3]; ProgramHeader mesh_primitive_header (80 B)
-                                              (added in v53, commit b06d1818ee; absent in v52)
+                                              (added in v53; absent in v52)
 vulkan_used: u32 magic 0x31505545 ("EUP1"); u32 count; count x (u64 GraphicsPipelineCacheKey::Hash(), u8 age)
 """
 
@@ -407,7 +407,7 @@ def parse_cache(data: bytes, mesh_fields: bool | None = None,
         raise CacheError("bad magic")
     version = struct.unpack_from("<I", data, 8)[0]
     if mesh_fields is None:
-        # Fritchii's v52 records carry them too (stored since 3a2c8980ad); upstream's from v53.
+        # Fritchii's v52 records carry them too (stored since then); the original builds' from v53.
         mesh_fields = version >= 52
     mv = memoryview(data)
     n = len(data)
@@ -495,7 +495,7 @@ THIS_MACHINE = {"extended_dynamic_state": 1, "extended_dynamic_state_2": 1,
 
 def check_loadable(rec: Record, machine: dict = THIS_MACHINE) -> list[str]:
     """Problems that would make LoadPipelines skip, crash on, or mis-key this record. Empty = OK.
-    (Structural parse problems raise CacheError earlier and would make Lichii DELETE the file.)"""
+    (Structural parse problems raise CacheError earlier and would make Fritchii DELETE the file.)"""
     p = []
     if not rec.envs:
         return ["num_envs == 0 (envs.front() is UB in LoadPipelines)"]
@@ -530,7 +530,7 @@ def check_loadable(rec: Record, machine: dict = THIS_MACHINE) -> list[str]:
         if gk["driver_id"] != machine["driver_id"] or gk["driver_version"] != machine["driver_version"]:
             p.append("driver id/version differs: loads and builds, but runtime keys never match it")
         if any(rec.key[48 + gk["state_size"]:]):
-            p.append("nonzero bytes beyond FixedPipelineState::Size() (ignored by hash/==, but not what Lichii writes)")
+            p.append("nonzero bytes beyond FixedPipelineState::Size() (ignored by hash/==, but not what Fritchii writes)")
         mesh_env = next((e for e in rec.envs if e.stage == STAGE_MESH), None)
         for slot, e in zip(nz, rec.envs):
             h = native_shader_hash(e.code)
@@ -544,7 +544,7 @@ def check_loadable(rec: Record, machine: dict = THIS_MACHINE) -> list[str]:
 def merge_caches(base: bytes, extra: bytes, version: int = 53, extra_mesh_fields: bool | None = None,
                  machine: dict = THIS_MACHINE):
     """Return (merged_bytes, added_graphics_key_hashes, report). Base records are kept verbatim and first
-    (Lichii keeps the first record per graphics key hash); extra records whose key hash is new and that pass
+    (Fritchii keeps the first record per graphics key hash); extra records whose key hash is new and that pass
     check_loadable are appended re-serialized in the v53 layout. Never writes files."""
     bver, bit = parse_cache(base)
     seen_g, seen_c = set(), set()

@@ -17,6 +17,8 @@ struct PendingImageDownload {
     size_t async_buffer_id;
     Common::SlotId object_id;
     std::shared_ptr<Image> retired_image{};
+    /// The GPU tick current when the retired image was deleted (0 without one, or on OpenGL).
+    u64 retired_tick{};
 
     Image& GetImage(Common::SlotVector<Image>& images) const {
         return retired_image ? *retired_image : images[object_id];
@@ -39,20 +41,26 @@ size_t DeduplicatePendingImageDownloads(Downloads& downloads, Common::SlotVector
 
 // Cache slots may be recycled before queued GPU downloads are submitted or
 // consumed. Keep the actual image, including its metadata, until those finish.
+// Returns the kept image (null when no download names it). A download lands once the GPU passed
+// its own copy, which can be before the GPU is past work recorded after that copy (the image
+// drawn to or read again, then deleted at `tick`): the caller holds the returned reference until
+// the GPU passes `tick` (Fritchii's free guard), so the landing never frees it in use.
 template <class Image, class Downloads, class Batches>
-bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pending,
-                                 Batches& submitted) {
+std::shared_ptr<Image> RetainPendingImageDownloads(Common::SlotId id, Image& image,
+                                                   Downloads& pending, Batches& submitted,
+                                                   u64 tick) {
     std::shared_ptr<Image> retained;
     const auto retain = [&](auto& downloads) {
         for (auto& download : downloads) {
             if (!download.is_swizzle || download.object_id != id || download.retired_image) continue;
             if (!retained) retained = std::make_shared<Image>(std::move(image));
             download.retired_image = retained;
+            download.retired_tick = tick;
         }
     };
     retain(pending);
     for (auto& downloads : submitted) retain(downloads);
-    return retained != nullptr;
+    return retained;
 }
 
 } // namespace VideoCommon

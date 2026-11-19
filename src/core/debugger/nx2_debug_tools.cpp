@@ -472,8 +472,25 @@ json SetSwitch(ToolState&, const json& params) {
     const int previous = value->load(std::memory_order_relaxed);
     if (params.contains("value")) {
         value->store(params.at("value").get<int>(), std::memory_order_relaxed);
+        VideoCore::Nx2Debug::BumpSwitchGeneration();
     }
-    return {{"name", name}, {"previous", previous}, {"value", value->load()}};
+    // -1 is "not read yet" (a switch is read from the environment on its first use, and some
+    // never are: the one follower's on AMD's proprietary driver). "effective" is what that
+    // first read takes: the environment's value (nx2_switches.txt sets it at boot), else the
+    // code's default (null here: each call site names its own).
+    const int current = value->load(std::memory_order_relaxed);
+    json result = {{"name", name}, {"previous", previous}, {"value", current}};
+    if (current >= 0) {
+        result["effective"] = current;
+        result["source"] = params.contains("value") ? "set live" : "read";
+    } else if (std::getenv(name.c_str()) != nullptr) {
+        result["effective"] = VideoCore::Nx2Debug::EnvSwitch(name.c_str());
+        result["source"] = "environment, not read yet";
+    } else {
+        result["effective"] = nullptr;
+        result["source"] = "code default, not read yet";
+    }
+    return result;
 }
 
 // Ocarina of Time's high refresh rate mode, switched live for tests without saving the setting
@@ -692,11 +709,26 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
         }
         return g_nx2_present_count.load(std::memory_order_relaxed);
     };
-    controller->SetInputInjector([script, ends, frame_now] {
-        return InputAt(*script, *ends, frame_now());
+    // "keep": true (2026-11-14, the owner: ZL must never let go in fight tests): no gap between
+    // calls. Before the first step's present the first step is already held, and once the call
+    // has finished the last step stays held until the next input call replaces it. A call that
+    // fails (client gone, shutdown, timeout) still releases everything.
+    const bool keep = params.is_object() && params.value("keep", false);
+    controller->SetInputInjector([script, ends, frame_now, keep] {
+        auto input = InputAt(*script, *ends, frame_now());
+        if (!input && keep) {
+            input = frame_now() < ends->back() ? script->front().input : script->back().input;
+        }
+        return input;
     });
+    bool finished = false;
     SCOPE_EXIT {
-        controller->SetInputInjector({});
+        if (keep && finished) {
+            const HID::InjectedInput last = script->back().input;
+            controller->SetInputInjector([last] { return std::optional<HID::InjectedInput>{last}; });
+        } else {
+            controller->SetInputInjector({});
+        }
     };
     const auto begin = std::chrono::steady_clock::now();
     const auto deadline = begin + std::chrono::seconds{timeout};
@@ -719,6 +751,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
         }
         std::this_thread::sleep_for(2ms);
     }
+    finished = true;
     return {
         {"controller", name},
         {"steps", steps.size()},
@@ -733,6 +766,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
 json Input(ToolState& state, const json& params, const ClientGone& client_gone) {
     json step = params;
     step.erase("timeout_s");
+    step.erase("keep");
     return RunInput(state, {ParseInputStep(step)}, params, client_gone);
 }
 

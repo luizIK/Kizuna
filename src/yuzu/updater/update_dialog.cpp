@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <filesystem>
 #include <utility>
 #include <QTimer>
@@ -45,6 +46,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Kizuna keeps lichii.exe (Fritchii v6 renamed it fritchii.exe, with a lichii.exe forwarder).
 constexpr wchar_t ExeName[] = L"lichii.exe";
 // Set for a restarted process to a note it shows once it is up, such as "v5 is installed".
 constexpr char RestartNoteVariable[] = "LICHII_UPDATE_NOTE";
@@ -171,7 +173,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
         return;
     }
 
-    // TODO(crueter): Find a way to set default
+    // TODO: Find a way to set default
     const auto assets = release.GetPlatformAssets();
 
     if (assets.empty()) {
@@ -319,7 +321,21 @@ void UpdateDialog::InstallInPlace() {
 
     const auto package = UpdateInstaller::FindPackageRoot(unpacked, ExeName);
     if (!package) {
-        fail(tr("The downloaded update does not contain lichii.exe."));
+        // 2026-11-11, v5.8.4: a player got this with a good zip: the exe was in it but gone
+        // from disk right after unpacking, as an antivirus quarantining a new unsigned exe does.
+        const bool in_archive = std::ranges::any_of(extracted, [](const QString& file) {
+            return file.endsWith(QStringLiteral("/lichii.exe"), Qt::CaseInsensitive) ||
+                   file.endsWith(QStringLiteral("\\lichii.exe"), Qt::CaseInsensitive);
+        });
+        LOG_ERROR(Frontend, "Update package without {}: {} files unpacked, the exe {} in the list",
+                  PathText(ExeName), extracted.size(), in_archive ? "was" : "was not");
+        fail(in_archive
+                 ? tr("Your antivirus probably removed lichii.exe from the update right after it "
+                      "was unpacked.\n\nAllow it in your antivirus and try again, or download %1 "
+                      "from the release page and unzip it over your Fritchii folder. Your saves "
+                      "and settings are kept either way.")
+                       .arg(QString::fromStdString(m_asset.filename.empty() ? m_asset.name : m_asset.filename))
+                 : tr("The downloaded update does not contain lichii.exe."));
         return;
     }
 
@@ -362,7 +378,7 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         return false;
     }
 
-    // TODO(crueter): Move to net.cpp
+    // TODO: Move to net.cpp
     constexpr std::size_t timeout_seconds = 15;
 
     std::unique_ptr<httplib::Client> client = std::make_unique<httplib::Client>(m_asset.url);
@@ -370,7 +386,7 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
     client->set_read_timeout(timeout_seconds);
     client->set_write_timeout(timeout_seconds);
     client->set_follow_location(true);
-    client->set_default_headers({{"User-Agent", "Lichii"}});
+    client->set_default_headers({{"User-Agent", "Fritchii"}});
 
 #ifdef YUZU_BUNDLED_OPENSSL
     client->load_ca_cert_store(kCert, sizeof(kCert));
@@ -539,7 +555,7 @@ bool FinishPendingSwap(QWidget* window) {
     }
     const UpdateInstaller::Lock lock{install_dir / UpdateInstaller::LockName};
     if (!lock.Held()) {
-        // Another Lichii window is installing or rolling back right now.
+        // Another Fritchii window is installing or rolling back right now.
         return false;
     }
     switch (UpdateInstaller::Recover(install_dir, ec)) {

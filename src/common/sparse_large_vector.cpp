@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /* virtual_buffer.cpp */
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _WIN32
@@ -13,8 +12,12 @@
 #include <sys/mman.h>
 #endif
 
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/sparse_large_vector.h"
 
 namespace Common {
@@ -63,13 +66,13 @@ static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
 
     // Commit this region
     if (addr != 0) {
-        if (!CommitVectorPage(addr << HostPageBits, false)) {
+        if (!CommitVectorPage(addr << HostPageBits)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
     // Commit next region if needed
     if (addr2 != 0) {
-        if (!CommitVectorPage(addr2 << HostPageBits, false)) {
+        if (!CommitVectorPage(addr2 << HostPageBits)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
@@ -77,27 +80,22 @@ static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
+// Pages are always committed writable: the fault handler can run after another thread committed
+// the same page and is storing entries into it, so it must not take write access away.
+bool CommitVectorPage(uintptr_t addr) noexcept {
     MEMORY_BASIC_INFORMATION info {};
     auto res = VirtualQuery(reinterpret_cast<void*>(addr), &info, sizeof(info));
     if (res == 0) {
         LOG_CRITICAL(HW_Memory, "Failed to query large buffer region at {:#x} with error {}, will try committing anyway", addr, GetLastError());
     } else if (info.State == MEM_COMMIT) {
-        DWORD old_protect {};
-        auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-        if (!VirtualProtect(reinterpret_cast<void*>(addr), HostPageSize, perm, &old_protect)) {
-            LOG_ERROR(HW_Memory, "Failed to change permissions of large buffer region at {:#x}, error {}", addr, GetLastError());
-            return false;
-        }
         return true;
     } else if (info.State != MEM_RESERVE) {
         LOG_ERROR(HW_Memory, "Tried to commit an unreserved large buffer region at {:#x} that is not mapped (state {:#x})", addr, info.State);
         return false;
     }
 
-    auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-    void* res2 = VirtualAlloc(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, perm);
-    if (res2 == nullptr) {
+    // Quiet: this runs in the fault handler too. The failure below is logged once it is final.
+    if (!CommitPagesWaiting(reinterpret_cast<void*>(addr), HostPageSize, true)) {
         LOG_ERROR(HW_Memory, "Failed to commit large buffer region at {:#x}, error {}", addr, GetLastError());
         return false;
     }
@@ -139,6 +137,96 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
     ASSERT_MSG(base, "Failed to allocate {:#x} sized region with error {}", size, strerror(errno));
 #endif
     return base;
+}
+
+namespace {
+bool SwitchOn(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+} // namespace
+
+bool RamTableLazy() noexcept {
+    static const bool on = [] {
+        const bool value = SwitchOn("FRITCHII_RAM_PT_LAZY");
+        if (value) {
+            LOG_INFO(HW_Memory, "FRITCHII_RAM_PT_LAZY=1: page table walks skip uncommitted pages");
+        }
+        return value;
+    }();
+    return on;
+}
+
+bool RamTableTrim() noexcept {
+    static const bool on = [] {
+        const bool value = SwitchOn("FRITCHII_RAM_PT_TRIM");
+        if (value) {
+            LOG_INFO(HW_Memory, "FRITCHII_RAM_PT_TRIM=1: unmaps give back page table pages left "
+                                "without a mapped entry");
+        }
+        return value;
+    }();
+    return on;
+}
+
+void DiscardTablePages(void* base, std::size_t bytes) noexcept {
+    if (base == nullptr || bytes == 0) {
+        return;
+    }
+#ifdef _WIN32
+    // MEM_RESET: the contents need not be kept (no page file write); still committed. Unlocking
+    // pages that are not locked takes them out of the working set, so the RAM goes now, not at the
+    // next trim. A page read again holds zeros (the old zeros, or a fresh zero page).
+    if (VirtualAlloc(base, bytes, MEM_RESET, PAGE_READWRITE) == nullptr) {
+        return;
+    }
+    VirtualUnlock(base, bytes);
+#else
+    madvise(base, bytes, MADV_DONTNEED);
+#endif
+}
+
+bool CensusOn() noexcept {
+    return MemCensus::Mode() != 0;
+}
+
+void CensusTagTable(const char* name, const void* key, const void* base, std::size_t bytes,
+                    std::function<std::string()> reporter) {
+    if (!CensusOn()) {
+        return;
+    }
+    MemCensus::Tag(name, base, bytes);
+    MemCensus::AddReporter(key, std::move(reporter));
+}
+
+void CensusUntagTable(const void* key, const void* base) {
+    if (!CensusOn()) {
+        return;
+    }
+    MemCensus::RemoveReporter(key);
+    MemCensus::Untag(base);
+}
+
+std::vector<u8> TableResidentPages(const void* base, std::size_t bytes) {
+    return MemCensus::ResidentPages(base, bytes);
+}
+
+void NoteTableCommit(const char* name, const char* site, std::size_t first_index,
+                     std::size_t end_index, [[maybe_unused]] std::size_t entry_size,
+                     std::size_t pages) {
+    // Rare (a big map or a walk over a wide range): the first 64, then every 64th. Entries are
+    // per 4 KiB page of address space.
+    static std::atomic<u32> count{};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 64 && n % 64 != 0) {
+        return;
+    }
+    LOG_INFO(HW_Memory,
+             "Page table commit ({}): {} by {} committed {} KiB of entries for {:#x}..{:#x} ({} "
+             "MiB of address space){}",
+             n + 1, name, site != nullptr ? site : "?", pages * 4, u64{first_index} << 12,
+             u64{end_index} << 12, (u64{end_index - first_index} << 12) >> 20,
+             n >= 64 ? " (every 64th logged)" : "");
 }
 
 void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {

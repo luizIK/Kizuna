@@ -20,6 +20,7 @@
 #include <tlhelp32.h>
 
 #include "common/fs/path_util.h"
+#include "common/jit_symbols.h"
 #include "common/logging.h"
 #endif
 
@@ -237,6 +238,13 @@ void SamplerMain() {
     }
     LOG_INFO(Common, "Sample profile: {} samples of {} threads at {} Hz written to {}", samples,
              threads_written, config.hz, path.string());
+    // With EDEN_NX2_JIT_SYMBOLS=1: the JIT's block table next to it, so the report names the
+    // guest code behind "[jit]" samples.
+    std::string jit_path = path.string();
+    jit_path.replace(jit_path.size() - 4, 4, ".jit.txt");
+    if (Common::JitSymbols::DumpTo(jit_path)) {
+        LOG_INFO(Common, "Sample profile: JIT block table written to {}", jit_path);
+    }
 }
 
 #endif

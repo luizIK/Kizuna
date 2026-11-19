@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -117,6 +116,26 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
+    /// One follower (FRITCHII_ONEF_QUERY_OPS=2): whether a report of `type` lands later, at a
+    /// fence or flush (a streamer exists), not inside CounterReport (the payload write a type
+    /// without a streamer becomes).
+    [[nodiscard]] bool ReportLandsLater(QueryType type) const;
+    /// One follower (fable_b 16.2): whether a report of `type` written now makes a pending sync.
+    [[nodiscard]] bool ReportMakesPendingSync(QueryType type) const;
+    /// One follower (fable_b 19.4, FRITCHII_ONEF_SEM_E), E at the report's place: a payload
+    /// write to game memory, the waiters and the listeners, as CounterReport's immediate write
+    /// (`completion` false) or a synced fence report's operation (true) does it. The streamers
+    /// (R's) are not touched.
+    void WritePayloadNow(DAddr cpu_addr, GPUVAddr addr, u32 payload, bool has_timestamp,
+                         bool completion);
+    /// R: the streamer's side of a payload write E made, its pending sync for the next fence.
+    void NotePayloadWritten(DAddr cpu_addr, bool has_timestamp, u32 payload, u32 subreport);
+
+    /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
+    /// its stream place, R writes the report).
+    void CounterReportAt(GPUVAddr addr, std::optional<DAddr> device, QueryType counter_type,
+                         QueryPropertiesFlags flags, u32 payload, u32 subreport);
+
     void NotifyWFI();
 
     bool AccelerateHostConditionalRendering();
@@ -127,9 +146,12 @@ public:
     bool HasUncommittedFlushes() const;
 
     /// Whether a new fence has queries to flush or host writes to sync for this cache.
-    /// `ignore_payload_sync` (EDEN_NX2_EXP28 & 1, zortos293/Lichii#717 FENCE_TRIM): payload
+    /// `ignore_payload_sync` (EDEN_NX2_EXP28 & 1, the original's FENCE_TRIM): payload
     /// releases' host buffer syncs don't count; they wait for a later fence or wait for idle.
     bool HasPendingFenceWork(bool ignore_payload_sync = false) const;
+
+    /// Whether NotifyWFI would sync query results now (a streamer has pending syncs).
+    bool HasPendingSync() const;
 
     /// EXP28 & 1: a fence was skipped although payload releases wait for their host sync.
     void NotePayloadSyncDeferred();

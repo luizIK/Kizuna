@@ -142,6 +142,9 @@ public:
             return false;
         }
         if (sensor_timestamp < last_motion_update) {
+            // The sensor clock went back (a reconnected controller starts it again from zero).
+            // Follow it instead of dropping every report until it passes the old value.
+            last_motion_update = sensor_timestamp;
             return false;
         }
 
@@ -306,6 +309,12 @@ public:
     }
 
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
+        {
+            std::scoped_lock lock{mutex};
+            last_motion_update = 0;
+            motion_error_count = 0;
+            motion_restart_threshold = InitialMotionRestartThreshold;
+        }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
     }
@@ -663,7 +672,7 @@ void SDLDriver::CloseJoysticks() {
 SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
     // Set our application name. Currently passed to DBus by SDL and visible to the user through
     // their desktop environment.
-    SDL_SetHint(SDL_HINT_APP_NAME, "Eden");
+    SDL_SetHint(SDL_HINT_APP_NAME, "Fritchii");
 
     // Disable raw input. When enabled this setting causes SDL to die when a web applet opens
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, Settings::values.enable_raw_input ? "1" : "0");

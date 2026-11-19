@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <utility>
 
+#include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -98,7 +102,7 @@ bool MultiRangeBufferCache::CanBindSparse(std::span<const MultiRangeSource> sour
                         });
 }
 
-SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler& scheduler,
+SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, SeamClock& clock,
                                                  std::span<const MultiRangeSource> sources,
                                                  VkDeviceSize total) {
     const VkDevice logical = *device.GetLogical();
@@ -158,7 +162,7 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
     vk::Fence fence = device.GetLogical().CreateFence(fence_ci);
     VkResult bind_result = VK_ERROR_UNKNOWN;
     {
-        std::scoped_lock lock{scheduler.submit_mutex};
+        std::scoped_lock lock{clock.GetScheduler().submit_mutex};
         bind_result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
     }
     if (bind_result != VK_SUCCESS) {
@@ -168,12 +172,12 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
     return handle;
 }
 
-void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
+void MultiRangeBufferCache::RetireEntry(SeamClock& clock, Entry& entry) {
     if (!entry.sparse_handle && !entry.gathered) {
         return;
     }
     if (retired.size() == retired.capacity()) {
-        DrainRetired(scheduler);
+        DrainRetired(clock);
     }
     if (retired.size() == retired.capacity()) {
         u64 oldest = retired.front().tick;
@@ -182,20 +186,39 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
                 oldest = item.tick;
             }
         }
-        scheduler.Wait(oldest);
-        DrainRetired(scheduler);
+        // Counters (this path is rare): the list full after a drain, and the case where its
+        // oldest entry is the tick being recorded, whose Wait submits in the middle of a draw.
+        static std::atomic<u64> full_events{};
+        static std::atomic<u64> current_events{};
+        static std::atomic<s64> last_report_s{};
+        const u64 full = full_events.fetch_add(1, std::memory_order_relaxed) + 1;
+        const u64 current = oldest >= clock.Now()
+                                ? current_events.fetch_add(1, std::memory_order_relaxed) + 1
+                                : current_events.load(std::memory_order_relaxed);
+        const s64 now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+        if (full <= 4 || now_s - last_report_s.load(std::memory_order_relaxed) >= 60) {
+            last_report_s.store(now_s, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "Multi-range retired list full ({} entries) {} times, {} of them on the tick "
+                     "being recorded (a submit mid-draw)",
+                     retired.capacity(), full, current);
+        }
+        clock.Wait(oldest);
+        DrainRetired(clock);
     }
     retired.push_back(Retired{
         .handle = std::move(entry.sparse_handle),
         .gathered = std::move(entry.gathered),
-        .tick = scheduler.CurrentTick(),
+        .tick = clock.Now(),
     });
 }
 
-void MultiRangeBufferCache::DrainRetired(Scheduler& scheduler) {
+void MultiRangeBufferCache::DrainRetired(SeamClock& clock) {
     size_t index = 0;
     while (index < retired.size()) {
-        if (scheduler.IsFree(retired[index].tick)) {
+        if (clock.IsFree(retired[index].tick)) {
             if (index + 1 != retired.size()) {
                 retired[index] = std::move(retired.back());
             }
@@ -206,7 +229,7 @@ void MultiRangeBufferCache::DrainRetired(Scheduler& scheduler) {
     }
 }
 
-MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& scheduler,
+MultiRangeRef MultiRangeBufferCache::Get(const Device& device, SeamClock& clock,
                                          MemoryAllocator& memory_allocator, u64 key,
                                          std::span<const MultiRangeSource> sources,
                                          VkDeviceSize total) {
@@ -214,7 +237,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
         return MultiRangeRef{};
     }
     if (!retired.empty()) {
-        DrainRetired(scheduler);
+        DrainRetired(clock);
     }
     const u64 geometry = HashSources(sources);
     const u64 content = HashContent(sources);
@@ -240,7 +263,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
         return ref;
     }
     if (it != entries.end()) {
-        RetireEntry(scheduler, it->second);
+        RetireEntry(clock, it->second);
         entries.erase(it);
     }
 
@@ -249,7 +272,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
     entry.content = content;
     entry.size = total;
     if (CanBindSparse(sources)) {
-        entry.sparse_handle = CreateSparse(device, scheduler, sources, total);
+        entry.sparse_handle = CreateSparse(device, clock, sources, total);
         if (entry.sparse_handle) {
             entry.owners.reserve(sources.size());
             for (const MultiRangeSource& source : sources) {
@@ -307,7 +330,7 @@ void MultiRangeBufferCache::MarkGathered(u64 key) {
     }
 }
 
-void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+void MultiRangeBufferCache::DropOwner(SeamClock& clock, VkBuffer owner) {
     if (owner == VK_NULL_HANDLE) {
         return;
     }
@@ -324,7 +347,7 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
             ++it;
             continue;
         }
-        RetireEntry(scheduler, entry);
+        RetireEntry(clock, entry);
         it = entries.erase(it);
     }
 }

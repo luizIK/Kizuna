@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -92,40 +91,32 @@ constexpr u64 RECURRING_CLEAR_WINDOW = 4;
     return DrawTargetClass::Recurring;
 }
 
-/// Kizuna: whether a target was written in two render frames in a row, the last of them this
-/// one or the one before (from its last two distinct write frames, ~0 = none). A target the game
-/// redraws every frame without a full clear (shadow cascades, a half-resolution depth, HDR probes;
-/// cleared by a draw or a partial clear) classifies as Persistent, so its draws waited for every
-/// new pipeline: the game froze for the driver's whole compile (2026-11-11, up to 5 s on an
-/// RX 6600 entering a new area). Such a draw skipped is missing for a frame, as for a Recurring
-/// target. A layer the game renders once is not written frame after frame.
-[[nodiscard]] constexpr bool RedrawnEveryFrame(u64 last_write_frame, u64 previous_write_frame,
-                                               u64 render_frame) noexcept {
+/// Consecutive render frames a target must have been written in, this one included, to count as
+/// redrawn every frame although the game never fully clears it (a scene colour target the sky or
+/// terrain covers instead of a clear). FRITCHII_ASYNC_REDRAWN, see ClassifyDrawTargets.
+constexpr u32 REDRAWN_WRITE_FRAMES = 8;
+
+/// The run of consecutive render frames with a write, after a write in render_frame, from the
+/// frame of the image's previous write (~0 = none, or contents discarded) and the run up to it.
+/// Several writes in one frame count once; a frame without a write starts the run again.
+[[nodiscard]] constexpr u32 NextWriteStreak(u64 last_write_frame, u32 streak,
+                                            u64 render_frame) noexcept {
     constexpr u64 Never = ~u64{0};
-    if (last_write_frame == Never || previous_write_frame == Never ||
-        last_write_frame > render_frame || previous_write_frame >= last_write_frame) {
-        return false;
+    if (last_write_frame == render_frame) {
+        return streak == 0 ? 1 : streak;
     }
-    return render_frame - last_write_frame <= 1 && last_write_frame - previous_write_frame == 1;
+    if (last_write_frame != Never && last_write_frame + 1 == render_frame && streak != 0) {
+        return streak + 1;
+    }
+    return 1;
 }
 
-/// Kizuna: render frames apart two writes may be for a scene-format target (depth, float, 10-bit;
-/// TextureCache::IsSceneTargetFormat) to count as a per-frame target.
-constexpr u64 PERIODIC_REDRAW_WINDOW = 8;
-
-/// Kizuna: RedrawnEveryFrame for targets the game updates in turns: the reflection probes'
-/// 128x128 B10G11R11 faces are each drawn every few frames, never in two frames in a row, so
-/// their draws waited for every new pipeline (366 ms held at once, 2026-11-12). A skipped draw is
-/// missing until the face's next turn, a few frames later.
-[[nodiscard]] constexpr bool RedrawnPeriodically(u64 last_write_frame, u64 previous_write_frame,
-                                                 u64 render_frame) noexcept {
-    constexpr u64 Never = ~u64{0};
-    if (last_write_frame == Never || previous_write_frame == Never ||
-        last_write_frame > render_frame || previous_write_frame >= last_write_frame) {
-        return false;
-    }
-    return render_frame - last_write_frame <= PERIODIC_REDRAW_WINDOW &&
-           last_write_frame - previous_write_frame <= PERIODIC_REDRAW_WINDOW;
+/// Whether a target not cleared in this render frame is still one the game draws every frame:
+/// already written in this one and in each of the REDRAWN_WRITE_FRAMES - 1 before. A layer the
+/// game renders once, or now and then, never is.
+[[nodiscard]] constexpr bool IsRedrawnTarget(u64 last_write_frame, u32 streak,
+                                             u64 render_frame) noexcept {
+    return last_write_frame == render_frame && streak >= REDRAWN_WRITE_FRAMES;
 }
 
 enum class RelaxedOptions : u32 {

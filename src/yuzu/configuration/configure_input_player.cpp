@@ -27,6 +27,7 @@
 #include "yuzu/configuration/configure_input_player_widget.h"
 #include "yuzu/configuration/configure_mouse_panning.h"
 #include "yuzu/configuration/input_profiles.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/util/limitable_input_dialog.h"
 
 const std::array<std::string, ConfigureInputPlayer::ANALOG_SUB_BUTTONS_NUM>
@@ -320,6 +321,10 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
         emulated_controller->EnableConfiguration();
     }
     ui->setupUi(this);
+    if (FritchiiUi::Enabled()) {
+        // 60 characters made the device box push the controller preview off the page.
+        ui->comboDevices->setMinimumContentsLength(20);
+    }
 
     setFocusPolicy(Qt::ClickFocus);
 

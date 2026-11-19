@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -170,7 +169,6 @@ public:
         GenerateEdenPath(EdenPath::KeysDir, eden_path / KEYS_DIR);
         GenerateEdenPath(EdenPath::LoadDir, eden_path / LOAD_DIR);
         GenerateEdenPath(EdenPath::LogDir, eden_path / LOG_DIR);
-        GenerateEdenPath(EdenPath::LosslessDir, eden_path / LOSSLESS_DIR);
         GenerateEdenPath(EdenPath::NANDDir, eden_path / NAND_DIR);
         GenerateEdenPath(EdenPath::PlayTimeDir, eden_path / PLAY_TIME_DIR);
         GenerateEdenPath(EdenPath::PostPresetDir, eden_path / POST_PRESET_DIR);
@@ -371,7 +369,7 @@ fs::path GetAppDataRoamingDirectory() {
 fs::path GetHomeDirectory() {
     const char* home_env_var = getenv("HOME");
 
-    if (home_env_var) {
+    if (home_env_var && *home_env_var != '\0') {
         return fs::path{home_env_var};
     }
 
@@ -392,7 +390,9 @@ fs::path GetHomeDirectory() {
 fs::path GetDataDirectory(const std::string& env_name) {
     const char* data_env_var = getenv(env_name.c_str());
 
-    if (data_env_var) {
+    // The XDG spec says to ignore an empty or relative value, which would otherwise put the
+    // data directory under the current working directory.
+    if (data_env_var && fs::path{data_env_var}.is_absolute()) {
         return fs::path{data_env_var};
     }
 

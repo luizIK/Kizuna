@@ -220,7 +220,7 @@ TEST_CASE("Release requests handle HTTP failures without throwing", "[updater]")
     httplib::Server server;
     server.Get("/releases", [status](const httplib::Request& request, httplib::Response& response) {
         response.status =
-            request.get_header_value("User-Agent") == "Lichii" &&
+            request.get_header_value("User-Agent") == "Fritchii" &&
                     request.get_header_value("Accept") == "application/vnd.github+json"
                 ? status
                 : 400;

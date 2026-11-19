@@ -62,7 +62,7 @@ if (USE_DISCORD_PRESENCE)
     target_compile_definitions(qt_common PUBLIC USE_DISCORD_PRESENCE)
 endif()
 
-# TODO(crueter)
+# TODO
 target_link_libraries(qt_common PRIVATE Qt6::Widgets)
 
 target_compile_definitions(qt_common PUBLIC

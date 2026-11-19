@@ -1,6 +1,6 @@
 name: kizuna-windows
 
-# Kizuna: Windows build of this fork, based on Fritchii v5.8.4. MinGW clang with the repo's PGO
+# Kizuna: Windows build of this fork, based on Fritchii v6.2. MinGW clang with the repo's PGO
 # profile, the same build release-binaries.yml calls windows-x86_64-pgo. The MSVC build is not
 # used: frizti_settings.cpp declares parameters named `values`, which MSVC rejects (C4459, an
 # error here). Warnings are not errors (ENABLE_WERROR=OFF): clang's -Wshadow also stops v5.8.4,

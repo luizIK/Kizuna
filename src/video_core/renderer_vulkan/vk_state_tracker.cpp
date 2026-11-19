@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -262,8 +261,11 @@ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
 }
 
 void StateTracker::InvalidateState() {
+    ++vertex_input_generation;
     flags->set();
+    VideoCommon::ESplit::NoteTrackerInvalidation(flags); // FRITCHII_ESPLIT_COUNT >= 2
     current_topology = INVALID_TOPOLOGY;
+    current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     stencil_reset = true;
 }
 

@@ -265,6 +265,15 @@ public slots:
     void OnTasStateChanged();
 
 private:
+    /// Applies the Frizti tuned settings once per revision and undoes other builds' changes to
+    /// them (common/frizti_settings.h).
+    enum class FriztiStart {
+        Silent,   ///< sets the tuned values when the revision is new (fresh config, Reset)
+        AskFirst, ///< app start: a player with an earlier version's settings is asked first
+        Keep,     ///< after Restore Settings: the restored settings stay, this revision handled
+    };
+    void MigrateFriztiSettings(FriztiStart start = FriztiStart::Silent);
+
     /// Updates an action's shortcut and text to reflect an updated hotkey from the hotkey registry.
     void LinkActionShortcut(QAction* action, const QString& action_name,
                             const bool tas_allowed = false);
@@ -390,9 +399,6 @@ private slots:
     void OnConfigure();
     /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
     void AskOotFrameRate();
-    /// Applies the Frizti tuned settings once per revision and undoes other builds' changes to
-    /// them (common/frizti_settings.h).
-    void MigrateFriztiSettings();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
@@ -415,8 +421,13 @@ private slots:
     void OnExportLog();
     /// A critical error box; Fritchii builds add an "Export Log..." button next to OK.
     void ShowErrorWithExportLog(const QString& title, const QString& text);
-    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in Lichii builds.
+    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in other builds.
     void SetUpFritchiiUi();
+    /// Help > Profiling Mode and, while it is on, its banner and status bar label
+    /// (util/profiling_mode).
+    void SetUpProfilingMode();
+    /// Tools > Switches (fritchii/switches_window): the player's nx2_switches.txt.
+    void SetUpSwitchesWindow();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -493,8 +504,6 @@ private:
     bool ToggleOotHighRefresh();
     /// Kizuna: `text` in the status bar and, while a game runs, over it (fullscreen too).
     void ShowGameNotice(const QString& text);
-    /// Kizuna (Ctrl+G): frame generation on (at its multiplier) or off, live.
-    void ToggleFrameGeneration();
     /// Kizuna: a notice over the game while Windows has under 3 GiB of commit left.
     void WarnLowSystemMemory();
     /// Switches Ocarina of Time's high refresh rate mode while it runs, saves the setting when it
@@ -614,7 +623,7 @@ private:
     std::unique_ptr<QtConfig> config;
     bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
-    // Whether emulation is currently running in yuzu.
+    // Whether emulation is currently running.
     bool emulation_running = false;
     bool boot_in_progress = false;
     bool close_pending = false;

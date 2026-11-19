@@ -59,6 +59,9 @@ public:
     void EmitCallWithReturnPointer(BlockOfCode& code, std::function<void(Xbyak::Reg64, RegList)> fn) const override;
 
 private:
+    /// reg = arg (Fritchii: from the state block for a per-core object, FRITCHII_JIT_STATE_REFS).
+    void EmitArg(BlockOfCode& code, const Xbyak::Reg64& reg) const;
+
     void (*fn)();
     u64 arg;
 };

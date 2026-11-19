@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <limits>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -14,13 +14,17 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/vk_buffer_recycler.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_mem_stage.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+#include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/vk_side_queue.h"
 
 namespace Vulkan {
 
@@ -86,8 +90,10 @@ private:
     };
 
     const Device* device{};
-    Scheduler* scheduler{};
-    vk::Buffer buffer;
+    const SeamClock* clock{};
+    /// EXP104: may be larger than SizeBytes() (its size class), and goes back to the pool when
+    /// this Buffer is destroyed. Declared before the views, so they are destroyed first.
+    RecycledBuffer buffer;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};
@@ -110,7 +116,29 @@ public:
                                 Scheduler& scheduler_, StagingBufferPool& staging_pool_,
                                 GuestDescriptorQueue& guest_descriptor_queue,
                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue,
-                                DescriptorPool& descriptor_pool);
+                                DescriptorPool& descriptor_pool, MemStage& mem_stage,
+                                SeamClock& clock);
+    ~BufferCacheRuntime();
+
+    /// The back's way to the seam and its player (memory stage spec 5.4: never from GPUMem).
+    [[nodiscard]] MemStage& Seam() noexcept {
+        MemPlayer::CheckBack("runtime.Seam()");
+        return mem_stage;
+    }
+
+    [[nodiscard]] SeamClock& Clock() noexcept {
+        return clock;
+    }
+
+    [[nodiscard]] MemPlayer& Player() noexcept {
+        MemPlayer::CheckBack("runtime.Player()");
+        return mem_stage.Player();
+    }
+
+    /// The fence commit's fill bracket (FenceManager): its downloads are played as it ends.
+    [[nodiscard]] MemStage::FillPlay FenceCommitBracket() {
+        return MemStage::FillPlay{mem_stage, MemStage::Site::Fence};
+    }
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
@@ -121,14 +149,36 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
+    bool AnyVertexRepacked() const {
+        return vertex_repack_mask != 0;
+    }
+
+    [[nodiscard]] u32 RepackMask() const noexcept {
+        return vertex_repack_mask;
+    }
+
+    /// The clock's stamp (SeamClock: a scheduler tick, or a packet number with
+    /// FRITCHII_MEMSTAGE_TICKS). IsFree, Wait, WaitSubmittedTick, WaitForHostRead and IsFreeNow
+    /// take these, as does what SubmitForHostRead returns.
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);
 
+    /// Changes exactly when the scheduler's tick does (one thread): the stream uniform reuse's
+    /// "the stream copy is still there" test (vk_mem_stage.cpp, "Packet ticks").
+    [[nodiscard]] u64 StreamEpoch() const noexcept {
+        return clock.Epoch();
+    }
+
+    /// Whether a buffer deleted at `stamp` may be destroyed once its frames have passed.
+    [[nodiscard]] bool DeletedBufferFree(u64 stamp);
+    void NoteHeldBuffers(u64 newly_held);
+
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick, u64 writer = 0);
+    /// `tick`: a scheduler tick (WaitSubmittedTick translated the stamp).
     void WaitSubmittedTickImpl(u64 tick);
 
     void Finish();
@@ -143,6 +193,60 @@ public:
     /// Whether the host GPU completed `tick`, asking it when the tick is submitted but not known
     /// to be done.
     [[nodiscard]] bool IsFreeNow(u64 tick);
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: the scheduler tick `stamp` is recorded
+    /// in (the open one when it is not published yet), the scheduler's current tick, and the host
+    /// GPU's completed tick (refreshed).
+    struct ReadTicks {
+        u64 write;
+        u64 current;
+        u64 known;
+    };
+    [[nodiscard]] ReadTicks ReadWriterTicks(u64 stamp);
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: false when scheduler tick `tick` is not
+    /// submitted (nothing done: no flush is asked for); else waits until the host GPU ran it.
+    bool WaitTickIfSubmitted(u64 tick);
+
+    /// FRITCHII_SUBMIT_TIMES (diagnostic), on any thread: the GPU's start and end of the
+    /// scheduler ticks [first, last] (those it ran), as busy time and gaps.
+    struct AheadTimes {
+        u32 submissions;
+        u32 resolved;
+        u64 busy_ns;
+        u64 gap_ns;
+        u64 overlap_ns;
+        u64 span_ns;
+    };
+    [[nodiscard]] AheadTimes MeasureSubmissions(u64 first, u64 last);
+
+    /// FRITCHII_READ_SIDE_COPY >= 2 (vk_side_queue.h): whether the side queue is there (made on
+    /// the first ask; the device must have been made with it).
+    [[nodiscard]] bool SideCopyReady();
+
+    /// One region of a side copy: from a buffer cache buffer into a download staging buffer.
+    struct SideCopyRegion {
+        VkBuffer src;
+        VkBuffer dst;
+        u64 src_offset;
+        u64 dst_offset;
+        u64 size;
+    };
+    /// Submits `regions` on the side queue after the main queue ran scheduler tick `main_tick`;
+    /// returns the side value (0: not submitted). Every later main submission waits for it.
+    [[nodiscard]] u64 SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions);
+    [[nodiscard]] bool SideDone(u64 value);
+    void WaitSide(u64 value);
+    /// FRITCHII_READ_SIDE_COPY: the side queue's and the main queue's counts since the last call
+    /// (raised waits, slow host waits, main submissions that waited, must-be-0 unsubmitted).
+    struct SideQueueStats {
+        u64 raised;
+        u64 slow_waits;
+        u64 not_queued;
+        u64 main_waits;
+        u64 unsubmitted;
+    };
+    [[nodiscard]] SideQueueStats TakeSideQueueStats();
 
     u64 GetDeviceLocalMemory() const;
 
@@ -205,7 +309,8 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
-        const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+        const StagingBufferRef ref = staging_pool.Request(
+            size, MemoryUsage::Upload, false, VideoCommon::BufferChurnStats::StagingCaller::UniformStream);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
@@ -225,7 +330,8 @@ public:
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+            DescriptorForm(), ref.buffer, ref.device_address, ref.offset, size));
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -265,7 +371,7 @@ public:
     }
 
     void OnBufferDeleted(const Buffer& buffer) {
-        multi_range_buffers.DropOwner(scheduler, buffer.Handle());
+        multi_range_buffers.DropOwner(clock, buffer.Handle());
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
@@ -283,9 +389,10 @@ public:
         if (format == VideoCore::Surface::PixelFormat::Invalid) {
             format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
-                                              TexelBufferFormat(format));
+        const VkBufferView view = buffer.View(offset, size, format);
+        mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeTexelEntry(
+            DescriptorForm(), view, buffer.DeviceAddress(), offset, size,
+            TexelBufferFormat(format)), true);
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -299,11 +406,20 @@ public:
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
+        const bool descriptor_buffer = DescriptorForm();
         if (handle == VK_NULL_HANDLE) {
-            guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
+            mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+                descriptor_buffer, handle, 0, 0, VK_WHOLE_SIZE));
         } else {
-            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, size);
+            mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+                descriptor_buffer, handle, buffer.DeviceAddress(), offset, size));
         }
+    }
+
+    /// The form of the descriptor entries pushed now: a held fill's pipeline's (SEAM = 2 fills
+    /// before Acquire), else the queue's.
+    [[nodiscard]] bool DescriptorForm() const noexcept {
+        return mem_stage.DescriptorForm(guest_descriptor_queue.UsesDescriptorBuffer());
     }
 
     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
@@ -311,11 +427,21 @@ private:
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
 
+    /// A buffer cache buffer of at least `size` bytes: with EXP104, rounded up to its size class
+    /// and taken from the staging pool's BufferRecycler when one is free there.
+    RecycledBuffer CreateCacheBuffer(u64 size, bool sparse_compatible);
+
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+    MemStage& mem_stage;
+    SeamClock& clock;
+
+    /// FRITCHII_READ_SIDE_COPY >= 2: made on the first SideCopyReady.
+    std::unique_ptr<SideQueue> side_queue;
+    std::once_flag side_queue_once;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
@@ -336,13 +462,6 @@ private:
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
-
-    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
-    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
-    VkDeviceSize bound_index_offset = 0;
-    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
-    u64 bound_index_epoch = 0;
-    bool bound_index_valid = false;
 };
 
 struct BufferCacheParams {

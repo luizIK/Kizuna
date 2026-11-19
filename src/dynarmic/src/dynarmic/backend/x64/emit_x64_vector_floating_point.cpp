@@ -7,12 +7,17 @@
  */
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <limits>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "dynarmic/mcl/function_info.hpp"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include "dynarmic/backend/x64/xbyak.h"
@@ -1710,11 +1715,136 @@ void EmitX64::EmitFPVectorRoundInt64(EmitContext& ctx, IR::Inst* inst) {
     EmitFPVectorRoundInt<64>(code, ctx, inst);
 }
 
+namespace {
+
+// Fritchii: FRITCHII_JIT_RSQRT_ZERO (boot, default 0; fable_a_gameceiling_answer 12.5). The vector
+// reciprocal square root estimate's inline path sends the whole vector to C++ when any lane is a
+// NaN, negative, zero or denormal. 1 = count those calls by lane kind (a line every 10 s);
+// 2 = also handle vectors whose only such lanes are exact zeros inline (+-infinity, FPSR.DZC),
+// with the host's exception flags put back as the C++ estimate leaves them.
+int RSqrtZeroMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("FRITCHII_JIT_RSQRT_ZERO");
+        int value = text == nullptr ? 0 : std::atoi(text);
+        if (value < 0 || value > 2) {
+            value = 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_RSQRT_ZERO={}: {}", value,
+                     value == 1 ? "counting the vector reciprocal square root estimate's fallbacks"
+                                : "zero lanes of the vector reciprocal square root estimate inline");
+        }
+        return value;
+    }();
+    return mode;
+}
+
+struct RSqrtFallbackCounters {
+    std::atomic<u64> calls{};     ///< vectors that went to C++ (32 and 64-bit lanes)
+    std::atomic<u64> zero_only{}; ///< of them, whose only bad lanes are exact zeros
+    std::atomic<u64> zero{};      ///< lanes, by kind
+    std::atomic<u64> denormal{};
+    std::atomic<u64> negative{};
+    std::atomic<u64> nan{};
+    std::atomic<u64> infinity{};  ///< +infinity (the inline path's check catches it too)
+    std::array<std::atomic<u64>, 4> zero_by_lane{};
+    std::atomic<s64> last_ns{0};
+    std::mutex log_mutex;
+    std::array<u64, 11> logged{};
+};
+RSqrtFallbackCounters g_rsqrt_fallbacks;
+
+/// Integer math only: this runs on a guest core with the guest's MXCSR, whose exception flags
+/// the guest reads back as FPSR.
+void LogRSqrtFallbacks() {
+    RSqrtFallbackCounters& c = g_rsqrt_fallbacks;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = c.last_ns.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 10'000'000'000LL) {
+        return;
+    }
+    std::unique_lock lock{c.log_mutex, std::try_to_lock};
+    if (!lock.owns_lock() || !c.last_ns.compare_exchange_strong(last, now)) {
+        return;
+    }
+    const std::array<u64, 11> values{
+        c.calls.load(std::memory_order_relaxed),     c.zero_only.load(std::memory_order_relaxed),
+        c.zero.load(std::memory_order_relaxed),      c.denormal.load(std::memory_order_relaxed),
+        c.negative.load(std::memory_order_relaxed),  c.nan.load(std::memory_order_relaxed),
+        c.zero_by_lane[0].load(std::memory_order_relaxed), c.zero_by_lane[1].load(std::memory_order_relaxed),
+        c.zero_by_lane[2].load(std::memory_order_relaxed), c.zero_by_lane[3].load(std::memory_order_relaxed),
+        c.infinity.load(std::memory_order_relaxed),
+    };
+    if (last != 0) {
+        const u64 ms = (std::max)(u64(now - last) / 1'000'000, u64{1});
+        std::array<u64, 11> d{};
+        for (size_t i = 0; i < d.size(); ++i) {
+            d[i] = (values[i] - c.logged[i]) * 1000 / ms;
+        }
+        LOG_INFO(Core_ARM,
+                 "JIT vector rsqrt estimate fallbacks (FRITCHII_JIT_RSQRT_ZERO={}) {} ms: calls {}/s, "
+                 "only zero lanes bad {}/s ({}%); lanes/s: zero {}, denormal {}, negative {}, NaN {}, "
+                 "+infinity {}; zero lanes by lane {}/{}/{}/{}",
+                 RSqrtZeroMode(), ms, d[0], d[1], d[0] == 0 ? 0 : d[1] * 100 / d[0], d[2], d[3],
+                 d[4], d[5], d[10], d[6], d[7], d[8], d[9]);
+    }
+    c.logged = values;
+}
+
+template<typename FPT>
+void CountRSqrtFallback(const VectorArray<FPT>& operand) {
+    RSqrtFallbackCounters& c = g_rsqrt_fallbacks;
+    bool other_bad = false;
+    bool any_zero = false;
+    for (size_t i = 0; i < operand.size(); ++i) {
+        const FPT value = operand[i];
+        const FPT exponent = value & FPT(FP::FPInfo<FPT>::exponent_mask);
+        const FPT mantissa = value & FPT(FP::FPInfo<FPT>::mantissa_mask);
+        const bool sign = (value & FPT(FP::FPInfo<FPT>::sign_mask)) != 0;
+        if (exponent == FPT(FP::FPInfo<FPT>::exponent_mask) && mantissa != 0) {
+            c.nan.fetch_add(1, std::memory_order_relaxed);
+            other_bad = true;
+        } else if (exponent == 0 && mantissa == 0) {
+            c.zero.fetch_add(1, std::memory_order_relaxed);
+            if (i < c.zero_by_lane.size()) {
+                c.zero_by_lane[i].fetch_add(1, std::memory_order_relaxed);
+            }
+            any_zero = true;
+        } else if (sign) {
+            c.negative.fetch_add(1, std::memory_order_relaxed);
+            other_bad = true;
+        } else if (exponent == FPT(FP::FPInfo<FPT>::exponent_mask)) {
+            c.infinity.fetch_add(1, std::memory_order_relaxed);
+            other_bad = true;
+        } else if (exponent == 0) {
+            c.denormal.fetch_add(1, std::memory_order_relaxed);
+            other_bad = true;
+        }
+    }
+    if (any_zero && !other_bad) {
+        c.zero_only.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((c.calls.fetch_add(1, std::memory_order_relaxed) & 0xfff) == 0) {
+        LogRSqrtFallbacks();
+    }
+}
+
+}  // namespace
+
 template<size_t fsize>
 static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     using FPT = mcl::unsigned_integer_of_size<fsize>;
 
     const auto fallback_fn = [](VectorArray<FPT>& result, const VectorArray<FPT>& operand, FP::FPCR fpcr, FP::FPSR& fpsr) {
+        for (size_t i = 0; i < result.size(); i++) {
+            result[i] = FP::FPRSqrtEstimate<FPT>(operand[i], fpcr, fpsr);
+        }
+    };
+    // FRITCHII_JIT_RSQRT_ZERO: the same, counting why the vector came here.
+    [[maybe_unused]] const auto counting_fallback_fn = [](VectorArray<FPT>& result, const VectorArray<FPT>& operand, FP::FPCR fpcr, FP::FPSR& fpsr) {
+        CountRSqrtFallback<FPT>(operand);
         for (size_t i = 0; i < result.size(); i++) {
             result[i] = FP::FPRSqrtEstimate<FPT>(operand[i], fpcr, fpsr);
         }
@@ -1745,10 +1875,14 @@ static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
         if (code.HasHostFeature(HostFeature::AVX)) {
             auto args = ctx.reg_alloc.GetArgumentInfo(inst);
             const bool fpcr_controlled = args[1].GetImmediateU1();
+            const int zero_mode = RSqrtZeroMode();
+            // =2 needs the C++ estimate's zero case to be a plain DZC (no trap enabled).
+            const bool zero_inline = zero_mode == 2 && !ctx.FPCR(fpcr_controlled).DZE();
 
             const Xbyak::Xmm operand = ctx.reg_alloc.UseXmm(code, args[0]);
             const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
             const Xbyak::Xmm value = ctx.reg_alloc.ScratchXmm(code);
+            const Xbyak::Xmm zeros = zero_inline ? ctx.reg_alloc.ScratchXmm(code) : Xbyak::Xmm{};
 
             SharedLabel bad_values = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
 
@@ -1774,9 +1908,45 @@ static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
 
             ctx.deferred_emits.emplace_back([=, &code, &ctx] {
                 code.L(*bad_values);
+                if (zero_inline) {
+                    // FRITCHII_JIT_RSQRT_ZERO=2. Here: result = the bad lanes (all ones), value =
+                    // the operand with its low mantissa bits replaced, xmm0 = the mask above.
+                    Xbyak::Label other_bad;
+                    // zeros = lanes that are +0 or -0 exactly.
+                    code.vpand(zeros, operand, GetVectorOf<fsize, (fsize == 32 ? 0x7FFFFFFF : 0x7FFF'FFFF'FFFF'FFFF)>(code));
+                    ICODE(vpcmpeq)(zeros, zeros, GetVectorOf<fsize, 0>(code));
+                    // CF = no bad lane outside the zero lanes.
+                    code.vptest(zeros, result);
+                    code.jnc(other_bad, code.T_NEAR);
+                    // The other lanes as the inline path computes them, the zero lanes from 1.0
+                    // (no exception), and the host's exception flags as they were: the C++
+                    // estimate raises none but the zero lanes' DZC (set below).
+                    FCODE(vblendvp)(value, value, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code), zeros);
+                    code.lea(rsp, ptr[rsp - 8]);
+                    code.stmxcsr(dword[rsp]);
+                    FCODE(sqrtp)(value, value);
+                    code.vmovaps(result, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code));
+                    FCODE(divp)(result, value);
+                    ICODE(padd)(result, GetVectorOf<fsize, (fsize == 32 ? 0x00004000 : 0x0000'0800'0000'0000)>(code));
+                    code.pand(result, xmm0);
+                    code.ldmxcsr(dword[rsp]);
+                    code.lea(rsp, ptr[rsp + 8]);
+                    // Zero lanes: infinity with the zero's sign.
+                    code.vpand(value, operand, GetVectorOf<fsize, (fsize == 32 ? 0x80000000 : 0x8000'0000'0000'0000)>(code));
+                    code.vpor(value, value, GetVectorOf<fsize, (fsize == 32 ? 0x7F800000 : 0x7FF0'0000'0000'0000)>(code));
+                    FCODE(vblendvp)(result, result, value, zeros);
+                    // FPSR.DZC, as FPProcessException(DivideByZero) sets it.
+                    code.or_(dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_fpsr_exc], u32(1) << 1);
+                    code.jmp(*end, code.T_NEAR);
+                    code.L(other_bad);
+                }
                 code.lea(rsp, ptr[rsp - 8]);
                 ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(result.getIdx()));
-                EmitTwoOpFallbackWithoutRegAlloc(code, ctx, result, operand, fallback_fn, fpcr_controlled);
+                if (zero_mode != 0) {
+                    EmitTwoOpFallbackWithoutRegAlloc(code, ctx, result, operand, counting_fallback_fn, fpcr_controlled);
+                } else {
+                    EmitTwoOpFallbackWithoutRegAlloc(code, ctx, result, operand, fallback_fn, fpcr_controlled);
+                }
                 ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(result.getIdx()));
                 code.add(rsp, 8);
                 code.jmp(*end, code.T_NEAR);

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -121,6 +120,10 @@ private:
         return kernel.GlobalSchedulerContext().m_priority_queue;
     }
     static u64 UpdateHighestPriorityThreadsImpl(KernelCore& kernel);
+
+    // EXP98 1 and 2 (k_scheduler.cpp): the two yields with the per core early return.
+    static void YieldWithoutCoreMigrationExp98(KernelCore& kernel, int mode);
+    static void YieldWithCoreMigrationExp98(KernelCore& kernel, int mode);
 
     static void RescheduleCurrentHLEThread(KernelCore& kernel);
 

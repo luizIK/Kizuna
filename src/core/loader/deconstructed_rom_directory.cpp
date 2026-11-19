@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -112,29 +111,7 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
         }
     }
 
-    const auto build_from = [](const FileSys::VirtualDir& romfs_dir) -> FileSys::VirtualFile {
-        if (romfs_dir == nullptr) {
-            return nullptr;
-        }
-        // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
-        // MiB), so loaders of the same directory share one build while any of them holds it.
-        static std::mutex cache_mutex;
-        static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
-        std::scoped_lock lk{cache_mutex};
-        auto& cached = cache[romfs_dir->GetFullPath()];
-        if (auto built = cached.lock()) {
-            return built;
-        }
-        LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
-        const auto started = std::chrono::steady_clock::now();
-        auto built = FileSys::CreateRomFS(romfs_dir);
-        LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - started)
-                     .count());
-        cached = built;
-        return built;
-    };
+    const auto build_from = BuildLooseRomFS;
 
     if (const auto parent = exefs_dir->GetParentDirectory()) {
         if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
@@ -281,6 +258,33 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
 }
 
 } // namespace
+
+FileSys::VirtualFile BuildLooseRomFS(const FileSys::VirtualDir& romfs_dir) {
+    if (romfs_dir == nullptr) {
+        return nullptr;
+    }
+    // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
+    // MiB), so loaders of the same directory share one build while any of them holds it. The NX
+    // tree loader's RomFS is the same directory as its executable loader's, so it shares it too.
+    static std::mutex cache_mutex;
+    static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
+    std::scoped_lock lk{cache_mutex};
+    auto& cached = cache[romfs_dir->GetFullPath()];
+    if (auto built = cached.lock()) {
+        LOG_INFO(Loader, "Loose RomFS image shared with another loader of {}",
+                 romfs_dir->GetFullPath());
+        return built;
+    }
+    LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
+    const auto started = std::chrono::steady_clock::now();
+    auto built = FileSys::CreateRomFS(romfs_dir);
+    LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - started)
+                 .count());
+    cached = built;
+    return built;
+}
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_)
     : AppLoader(std::move(file_))

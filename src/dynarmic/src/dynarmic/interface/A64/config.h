@@ -211,6 +211,22 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// Fritchii: the guest address the main image (its first module) was loaded at, 0 when not
+    /// known. It changes with every launch (address space randomisation), so diagnostics record
+    /// guest pcs as offsets from it (FRITCHII_JIT_DUMP, FRITCHII_JIT_DUMP_LIST). Changes no code.
+    std::uint64_t image_base = 0;
+
+    /// Diagnostics: when set, the x64 backend counts here the dispatcher's C++ block lookups,
+    /// the blocks it compiles and full code cache clears. The thread that runs the JIT writes
+    /// them (a clear asked for while it is idle runs on the asking thread); JITs that run on the
+    /// same host thread may share one.
+    struct Counters {
+        std::uint64_t block_lookups = 0;
+        std::uint64_t blocks_compiled = 0;
+        std::uint64_t cache_clears = 0;
+    };
+    Counters* counters = nullptr;
+
     /// Determines if we should detect memory accesses via page_table that straddle are
     /// misaligned. Accesses that straddle page boundaries will fallback to the relevant
     /// memory callback.
@@ -292,6 +308,17 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+
+    /// Fritchii (FRITCHII_JIT_INLINE_CNTPCT, x86-64 backend, with wall_clock_cntpct): CNTPCT_EL0
+    /// reads are computed in the block as the high 64 bits of lfence; rdtsc; lfence times
+    /// *inline_cntpct_factor, the same as the host's WallClock::GetCNTPCT. A factor of 0 (read at
+    /// run time) calls GetCNTPCT through a thunk that keeps every register. nullptr = always the
+    /// host call, as before.
+    const std::uint64_t* inline_cntpct_factor = nullptr;
+    /// With inline_cntpct_factor: the previous read (shared with the host callback). Two reads
+    /// closer than inline_cntpct_spin_ticks pause twice, as GetCNTPCT does. nullptr = no pause.
+    std::uint64_t* inline_cntpct_last = nullptr;
+    std::uint32_t inline_cntpct_spin_ticks = 0;
 
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.

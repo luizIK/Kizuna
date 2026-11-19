@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -21,13 +23,17 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/early_compute.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
+#include "video_core/texture_handle_values.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -189,7 +195,194 @@ void TraceUpscalerDispatch(UpscalerTrace& trace, const Shader::Info& info, u64 s
     log_views(info.texture_descriptors, "tex");
     log_views(info.image_descriptors, "img");
 }
+
+// FRITCHII_COMPUTE_FAST_FIRST's counts, logged every 10 s (ComputePipeline::ReportFastFirst).
+struct FastFirstWindow {
+    u64 served{};          ///< unoptimized builds that became the pipeline (dispatches used them)
+    double served_ms{};
+    u64 beaten{};          ///< unoptimized builds the optimized one beat (never bound, freed)
+    u64 failed{};          ///< unoptimized builds that made nothing (the optimized one served)
+    u64 optimized{};       ///< optimized builds of programs an unoptimized one served
+    u64 optimized_failed{};
+    double paired_fast_ms{};
+    double paired_optimized_ms{};
+    u64 swaps{};
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return served == 0 && beaten == 0 && failed == 0 && optimized == 0 &&
+               optimized_failed == 0 && swaps == 0;
+    }
+};
+
+/// A program an unoptimized build serves, until its optimized one is swapped in.
+struct FastFirstOpen {
+    const void* pipeline;
+    u64 hash;
+    std::chrono::steady_clock::time_point at;
+    bool optimized_done;
+    bool warned;
+};
+
+struct FastFirstState {
+    std::mutex mutex;
+    FastFirstWindow window;
+    std::vector<FastFirstOpen> open;
+    u64 stuck_total{};
+    u32 lines{};
+};
+
+/// Never destroyed: pipelines may be freed after static destruction began.
+FastFirstState& GetFastFirst() {
+    static FastFirstState* const state = new FastFirstState;
+    return *state;
+}
+
+/// Anything to report (ReportFastFirst returns at once while false).
+std::atomic_bool g_fast_first_seen{false};
+constexpr u32 FastFirstLineLimit = 64;
+
+void EraseOpenLocked(FastFirstState& state, const void* pipeline) {
+    std::erase_if(state.open,
+                  [pipeline](const FastFirstOpen& open) { return open.pipeline == pipeline; });
+}
+
+void ForgetFastFirst(const void* pipeline) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    EraseOpenLocked(state, pipeline);
+}
+
+void NoteFastBuild(const void* pipeline, u64 hash, bool served, double compile_ms,
+                   bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    // Under the lock: ReportFastFirst clears it under the lock when nothing is left.
+    g_fast_first_seen.store(true, std::memory_order_relaxed);
+    if (!served) {
+        ++state.window.beaten;
+        return;
+    }
+    ++state.window.served;
+    state.window.served_ms += compile_ms;
+    state.open.push_back({pipeline, hash, std::chrono::steady_clock::now(), false, false});
+    fast_open = true;
+    if (state.lines < FastFirstLineLimit) {
+        ++state.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute fast-first: pipeline {:016x} built unoptimized in {:.0f} ms "
+                 "(FRITCHII_COMPUTE_FAST_FIRST={}); its optimized build follows on its worker",
+                 hash, compile_ms, ComputePipeline::FastFirstMode());
+    }
+}
+
+void NoteFastFailed() {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    g_fast_first_seen.store(true, std::memory_order_relaxed);
+    ++state.window.failed;
+}
+
+void NoteOptimizedAfterFast(const void* pipeline, u64 hash, bool ok, double fast_ms,
+                            double optimized_ms, bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    if (!ok) {
+        ++state.window.optimized_failed;
+        EraseOpenLocked(state, pipeline);
+        fast_open = false;
+        LOG_WARNING(Render_Vulkan,
+                    "Compute fast-first: the optimized build of {:016x} failed, it keeps its "
+                    "unoptimized pipeline (same results, more GPU time)",
+                    hash);
+        return;
+    }
+    ++state.window.optimized;
+    state.window.paired_fast_ms += fast_ms;
+    state.window.paired_optimized_ms += optimized_ms;
+    for (FastFirstOpen& open : state.open) {
+        if (open.pipeline == pipeline) {
+            open.optimized_done = true;
+        }
+    }
+    if (state.lines < FastFirstLineLimit) {
+        ++state.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute fast-first: pipeline {:016x} optimized in {:.0f} ms (unoptimized: {:.0f} "
+                 "ms), swapped in at its next dispatch",
+                 hash, optimized_ms, fast_ms);
+    }
+}
+
+void NoteFastSwap(const void* pipeline, bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    ++state.window.swaps;
+    EraseOpenLocked(state, pipeline);
+    fast_open = false;
+}
 } // namespace
+
+void ComputePipeline::ReportFastFirst() {
+    if (!g_fast_first_seen.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // GPU thread only.
+    static std::chrono::steady_clock::time_point next_report{};
+    const auto now = std::chrono::steady_clock::now();
+    if (next_report == std::chrono::steady_clock::time_point{}) {
+        next_report = now + std::chrono::seconds{10};
+        return;
+    }
+    if (now < next_report) {
+        return;
+    }
+    next_report = now + std::chrono::seconds{10};
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    u64 waiting = 0;
+    u64 unswapped = 0;
+    u64 stuck = 0;
+    for (FastFirstOpen& open : state.open) {
+        if (open.optimized_done) {
+            ++unswapped; // built, not dispatched since
+            continue;
+        }
+        ++waiting;
+        if (now - open.at < std::chrono::seconds{30}) {
+            continue;
+        }
+        ++stuck;
+        if (!open.warned) {
+            open.warned = true;
+            ++state.stuck_total;
+            LOG_WARNING(Render_Vulkan,
+                        "Compute fast-first: pipeline {:016x} still runs unoptimized {:.0f} s "
+                        "after its unoptimized build, its optimized build has not ended (must "
+                        "be 0)",
+                        open.hash, std::chrono::duration<double>(now - open.at).count());
+        }
+    }
+    const FastFirstWindow window = std::exchange(state.window, FastFirstWindow{});
+    if (window.Empty() && stuck == 0) {
+        if (state.open.empty()) {
+            g_fast_first_seen.store(false, std::memory_order_relaxed);
+            next_report = {};
+        }
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute fast-first (FRITCHII_COMPUTE_FAST_FIRST={}) in the last 10 s: {} unoptimized "
+             "builds served dispatches ({:.0f} ms, {:.0f} ms each), {} beaten by the optimized "
+             "build, {} failed; {} optimized builds followed ({} failed), those programs {:.0f} ms "
+             "unoptimized vs {:.0f} ms optimized; {} swapped in; now {} waiting for their "
+             "optimized build, {} built and not dispatched since; must be 0: {} programs "
+             "unoptimized over 30 s ({} since boot)",
+             FastFirstMode(), window.served, window.served_ms,
+             window.served != 0 ? window.served_ms / static_cast<double>(window.served) : 0.0,
+             window.beaten, window.failed, window.optimized, window.optimized_failed,
+             window.paired_fast_ms, window.paired_optimized_ms, window.swaps, waiting, unswapped,
+             stuck, state.stuck_total);
+}
 
 void ComputePipeline::TickUpscalerTrace() {
     auto& trace{GetUpscalerTrace()};
@@ -210,10 +403,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
                                  vk::ShaderModule spv_module_, u64 shader_hash_,
                                  std::function<vk::ShaderModule()> make_module)
-    : device{device_},
+    : device{device_}, owner_scheduler{scheduler}, build_notify{shader_notify},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      make_module_fn(std::move(make_module)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -250,102 +444,46 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics, make_module = std::move(make_module)] {
-        if (make_module) {
-            // A precompiled pipeline's module, from the SPIR-V its preparation kept: made here,
-            // on the worker. Without one the build ends with no pipeline (BuildFailed), and the
-            // pipeline cache replaces it by a translated one at the next dispatch.
-            try {
-                spv_module = make_module();
-            } catch (const std::exception& exception) {
-                LOG_ERROR(Render_Vulkan, "Precompiled compute shader {:016X}: {}", shader_hash,
-                          exception.what());
-                std::scoped_lock lock{build_mutex};
-                is_built = true;
-                build_condvar.notify_one();
-                if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
-                }
-                return;
-            }
+    // FRITCHII_COMPUTE_FAST_FIRST: only builds queued at run time. The boot, warm-up and
+    // preparation builds run here on their own threads, and no dispatch waits for them. The
+    // programs always built unoptimized (BuildsUnoptimized) gain nothing from it.
+    fast_first_allowed = thread_worker != nullptr &&
+                         !BuildsUnoptimized(device.GetDriverID(), shader_hash);
+    auto func{[this, pipeline_statistics] {
+        if (!AcquireModule()) {
+            // No module (a precompiled one that could not be made): the build ends with no
+            // pipeline (BuildFailed), and the pipeline cache replaces it by a translated one at
+            // the next dispatch.
+            Publish(vk::Pipeline{}, true, 0.0);
+            return;
         }
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .requiredSubgroupSize = GuestWarpSize,
-        };
-        // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
-        // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
-                                   info.uses_quad_shuffles || info.uses_fswzadd ||
-                                   info.uses_cooperative_matrix;
-        VkPipelineCreateFlags flags{};
-        if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
-            flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-        }
-        if (uses_descriptor_buffer) {
-            flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-        }
-        if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
-            flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        }
-        const VkComputePipelineCreateInfo compute_ci{
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = flags,
-            .stage{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
-                             ? &subgroup_size_ci
-                             : nullptr,
-                .flags = info.uses_cooperative_matrix
-                             ? VkPipelineShaderStageCreateFlags{
-                                   VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
-                             : VkPipelineShaderStageCreateFlags{},
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                .module = *spv_module,
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            },
-            .layout = *pipeline_layout,
-            .basePipelineHandle = 0,
-            .basePipelineIndex = 0,
-        };
+        const auto begin = std::chrono::steady_clock::now();
+        vk::Pipeline made;
         try {
-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            // Through Fritchii's pipeline binary store when it is on (FRITCHII_PIPELINE_BINARY).
+            made = CreateHandle(false);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
-            std::scoped_lock lock{build_mutex};
-            is_built = true;
-            build_condvar.notify_one();
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+        }
+        const double compile_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                .count();
+        if (made) {
+            // Log compute pipeline creation
+            if (GPU::Logging::IsActive()) {
+                GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
+                    "ComputePipeline created"
+                );
             }
-            return;
-        }
-
-        // Log compute pipeline creation
-        if (GPU::Logging::IsActive()) {
-            GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
-                "ComputePipeline created"
-            );
-        }
-
-        if (pipeline_statistics) {
-            pipeline_statistics->Collect(device, *pipeline);
+            if (pipeline_statistics) {
+                pipeline_statistics->Collect(device, *made);
+            }
         }
         // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
-        // lives.
-        spv_module.reset();
-        std::scoped_lock lock{build_mutex};
-        is_built = true;
-        build_condvar.notify_one();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
-        }
+        // lives. An unoptimized build still compiling from it lets go of it last.
+        ReleaseModule(true);
+        Publish(std::move(made), true, compile_ms);
     }};
     build_task = std::move(func);
     if (thread_worker) {
@@ -360,26 +498,330 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 }
 
+ComputePipeline::~ComputePipeline() {
+    if (fast_open) {
+        ForgetFastFirst(this);
+    }
+}
+
+vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized) {
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
+    // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
+    const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                               info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                               info.uses_quad_shuffles || info.uses_fswzadd ||
+                               info.uses_cooperative_matrix;
+    // Shaders without them may be given a narrower size where the driver's choice spills
+    // (Intel, Device::NarrowComputeSubgroupSize).
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = uses_warp_ops
+                                    ? 0
+                                    : device.NarrowComputeSubgroupSize(info.uses_global_memory),
+    };
+    const void* const stage_next =
+        device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+            ? static_cast<const void*>(&subgroup_size_ci)
+        : narrow_subgroup_size_ci.requiredSubgroupSize != 0
+            ? static_cast<const void*>(&narrow_subgroup_size_ci)
+            : nullptr;
+    VkPipelineCreateFlags flags{};
+    if (!unoptimized && device.IsKhrPipelineExecutablePropertiesEnabled() &&
+        Settings::values.renderer_debug.GetValue()) {
+        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+    if (unoptimized || BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    const VkComputePipelineCreateInfo compute_ci{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = flags,
+        .stage{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = stage_next,
+            .flags = info.uses_cooperative_matrix
+                         ? VkPipelineShaderStageCreateFlags{
+                               VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+                         : VkPipelineShaderStageCreateFlags{},
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = *spv_module,
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        },
+        .layout = *pipeline_layout,
+        .basePipelineHandle = 0,
+        .basePipelineIndex = 0,
+    };
+    if (unoptimized) {
+        // FRITCHII_COMPUTE_FAST_FIRST: never stored. Not through the binary store or a pipeline
+        // cache, which keep the optimized build of this program for the next session.
+        return device.GetLogical().CreateComputePipeline(compute_ci);
+    }
+    return PipelineBinary::CreateComputePipeline(device, compute_ci, *pipeline_cache);
+}
+
+bool ComputePipeline::AcquireModule() {
+    std::scoped_lock lock{module_mutex};
+    if (!spv_module && make_module_fn && !module_release_due) {
+        // A precompiled pipeline's module, from the SPIR-V its preparation kept: made by the
+        // first build that needs it (its worker, or a dispatch's unoptimized build).
+        auto make = std::move(make_module_fn);
+        make_module_fn = nullptr;
+        try {
+            spv_module = make();
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Precompiled compute shader {:016X}: {}", shader_hash,
+                      exception.what());
+        }
+    }
+    if (!spv_module) {
+        return false;
+    }
+    ++module_users;
+    return true;
+}
+
+void ComputePipeline::ReleaseModule(bool optimized_done) {
+    std::scoped_lock lock{module_mutex};
+    --module_users;
+    module_release_due = module_release_due || optimized_done;
+    if (module_release_due && module_users == 0) {
+        spv_module.reset();
+    }
+}
+
+bool ComputePipeline::Publish(vk::Pipeline made, bool optimized, double compile_ms) {
+    const bool made_ok = static_cast<bool>(made);
+    bool first = false;
+    bool after_fast = false;
+    double served_fast_ms = 0.0;
+    {
+        std::scoped_lock lock{build_mutex};
+        if (!is_built.load(std::memory_order::relaxed)) {
+            // Nothing binds `pipeline` before is_built: Configure's build wait precedes the bind.
+            pipeline = std::move(made);
+            has_pipeline.store(made_ok, std::memory_order::release);
+            running_optimized = optimized;
+            if (!optimized) {
+                fast_ms = compile_ms;
+            }
+            built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                           std::memory_order::release);
+            is_built.store(true, std::memory_order::release);
+            // All waiters: the scheduler's wait in Configure and FRITCHII_ASYNC_COMPUTE_SKIP's
+            // bounded wait on the GPU thread can wait at once.
+            build_condvar.notify_all();
+            first = true;
+        } else if (optimized && !running_optimized) {
+            // An unoptimized build serves: this one is swapped in by the scheduler worker
+            // before its next bind (SwapInOptimized).
+            after_fast = true;
+            served_fast_ms = fast_ms;
+            if (made_ok) {
+                optimized_pipeline = std::move(made);
+                optimized_ready.store(true, std::memory_order::release);
+            }
+        }
+        // Otherwise `made` lost the race (an unoptimized build after the optimized one): it was
+        // never bound, and is destroyed when this returns.
+    }
+    if (first && build_notify) {
+        build_notify->MarkShaderComplete();
+    }
+    if (!optimized) {
+        NoteFastBuild(this, shader_hash, first, compile_ms, fast_open);
+    } else if (after_fast) {
+        NoteOptimizedAfterFast(this, shader_hash, made_ok, served_fast_ms, compile_ms, fast_open);
+    }
+    return first;
+}
+
+void ComputePipeline::SwapInOptimized() {
+    if (retired_fast && owner_scheduler.IsFree(retired_tick)) {
+        retired_fast.reset();
+    }
+    if (!optimized_ready.load(std::memory_order::acquire)) {
+        return;
+    }
+    {
+        std::scoped_lock lock{build_mutex};
+        // The unoptimized pipeline may be in command buffers the GPU has not finished: kept
+        // until it passed the recording thread's tick now, which is at or after the tick of the
+        // command buffer this worker records (one swap per pipeline).
+        retired_fast = std::move(pipeline);
+        retired_tick = owner_scheduler.CurrentTick();
+        pipeline = std::move(optimized_pipeline);
+        running_optimized = true;
+        optimized_ready.store(false, std::memory_order::release);
+    }
+    NoteFastSwap(this, fast_open);
+}
+
+int ComputePipeline::FastFirstMode() {
+    const int value = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_compute_fast_first, "FRITCHII_COMPUTE_FAST_FIRST", 0);
+    return value == 1 || value == 2 ? value : 0;
+}
+
+bool ComputePipeline::UsesFastFirst() const {
+    return fast_first_allowed && FastFirstMode() != 0;
+}
+
 void ComputePipeline::RunBuild() {
     // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
     // waiting for the worker queue, which can hold hundreds of builds, to reach it.
     if (build_claimed.exchange(true)) {
         return;
     }
+    // FRITCHII_COMPUTE_FAST_FIRST=2 (test): the worker builds the unoptimized pipeline first, so
+    // every program built at run time is served by it until the optimized one is swapped in.
+    if (fast_first_allowed && FastFirstMode() == 2 &&
+        !fast_claimed.exchange(true, std::memory_order::acq_rel)) {
+        static_cast<void>(RunFastBuild());
+    }
     build_task();
     build_task = nullptr;
 }
 
+void ComputePipeline::RunNeededBuild() {
+    if (is_built.load(std::memory_order::acquire)) {
+        return;
+    }
+    if (UsesFastFirst()) {
+        if (fast_claimed.exchange(true, std::memory_order::acq_rel)) {
+            // Another thread's unoptimized build: the caller waits for it (that thread falls
+            // back to the optimized build itself when it makes nothing).
+            return;
+        }
+        // The optimized build stays with its worker (queued, or compiling there now).
+        if (RunFastBuild() || is_built.load(std::memory_order::acquire)) {
+            return;
+        }
+        // It made nothing: the optimized build here, as without the switch.
+    }
+    RunBuild();
+}
+
+bool ComputePipeline::RunFastBuild() {
+    if (is_built.load(std::memory_order::acquire) || !AcquireModule()) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    vk::Pipeline made;
+    try {
+        made = CreateHandle(true);
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan, "Compute fast-first: the unoptimized build of {:016x} failed: {}",
+                    shader_hash, exception.what());
+    }
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    ReleaseModule(false);
+    if (!made) {
+        NoteFastFailed();
+        return false;
+    }
+    static_cast<void>(Publish(std::move(made), false, compile_ms));
+    return true;
+}
+
+bool ComputePipeline::WaitBuiltFor(std::chrono::nanoseconds timeout) {
+    std::unique_lock lock{build_mutex};
+    return build_condvar.wait_for(lock, timeout,
+                                  [this] { return is_built.load(std::memory_order::relaxed); });
+}
+
+void ComputePipeline::KickBuild(Common::ThreadWorker& worker) {
+    // A claimed build runs already (a worker, the scheduler's wait, an earlier kick). The queued
+    // pipeline worker's task finds the claim taken and returns at once when it gets there.
+    // kick_pending keeps the pipeline alive (IsBuildTaskDone) until the kick task is done. With
+    // FRITCHII_COMPUTE_FAST_FIRST the kick makes the unoptimized build (its claim is the one
+    // that counts), so the skip ends after the short compile.
+    const bool claimed = UsesFastFirst() ? fast_claimed.load(std::memory_order::acquire)
+                                         : build_claimed.load(std::memory_order::acquire);
+    if (is_built.load(std::memory_order::acquire) || claimed ||
+        kick_pending.exchange(true, std::memory_order::acq_rel)) {
+        return;
+    }
+    worker.QueueWork([this] {
+        RunNeededBuild();
+        kick_pending.store(false, std::memory_order::release);
+    });
+}
+
+void ComputePipeline::BindStoragePointers(BufferCache& buffer_cache) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
+    buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+    buffer_cache.UnbindComputeStorageBuffers();
+    buffer_cache.SetComputeShaderHash(shader_hash);
+    size_t ssbo_index{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        ASSERT(desc.count == 1);
+        buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                              desc.is_written, desc.indirect_offset,
+                                              desc.write_extent,
+                                              Shader::StorageWriteExtraOf(info, ssbo_index),
+                                              Shader::StorageReadExtentOf(info, ssbo_index));
+        ++ssbo_index;
+    }
+}
+
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
+    // The scaled 1440p passes only while the DLSS render-scale patch shrank the scene
+    // (FRITCHII_DLSS_RENDER_SCALE); without Max Resolution they follow the game's dynamic size.
+    const bool scaled_shader = (shader_hash == Ocarina1440pScaledShader ||
+                                shader_hash == Ocarina1440pScaledFieldShader) &&
+                               Settings::AppliedOcarinaRenderScale().has_value();
     const bool known_shader =
-        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == 0xef542df87cacfe9eULL ||
-        shader_hash == Ocarina1440pShader ||
+        shader_hash == OcarinaThreeQuarterShader || shader_hash == 0xef542df87cacfe9eULL ||
+        shader_hash == Ocarina1440pShader || scaled_shader ||
         shader_hash == OcarinaFullSizeShader;
     return known_shader && !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
            !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&
            std::ranges::none_of(info.storage_buffers_descriptors, &Shader::StorageBufferDescriptor::is_written);
+}
+
+// SEAM >= 3 (EXP123, vk_mem_stage.cpp): every raw handle this dispatch binds, in the order
+// Configure's handle loop reads them, into the dispatch packet. Called by the early fill, or by
+// Configure when no fill made them.
+void ComputePipeline::FillHandleValues(MemStage& seam,
+                                       const Tegra::Engines::KeplerCompute& kepler_compute,
+                                       Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                                       bool in_configure) {
+    seam.FillHandleValues(true, null_pointer_handles, in_configure, [&](std::vector<u32>& values) {
+        const auto& qmd{kepler_compute.launch_description};
+        VideoCommon::FillStageHandleValues<true>(
+            info, gpu_memory,
+            VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>>{qmd},
+            device.GetStorageBufferAlignment(), null_pointer_handles,
+            [&values](u32 raw) { values.push_back(raw); });
+    });
+}
+
+void ComputePipeline::MakeHandleValues(const Tegra::Engines::KeplerCompute& kepler_compute,
+                                       Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                                       std::vector<u32>& values) const {
+    values.clear();
+    const auto& qmd{kepler_compute.launch_description};
+    VideoCommon::FillStageHandleValues<true>(
+        info, gpu_memory, VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>>{qmd},
+        device.GetStorageBufferAlignment(), null_pointer_handles,
+        [&values](u32 raw) { values.push_back(raw); });
 }
 
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
@@ -391,21 +833,19 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
+    // SEAM = 2 (EXP123): the memory stage filled the dispatch's buffer side before this call
+    // (MemStage::FillDispatch); its calls below are skipped and its section played in place.
+    MemStage& mem_stage = buffer_cache.runtime.Seam();
+    const MemStage::DispatchPacket* const held = mem_stage.HeldDispatch();
+    // One follower: a posted dispatch R plays from ring B (nothing below may touch the buffer
+    // cache then: it is E's, E running ahead).
+    const bool ring_held = held != nullptr && mem_stage.HeldDispatchFromRing();
     namespace Profile = VideoCommon::Nx2Profile;
-    {
-        const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
-        buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
-        buffer_cache.UnbindComputeStorageBuffers();
-        buffer_cache.SetComputeShaderHash(shader_hash);
-        size_t ssbo_index{};
-        for (const auto& desc : info.storage_buffers_descriptors) {
-            ASSERT(desc.count == 1);
-            buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                                  desc.is_written, desc.indirect_offset,
-
-                                                  desc.write_extent);
-            ++ssbo_index;
-        }
+    // FRITCHII_ASYNC_COMPUTE_SKIP: the decision on an unbuilt pipeline bound them already
+    // (BindStoragePointers), with nothing in between; consumed here whatever path runs.
+    const bool prebound = std::exchange(pointers_prebound, false);
+    if (held == nullptr && !prebound) {
+        BindStoragePointers(buffer_cache);
     }
 
     // Ends after FillImageViews (views_scope.reset() below).
@@ -417,45 +857,55 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 
     const auto& qmd{kepler_compute.launch_description};
-    const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
+    // The handle words and handle programs: one function for the back's own read and the memory
+    // seam's fill (texture_handle_values.h). EDEN_NX2_HANDLE_ALIGN=0 reads a single handle
+    // program's words at the unaligned address (A/B, HandleProgramAlignment).
+    const VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>> cbuf_view{qmd};
+    const u64 storage_alignment{device.GetStorageBufferAlignment()};
+    // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the dispatch packet, with the
+    // EXP21 value they were made with; made here when no early fill made them.
+    const std::vector<u32>* handle_values{};
+    bool packet_null_pointers{};
+    // A ring-held dispatch (one follower) always carries E's values, whatever SEAM reads now.
+    if (mem_stage.ValuesByValue() || ring_held) {
+        handle_values = mem_stage.HandleValues(true, packet_null_pointers);
+        if (handle_values == nullptr) {
+            FillHandleValues(mem_stage, kepler_compute, gpu_memory,
+                             VideoCore::Nx2Debug::Experiment(21) != 0, true);
+            handle_values = mem_stage.HandleValues(true, packet_null_pointers);
+        }
+    }
+    const bool verify_handles{handle_values != nullptr &&
+                              (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0};
+    size_t handle_cursor{};
+    const auto next_value{[&](u32& value) {
+        if (handle_cursor < handle_values->size()) {
+            value = (*handle_values)[handle_cursor++];
+            return true;
+        }
+        ++handle_cursor;
+        return false;
+    }};
     const auto read_handle{[&](const auto& desc, u32 index) {
-        if (desc.handle_program != ~0U) {
-            // Read by the shader from a storage buffer: computed for this dispatch.
-            // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
-            static const bool align_storage{[] {
-                const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                return value == nullptr || *value != '0';
-            }()};
-            return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, gpu_memory,
-                                   [&](u32 cbuf) -> GPUVAddr {
-                                       return cbuf < cbufs.size() &&
-                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
-                                                       1) != 0
-                                                  ? cbufs[cbuf].Address()
-                                                  : GPUVAddr{};
-                                   },
-                                   align_storage ? device.GetStorageBufferAlignment() : 1),
+        if (handle_values == nullptr) {
+            return TexturePair(VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory,
+                                                                   cbuf_view, storage_alignment),
                                via_header_index);
         }
-        ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
-        const u32 index_offset{index << desc.size_shift};
-        const u32 offset{desc.cbuf_offset + index_offset};
-        const GPUVAddr addr{cbufs[desc.cbuf_index].Address() + offset};
-        if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
-                      std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
-            if (desc.has_secondary) {
-                ASSERT(((qmd.const_buffer_enable_mask >> desc.secondary_cbuf_index) & 1) != 0);
-                const u32 secondary_offset{desc.secondary_cbuf_offset};
-                const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
-                                             secondary_offset};
-                const u32 lhs_raw{gpu_memory.ReadHandleWord(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.ReadHandleWord(separate_addr) << desc.secondary_shift_left};
-                return TexturePair(lhs_raw | rhs_raw, via_header_index);
-            }
+        u32 value{};
+        if (!next_value(value)) [[unlikely]] {
+            value = VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory, cbuf_view,
+                                                        storage_alignment);
+        } else if (verify_handles) [[unlikely]] {
+            // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
+            const u32 own{VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory,
+                                                              cbuf_view, storage_alignment)};
+            mem_stage.NoteValueCheck(MemStage::Value::Handle, own == value,
+                                     VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                                     shader_hash, value, own);
         }
-        return TexturePair(gpu_memory.ReadHandleWord(addr), via_header_index);
+        return TexturePair(value, via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -474,25 +924,103 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, false);
     }
     // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-    const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+    // SEAM >= 3: the value the packet's handles were made with.
+    const bool null_pointer_handles{handle_values != nullptr
+                                        ? packet_null_pointers
+                                        : VideoCore::Nx2Debug::Experiment(21) != 0};
+    u32 texture{};
     for (const auto& desc : info.texture_descriptors) {
+        if (desc.count > 1 && desc.handle_program != ~0U) {
+            // A table of handles the shader indexes, read in one go; elements repeating a
+            // sampler share its lookup.
+            const size_t first{views.size()};
+            u32 last_sampler_index{~0U};
+            VideoCommon::SamplerId sampler{};
+            const auto table_element{[&](u32, u32 raw) {
+                const auto handle{TexturePair(raw, via_header_index)};
+                views.push_back({handle.first});
+                if (handle.second != last_sampler_index) {
+                    sampler = texture_cache.GetSamplerId(handle.second, true);
+                    last_sampler_index = handle.second;
+                }
+                samplers.push_back(sampler);
+            }};
+            if (handle_values == nullptr) {
+                VideoCommon::RawTextureHandleTable(info, desc, gpu_memory, cbuf_view,
+                                                   storage_alignment, table_element);
+            } else {
+                // SEAM >= 3: the table's values from the dispatch packet.
+                boost::container::small_vector<u32, 16> own;
+                if (verify_handles || handle_cursor + desc.count > handle_values->size())
+                    [[unlikely]] {
+                    VideoCommon::RawTextureHandleTable(
+                        info, desc, gpu_memory, cbuf_view, storage_alignment,
+                        [&own](u32, u32 raw) { own.push_back(raw); });
+                }
+                for (u32 element = 0; element < desc.count; ++element) {
+                    u32 value{};
+                    if (!next_value(value)) [[unlikely]] {
+                        value = own[element];
+                    } else if (verify_handles) [[unlikely]] {
+                        mem_stage.NoteValueCheck(
+                            MemStage::Value::Handle, own[element] == value,
+                            VideoCommon::HandleWordAddress(desc, element, cbuf_view), shader_hash,
+                            value, own[element]);
+                    }
+                    table_element(element, value);
+                }
+            }
+            if (VideoCommon::HandleTableNotes::Wanted()) {
+                std::vector<u32> tics(desc.count);
+                for (u32 index = 0; index < desc.count; ++index) {
+                    tics[index] = views[first + index].index;
+                }
+                VideoCommon::HandleTableNotes::Note(shader_hash, texture, tics);
+            }
+            ++texture;
+            continue;
+        }
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{null_pointer_handles &&
-                                      VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                  ? VideoCommon::NULL_TEXTURE_HANDLE
-                                  : read_handle(desc, index)};
+            const bool null_handle{null_pointer_handles &&
+                                   VideoCommon::HandleIsStoragePointer(info, desc, index)};
+            if (null_handle && handle_values != nullptr) {
+                // SEAM >= 3: the packet keeps its place (SKIPPED_HANDLE_VALUE).
+                ++handle_cursor;
+            }
+            const auto handle{null_handle ? VideoCommon::NULL_TEXTURE_HANDLE
+                                          : read_handle(desc, index)};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
             samplers.push_back(sampler);
         }
+        ++texture;
     }
     for (const auto& desc : info.image_descriptors) {
         add_image(desc, desc.is_written);
     }
+    if (handle_values != nullptr) {
+        mem_stage.LookedAtHandleValues(true, handle_cursor);
+    }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();
-    if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
+    // FRITCHII_EARLY_COMPUTE (dry): a feeder's sampled and storage images, and whether one has a
+    // GPU write the host GPU has not run (the buffers are judged where they are bound).
+    if (VideoCommon::EarlyCompute::g_early &&
+        VideoCommon::EarlyCompute::IsFeeder(shader_hash)) [[unlikely]] {
+        const size_t first_image = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                   Shader::NumDescriptors(info.image_buffer_descriptors);
+        bool pending = false;
+        for (size_t i = first_image; i < views.size() && !pending; ++i) {
+            pending = texture_cache.EarlyImageWritePending(views[i].id);
+        }
+        const bool writes_images = std::ranges::any_of(
+            info.image_descriptors, [](const auto& desc) { return desc.is_written; });
+        VideoCommon::EarlyCompute::NoteImages(shader_hash, views.size() > first_image, pending,
+                                              writes_images);
+    }
+    // Not for a ring-held dispatch (one follower): the trace reads the buffer cache, E's.
+    if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode() && !ring_held) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
         if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {
             trace.armed = true;
@@ -592,7 +1120,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         shadow = texture_runtime.CreateByteAddressedShadow(target_view);
     }
 
-    buffer_cache.UnbindComputeTextureBuffers();
+    if (held == nullptr) {
+        // A held dispatch has no texel buffers (else it fills here, LateFill).
+        buffer_cache.UnbindComputeTextureBuffers();
+    }
     size_t index{};
     const auto add_buffer{[&](const auto& desc) {
         constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
@@ -617,15 +1148,30 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
-    {
-        const Profile::Scope resolve_scope{Profile::Zone::ComputeResolve};
-        buffer_cache.UpdateComputeBuffers();
-    }
-    {
+    if (held != nullptr) {
+        // SEAM = 2: the `before` section, filled before Configure, played here.
         const Profile::Scope sync_scope{Profile::Zone::ComputeSync};
-        buffer_cache.BindHostComputeBuffers();
+        mem_stage.PlayHeld(held->before);
+    } else {
+        // The dispatch's `before` section: its uploads, binds and descriptors are played here,
+        // before the image descriptors.
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::DispatchBefore};
+        {
+            const Profile::Scope resolve_scope{Profile::Zone::ComputeResolve};
+            buffer_cache.UpdateComputeBuffers();
+        }
+        {
+            const Profile::Scope sync_scope{Profile::Zone::ComputeSync};
+            buffer_cache.BindHostComputeBuffers();
+        }
     }
-    if (buffer_cache.any_buffer_uploaded) {
+    if (ring_held) {
+        // One follower (FRITCHII_ONEF_OP_DISPATCH): R plays a dispatch E filled. The buffer cache
+        // is E's: its "uploaded" mark came in the packet (FillRingDispatch).
+        if ((held->flags & MemStage::PostCopyBarrier) != 0) {
+            mem_stage.PlayPostCopyBarrier();
+        }
+    } else if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
@@ -661,12 +1207,38 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         return false;
     }
 
-    if (!is_built.load(std::memory_order::relaxed)) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS: a pipeline that counts as unbuilt by the test delay
+    // waits here as a building one does, until the delay ends.
+    const auto test_deadline = std::exchange(test_wait_until, {});
+    if (!is_built.load(std::memory_order::relaxed) ||
+        test_deadline != std::chrono::steady_clock::time_point{}) {
         // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild();
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+        scheduler.Record([this, test_deadline](vk::CommandBuffer) {
+            const auto begin = std::chrono::steady_clock::now();
+            // FRITCHII_COMPUTE_FAST_FIRST: the unoptimized build here, the optimized one on its
+            // worker; else the optimized build here unless a worker has it.
+            RunNeededBuild();
+            bool unoptimized = false;
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+                unoptimized = !running_optimized;
+            }
+            const bool test = test_deadline != std::chrono::steady_clock::time_point{};
+            if (test) {
+                std::this_thread::sleep_until(test_deadline);
+            }
+            // Every GPU channel waits with the dispatch, so a long wait is a freeze (port of the
+            // log line of zortos293/Lichii #995: first-time compute programs waited 0.6-1 s each).
+            const auto waited = std::chrono::steady_clock::now() - begin;
+            if (waited > std::chrono::milliseconds{50}) {
+                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}{}{}",
+                         std::chrono::duration<double, std::milli>(waited).count(), shader_hash,
+                         test ? " (FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS)" : "",
+                         unoptimized ? " (an unoptimized build, FRITCHII_COMPUTE_FAST_FIRST)"
+                                     : "");
+            }
         });
     }
 
@@ -713,6 +1285,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+        // FRITCHII_COMPUTE_FAST_FIRST: the optimized pipeline replaces the unoptimized one here,
+        // on the scheduler worker (the only thread that binds it). Off: two loads.
+        if (optimized_ready.load(std::memory_order::acquire) || retired_fast) [[unlikely]] {
+            SwapInOptimized();
+        }
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -722,6 +1299,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        // FRITCHII_SLOW_GPU: the program a slow submission's dispatches ran (one TLS load off).
+        vk::NoteBoundProgram(VK_PIPELINE_BIND_POINT_COMPUTE, ShaderHash(), 0);
         if (!descriptor_set_layout) {
             return;
         }

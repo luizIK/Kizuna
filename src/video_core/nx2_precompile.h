@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Fritchii: the shader precompile system was written by Frizti for Fritchii. Additional terms
+// under GPLv3 section 7 apply to Frizti's material here (attribution "Shader precompile system by
+// Frizti (Fritchii)" must be kept): see LICENSES/Fritchii-Additional-Terms.txt. The recipe files
+// (*.nx2recipe) are not GPL; using them in other builds needs Frizti's direct permission (Discord
+// DM): see LICENSES/Fritchii-Recipe.txt.
 
-// Fritchii's automatic side of zortos293/Lichii#895: finds a title's precompiled pipeline file
-// (precompiled.fork-v<N>.nx2prep, as #895 places it) or a precompile recipe for it, and assembles
+// Fritchii's automatic side of the ported precompile feature: finds a title's precompiled pipeline file
+// (precompiled.fork-v<N>.nx2prep, as the ported feature places it) or a precompile recipe for it, and assembles
 // the recipe with the running game's own files when the file is missing or older than the recipe.
 // PipelineCache::PreparePrecompiled then builds the file's pipelines in the background.
 //
@@ -28,10 +33,11 @@ namespace VideoCommon::Nx2Precompile {
 
 /// EDEN_NX2_PRECOMPILE: 0 (the default) off; 1 prepares a title's precompiled pipelines in the
 /// background where the driver keeps a pipeline cache of its own (NVIDIA, AMD's proprietary
-/// driver); 2 also on other drivers. Read when first asked, after nx2_switches.txt is applied.
+/// driver, Intel's Windows driver); 2 also on other drivers. Read when first asked, after
+/// nx2_switches.txt is applied.
 [[nodiscard]] int Mode();
 
-/// EDEN_NX2_PRECOMPILED_FORCE=1 (#895's switch): prepare again although the stamp says it is done.
+/// EDEN_NX2_PRECOMPILED_FORCE=1 (the ported switch): prepare again although the stamp says it is done.
 [[nodiscard]] bool Forced();
 
 /// Threads that extract, assemble and prepare: EDEN_NX2_PRECOMPILE_THREADS (1 to 16), else a

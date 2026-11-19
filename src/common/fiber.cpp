@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <thread>
@@ -9,6 +8,7 @@
 
 #include "common/assert.h"
 #include "common/fiber.h"
+#include "common/memory_detect.h"
 
 #include <boost/context/detail/fcontext.hpp>
 
@@ -51,6 +51,8 @@ void Fiber::SetRewindPoint(std::function<void()>&& rewind_func) {
 Fiber::Fiber(std::function<void()>&& entry_point_func) : impl{std::make_unique<FiberImpl>()} {
     impl->entry_point = std::move(entry_point_func);
     impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);
+    // FRITCHII_MEM_CENSUS: named in the census (a no-op when it is off).
+    Common::MemCensus::Tag("guest thread stacks", impl->stack.get(), DEFAULT_STACK_SIZE);
     impl->stack_limit = impl->stack.get();
     u8* stack_base = impl->stack_limit + DEFAULT_STACK_SIZE;
     impl->context = boost::context::detail::make_fcontext(stack_base, DEFAULT_STACK_SIZE, [](boost::context::detail::transfer_t transfer) -> void {
@@ -69,6 +71,9 @@ Fiber::Fiber(std::function<void()>&& entry_point_func) : impl{std::make_unique<F
 Fiber::Fiber() : impl{std::make_unique<FiberImpl>()} {}
 
 Fiber::~Fiber() {
+    if (impl->stack) {
+        Common::MemCensus::Untag(impl->stack.get());
+    }
     if (!impl->released) {
         // Make sure the Fiber is not being used
         const bool locked = impl->guard.try_lock();

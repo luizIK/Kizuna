@@ -15,6 +15,8 @@ extern const char g_build_name[];
 extern const char g_build_date[];
 extern const char g_build_fullname[];
 extern const char g_build_version[];
+/// What players see ("v6.0 Beta"); g_build_version stays the parsable number ("v6").
+extern const char g_build_label[];
 extern const char g_build_id[];
 extern const char g_build_release_tag[];
 extern const char g_build_release_platform[];

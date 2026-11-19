@@ -16,7 +16,7 @@
 namespace Kernel::Svc {
 namespace {
 
-// Ocarina of Time (main build E0F3CCFA...), from zortos293/Lichii#641: the resource request
+// Ocarina of Time (main build E0F3CCFA...), from a ported change: the resource request
 // thread (main+0xF7A0, state 3) walks its pending requests (a name lookup through the query
 // engine at main+0x58EEA0, a mutex and status checks per request) and, if any is not ready yet,
 // starts the walk again at once with no wait. It only ever polls, so sleeping before the next walk

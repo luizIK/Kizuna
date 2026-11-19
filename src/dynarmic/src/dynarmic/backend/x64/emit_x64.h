@@ -9,10 +9,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -42,6 +46,7 @@ namespace Dynarmic::Backend::X64 {
 
 class A64EmitX64;
 class BlockOfCode;
+struct SharedCode;
 
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
@@ -53,6 +58,24 @@ using VectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T>>
 
 template<typename T>
 using HalfVectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T> / 2>;
+
+/// Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS, boot): the fastmem accesses that faulted (the
+/// do_not_fastmem markers), one set for every JIT on the same fastmem arena (one process), so an
+/// access that faulted on one core is compiled without fastmem by the others instead of faulting
+/// and recompiling there too (port of the idea of zortos293/Lichii #1861, arm64 there). A marker
+/// only sends that access to the page table path, so sharing changes no results. The lock is held
+/// only around a lookup while a block is emitted and around an insert in the fault handler; no
+/// thread faults while it holds it.
+struct SharedFastmemMarks {
+    std::shared_mutex mutex;
+    ::Common::unordered_set<std::tuple<IR::LocationDescriptor, unsigned>> marks;
+    std::atomic<std::uint64_t> used_from_other{0};  ///< compiles that took another core's marker
+    std::atomic<std::uint64_t> faults{0};           ///< markers added (first fault per access)
+};
+/// The set for this fastmem arena (null when the switch is off or there is no fastmem).
+std::shared_ptr<SharedFastmemMarks> SharedFastmemMarksFor(const void* fastmem_arena);
+/// Counts a compile that used another core's marker; logs at powers of two.
+void NoteSharedFastmemMarkUsed(SharedFastmemMarks& shared, unsigned core);
 
 using SharedLabel = Xbyak::Label*;
 struct EmitContext {
@@ -69,6 +92,38 @@ struct EmitContext {
     RegAlloc& reg_alloc;
     IR::Block& block;
     boost::container::stable_vector<Xbyak::Label>& shared_labels;
+
+    // Fritchii: FRITCHII_JIT_FLAG_BRANCH (A64 blocks only; A64EmitX64::Emit sets track_host_flags
+    // and keeps the rest current, see there). What the host flags hold at the current point of
+    // the emitted code, so a block's conditional terminal can branch on them directly.
+    bool track_host_flags = false;
+    /// The NZCV value (a GetNZCVFromOp) whose lahf + seto snapshot is still the host SF, ZF, CF
+    /// and OF; nullptr = none.
+    IR::Inst* host_flags_nzcv = nullptr;
+    /// The guest NZCV is host_flags_nzcv (an A64SetNZCV of it ran since the flags got it).
+    bool guest_nzcv_in_host_flags = false;
+    /// Host ZF = (check bit == 0): A64SetCheckBit tested the byte it stored.
+    bool check_bit_in_host_zf = false;
+    /// Set by an emitter whose code left the host flags as recorded above.
+    bool host_flags_set_here = false;
+
+    void HostFlagsHoldNZCV(IR::Inst* nzcv) noexcept {
+        host_flags_nzcv = nzcv;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = false;
+        host_flags_set_here = true;
+    }
+    void HostFlagsHoldCheckBit() noexcept {
+        host_flags_nzcv = nullptr;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = true;
+        host_flags_set_here = true;
+    }
+    void HostFlagsUnknown() noexcept {
+        host_flags_nzcv = nullptr;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = false;
+    }
 };
 
 class EmitX64 {
@@ -106,6 +161,11 @@ public:
     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
     void EmitAddCycles(size_t cycles);
     Xbyak::Label EmitCond(IR::Cond cond);
+    /// Fritchii (FRITCHII_JIT_FLAG_BRANCH): EmitCond's jump without its reload, for when the host
+    /// SF, ZF, CF and OF are the ones whose lahf + seto snapshot is the guest NZCV.
+    Xbyak::Label EmitCondFromHostFlags(IR::Cond cond);
+    /// The jump to `pass` for `cond`, the flags in EmitCond's reloaded form.
+    void EmitCondJump(IR::Cond cond, Xbyak::Label& pass);
     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 
@@ -132,12 +192,24 @@ public:
     virtual void EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
     virtual void EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
     virtual void EmitPatchMovRcx(CodePtr target_code_ptr = nullptr) = 0;
+    /// Fritchii (FRITCHII_JIT_SHARED): where an unlinked compact jump goes (the A64 link stub).
+    virtual CodePtr UnlinkedJumpTarget(const IR::LocationDescriptor& target_desc) { return nullptr; }
+    /// Fritchii (FRITCHII_JIT_SHARED): pads with nops so the patched field of the patch site about
+    /// to be emitted (`field_offset` bytes into it, `field_size` bytes long) is aligned, so one
+    /// atomic store rewrites it while other cores may run that code. Nothing per core.
+    void AlignPatchField(size_t field_offset, size_t field_size);
 
     // State
     BlockOfCode& code;
     ExceptionHandler exception_handler;
     ::Common::unordered_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
     ::Common::unordered_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    /// Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): set by the A64 emitter only; null = per-core.
+    std::shared_ptr<SharedFastmemMarks> shared_fastmem_marks;
+    /// Fritchii (FRITCHII_JIT_SHARED): set when this emitter's cache is run by every guest core of
+    /// the process (A64 only); null = one cache per core, the old code. With it, blocks go into its
+    /// lock-free map, removals into its log, and patches are single aligned atomic stores.
+    SharedCode* shared_code = nullptr;
 
     // We need materialized protected members
     friend class A64EmitX64;

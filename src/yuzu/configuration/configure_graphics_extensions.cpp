@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
@@ -44,7 +43,7 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
          Settings::values.linkage.by_category[Settings::Category::RendererExtensions]) {
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.sample_shading.Id()) {
-                // TODO(crueter): should support this natively perhaps?
+                // TODO: should support this natively perhaps?
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::Slider, true, 1.0f,
                     nullptr, tr("%", "Sample Shading percentage (e.g. 50%)"));
@@ -80,14 +79,19 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
     std::map<u32, QWidget*> hacks_hold{}; // A map will sort the data for us
 
     if (FritchiiUi::Enabled()) {
-        // Where Lichii has its "Pin GPU threads" toggle: players kept asking for it.
+        // Where other builds have their "Pin GPU threads" toggle: players kept asking for it.
         auto* pinning = new QLabel(tr("<b>GPU thread pinning is built in.</b><br>On automatically, nothing "
                                       "to turn on."),
                                    this);
         pinning->setObjectName(QStringLiteral("FritchiiSettingsNote"));
         pinning->setWordWrap(true);
         QFont font = pinning->font();
-        font.setPointSizeF(font.pointSizeF() * 1.35);
+        // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+        if (font.pointSizeF() > 0) {
+            font.setPointSizeF(font.pointSizeF() * 1.35);
+        } else if (font.pixelSize() > 0) {
+            font.setPixelSize(static_cast<int>(font.pixelSize() * 1.35 + 0.5));
+        }
         pinning->setFont(font);
         pinning->setContentsMargins(0, 6, 0, 12);
         hacks.addWidget(pinning);

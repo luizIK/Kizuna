@@ -9,7 +9,7 @@ namespace QtCommon::ROM {
 
 bool RomFSRawCopy(size_t total_size, size_t& read_size, QtProgressCallback callback,
                   const FileSys::VirtualDir& src, const FileSys::VirtualDir& dest, bool full) {
-    // TODO(crueter)
+    // TODO
     // if (src == nullptr || dest == nullptr || !src->IsReadable() || !dest->IsWritable())
     //     return false;
     // if (dialog.wasCanceled())

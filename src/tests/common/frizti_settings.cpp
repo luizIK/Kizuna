@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <memory>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "common/frizti_settings.h"
 
@@ -31,7 +32,7 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
     CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
-    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
+    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
 }
 } // namespace
 
@@ -69,9 +70,9 @@ TEST_CASE("Between revisions only another build's changes are undone", "[frizti_
     REQUIRE(changes.size() == 2);
     CHECK(values->gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
     CHECK(values->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
-    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
+    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
     CHECK(Frizti::FormatChanges(changes) ==
-          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> ScaleForce");
+          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> Auto");
 }
 
 TEST_CASE("Ocarina's per-game overrides go back to global", "[frizti_settings]") {
@@ -128,9 +129,67 @@ TEST_CASE("The Frizti record round-trips", "[frizti_settings]") {
     CHECK(parsed.revision == record.revision);
     CHECK(parsed.global == record.global);
     CHECK(parsed.per_game == record.per_game);
+    CHECK_FALSE(parsed.oot_folded);
+    record.oot_folded = true;
+    CHECK(Frizti::ParseRecord(Frizti::SerializeRecord(record)).oot_folded);
 
     const auto empty = Frizti::ParseRecord("");
     CHECK(empty.revision == 0);
     CHECK(empty.global.empty());
     CHECK(Frizti::ParseRecord("revision=x\r\nglobal.a = 1\r\n").global.at("a") == "1");
+}
+
+TEST_CASE("OoT's per-game settings move to the main ones", "[frizti_settings]") {
+    auto values = std::make_unique<Settings::Values>();
+    std::vector<Settings::BasicSetting*> all;
+    for (const auto& [category, list] : values->linkage.by_category) {
+        all.insert(all.end(), list.begin(), list.end());
+    }
+    values->resolution_setup.SetGlobal(false);
+    values->resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
+    // Same as the main value: back to global, but nothing visibly moved.
+    values->use_speed_limit.SetGlobal(false);
+    values->use_speed_limit.SetValue(values->use_speed_limit.GetValue(true));
+
+    const auto moved = Frizti::FoldPerGame(all);
+    REQUIRE(moved.size() == 1);
+    CHECK(moved[0].setting == &values->resolution_setup);
+    CHECK(values->resolution_setup.UsingGlobal());
+    CHECK(values->resolution_setup.GetValue() == Settings::ResolutionSetup::Res2X);
+    CHECK(values->use_speed_limit.UsingGlobal());
+    CHECK(Frizti::FoldPerGame(all).empty());
+
+    values->players.SetGlobal(false);
+    values->players.GetValue()[0].profile_name = "pad";
+    values->players.GetValue()[0].vibration_strength = 42;
+    const auto players = Frizti::FoldPerGamePlayers(*values);
+    REQUIRE(players.size() == 1);
+    CHECK(players[0].label == "player_0_profile");
+    CHECK(values->players.GetValue(true)[0].profile_name == "pad");
+    CHECK(values->players.GetValue(true)[0].vibration_strength == 42);
+    CHECK(values->players.GetValue()[0].profile_name.empty());
+    CHECK_FALSE(values->players.UsingGlobal());
+}
+
+TEST_CASE("A start asks only a player with an earlier Fritchii's settings", "[frizti_settings]") {
+    using Frizti::StartupApply;
+    constexpr u32 now = Frizti::Revision;
+    constexpr u32 earlier = Frizti::Revision - 1;
+    // Fresh install, or another build's config (no revision, no frizti.ini): set without asking.
+    CHECK(Frizti::DecideStartup(0, 0, "") == StartupApply::Full);
+    // An earlier Fritchii: revision in qt-config.ini and frizti.ini.
+    CHECK(Frizti::DecideStartup(earlier, earlier, "") == StartupApply::Ask);
+    // Only one of them from an earlier Fritchii (frizti.ini deleted, or qt-config.ini lost it).
+    CHECK(Frizti::DecideStartup(earlier, 0, "") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(0, earlier, "") == StartupApply::Ask);
+    // This revision handled already: no question, only another build's changes are undone.
+    CHECK(Frizti::DecideStartup(now, now, "") == StartupApply::Reconcile);
+    CHECK(Frizti::DecideStartup(now + 1, now, "") == StartupApply::Reconcile);
+    // Answered for this revision, but qt-config.ini lost the key: the tuned set as before.
+    CHECK(Frizti::DecideStartup(0, now, "") == StartupApply::Full);
+    // FRITCHII_SETTINGS_PROMPT: "ask" always asks, "0" keeps without asking.
+    CHECK(Frizti::DecideStartup(now, now, "ask") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(0, 0, "ask") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(earlier, earlier, "0") == StartupApply::Reconcile);
+    CHECK(Frizti::DecideStartup(0, 0, "0") == StartupApply::Full);
 }

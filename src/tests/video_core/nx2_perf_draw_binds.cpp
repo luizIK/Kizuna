@@ -113,6 +113,14 @@ Ranges DirtyUpload(Tracker& tracker, DAddr addr, u64 size) {
     return ranges;
 }
 
+Ranges ScannedUpload(Tracker& tracker, DAddr addr, u64 size) {
+    Ranges ranges;
+    tracker.ForEachScannedUploadRange(addr, size, [&](u64 range_addr, u64 range_size) {
+        ranges.emplace_back(range_addr, range_size);
+    });
+    return ranges;
+}
+
 } // Anonymous namespace
 
 TEST_CASE("Nx2Perf draw-binds: deferred barrier survives unrelated draws", "[video_core]") {
@@ -326,4 +334,131 @@ TEST_CASE("Nx2Perf draw-binds: dirty-word uploads match full uploads", "[video_c
         }
     }
     REQUIRE(full->ModifiedCpuRegion(BASE, span) == narrow->ModifiedCpuRegion(BASE, span));
+}
+
+TEST_CASE("Nx2 storage sync scan: scanned uploads match full uploads", "[video_core]") {
+    FakeRasterizer full_rasterizer;
+    FakeRasterizer scanned_rasterizer;
+    auto full = std::make_unique<Tracker>(full_rasterizer);
+    auto scanned = std::make_unique<Tracker>(scanned_rasterizer);
+    std::mt19937_64 rng{0x5ca11ULL};
+    constexpr u64 span = 6 * MANAGER;
+    const auto random_range = [&]() -> std::pair<DAddr, u64> {
+        static constexpr u64 sizes[] = {4, 256, PAGE, 3 * PAGE, WORD, 3 * WORD + 100, MANAGER,
+                                        2 * MANAGER + 5 * PAGE, 5 * MANAGER + 7};
+        const u64 size = sizes[rng() % std::size(sizes)];
+        const u64 offset = rng() % 2 == 0 ? (rng() % (span / PAGE)) * PAGE : rng() % span;
+        return {BASE + offset, (std::max<u64>)((std::min)(size, span - offset), 1)};
+    };
+    for (int step = 0; step < 40000; ++step) {
+        const auto [addr, size] = random_range();
+        switch (rng() % 10) {
+        case 0:
+            full->MarkRegionAsCpuModified(addr, size);
+            scanned->MarkRegionAsCpuModified(addr, size);
+            break;
+        case 1:
+            full->UnmarkRegionAsCpuModified(addr, size);
+            scanned->UnmarkRegionAsCpuModified(addr, size);
+            break;
+        case 2:
+            full->CachedCpuWrite(addr, size);
+            scanned->CachedCpuWrite(addr, size);
+            break;
+        case 3:
+            full->FlushCachedWrites();
+            scanned->FlushCachedWrites();
+            break;
+        case 4:
+            full->MarkRegionAsGpuModified(addr, size);
+            scanned->MarkRegionAsGpuModified(addr, size);
+            break;
+        default: {
+            // The scan's own verify count: nothing outside the windows, on the same state.
+            const auto check = scanned->CheckScannedWalk(addr, size);
+            REQUIRE(check.cpu_pages == 0);
+            REQUIRE(check.untracked_pages == 0);
+            REQUIRE(Upload(*full, addr, size) == ScannedUpload(*scanned, addr, size));
+            break;
+        }
+        }
+        REQUIRE(full_rasterizer.calls == scanned_rasterizer.calls);
+        if (step % 1000 == 0) {
+            for (u64 page = 0; page < span; page += PAGE) {
+                REQUIRE(full->IsRegionCpuModified(BASE + page, PAGE) ==
+                        scanned->IsRegionCpuModified(BASE + page, PAGE));
+                REQUIRE(full->IsRegionGpuModified(BASE + page, PAGE) ==
+                        scanned->IsRegionGpuModified(BASE + page, PAGE));
+            }
+        }
+    }
+    REQUIRE(full->ModifiedCpuRegion(BASE, span) == scanned->ModifiedCpuRegion(BASE, span));
+}
+
+TEST_CASE("Nx2 storage sync memo: an unchanged generation sum means a clean range", "[video_core]") {
+    FakeRasterizer rasterizer;
+    auto tracker = std::make_unique<Tracker>(rasterizer);
+    std::mt19937_64 rng{0x6e17ULL};
+    constexpr u64 span = 6 * MANAGER;
+    const auto random_range = [&]() -> std::pair<DAddr, u64> {
+        static constexpr u64 sizes[] = {4, 256, PAGE, 3 * PAGE, WORD, 3 * WORD + 100, MANAGER,
+                                        2 * MANAGER + 5 * PAGE};
+        const u64 size = sizes[rng() % std::size(sizes)];
+        const u64 offset = rng() % 2 == 0 ? (rng() % (span / PAGE)) * PAGE : rng() % span;
+        return {BASE + offset, (std::max<u64>)((std::min)(size, span - offset), 1)};
+    };
+    struct Memo {
+        DAddr addr;
+        u64 size;
+        u64 sum;
+    };
+    std::vector<Memo> memos;
+    u64 hits = 0;
+    for (int step = 0; step < 40000; ++step) {
+        const auto [addr, size] = random_range();
+        switch (rng() % 10) {
+        case 0:
+            tracker->MarkRegionAsCpuModified(addr, size);
+            break;
+        case 1:
+            tracker->UnmarkRegionAsCpuModified(addr, size);
+            break;
+        case 2:
+            tracker->CachedCpuWrite(addr, size);
+            break;
+        case 3:
+            tracker->FlushCachedWrites();
+            break;
+        case 4:
+            tracker->MarkRegionAsGpuModified(addr, size);
+            break;
+        case 5:
+            tracker->UnmarkRegionAsGpuModified(addr, size);
+            break;
+        default: {
+            // A synchronize as SynchronizeStorageMemo runs it: the sum before, the walk, the
+            // memo stored when the sum held across it.
+            u64 before = 0;
+            const bool tracked = tracker->DirtyGenerationSum(addr, size, before);
+            (void)Upload(*tracker, addr, size);
+            u64 after = 0;
+            if (tracked && tracker->DirtyGenerationSum(addr, size, after) && after == before) {
+                memos.push_back({addr, size, after});
+                if (memos.size() > 64) {
+                    memos.erase(memos.begin());
+                }
+            }
+            break;
+        }
+        }
+        for (const Memo& memo : memos) {
+            u64 sum = 0;
+            if (tracker->DirtyGenerationSum(memo.addr, memo.size, sum) && sum == memo.sum) {
+                ++hits;
+                REQUIRE_FALSE(tracker->CheckScannedWalk(memo.addr, memo.size).walks);
+                REQUIRE_FALSE(tracker->IsRegionCpuModified(memo.addr, memo.size));
+            }
+        }
+    }
+    REQUIRE(hits > 0);
 }

@@ -30,6 +30,9 @@ struct DlssStatus {
     Settings::NvidiaDlssQuality mode{};
     Settings::NvidiaDlssQuality requested{};
     Settings::DlssPreset preset{};
+    /// The last evaluation's input and output heights (e.g. 1440 and 2160)
+    u32 render_height{};
+    u32 output_height{};
 };
 
 struct RendererSettings {

@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Enable modules to include each other's files
 include_directories(.)
 
 # Dynarmic
-if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64) AND NOT YUZU_STATIC_ROOM)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64))
     add_subdirectory(dynarmic)
     add_library(dynarmic::dynarmic ALIAS dynarmic)
 endif()
@@ -239,7 +238,7 @@ else()
     if (YUZU_STATIC_BUILD AND NOT APPLE AND NOT MSVC)
         add_compile_options(-static)
 
-        # yuzu-cmd requires us to explicitly link libpthread, libgcc, and libstdc++ as static
+        # static builds need libpthread, libgcc, and libstdc++ linked explicitly as static
         add_link_options(-Wl,-Bstatic -static -lpthread)
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
@@ -266,19 +265,6 @@ endif()
 add_subdirectory(common)
 add_subdirectory(network)
 
-if (YUZU_ROOM)
-    add_subdirectory(dedicated_room)
-endif()
-
-if (YUZU_ROOM_STANDALONE)
-    add_subdirectory(yuzu_room_standalone)
-    set_target_properties(yuzu-room PROPERTIES OUTPUT_NAME "eden-room")
-endif()
-
-if (YUZU_STATIC_ROOM)
-    return()
-endif()
-
 add_subdirectory(core)
 add_subdirectory(audio_core)
 add_subdirectory(video_core)
@@ -291,23 +277,14 @@ if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()
 
-if (YUZU_CMD)
-    add_subdirectory(yuzu_cmd)
-    set_target_properties(yuzu-cmd PROPERTIES OUTPUT_NAME "eden-cli")
-endif()
-
 if (ENABLE_QT)
     add_subdirectory(qt_common)
     add_subdirectory(yuzu)
+    # Kizuna: no lichii_forwarder, the emulator itself is lichii.exe (src/yuzu/CMakeLists.txt).
 endif()
 
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
-endif()
-
-if (ANDROID)
-    add_subdirectory(android/app/src/main/jni)
-    target_include_directories(yuzu-android PRIVATE android/app/src/main)
 endif()
 
 include(GenerateDepHashes)

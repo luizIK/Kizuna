@@ -9,7 +9,17 @@ namespace Core {
 class System;
 }
 
+namespace Kernel {
+class KernelCore;
+class KThread;
+} // namespace Kernel
+
 namespace Kernel::Svc {
+
+/// EXP24 = 4 (fable52_answer_pipeline section 2): from KThread::BeginWait, scheduler lock held.
+/// While the present poll sleeps, ends that sleep once the event's value word reads 1 (the game's
+/// MainThread writes it, then blocks within tens of microseconds). One relaxed load otherwise.
+void Nx2OotPresentPollCheck(KernelCore& kernel, const KThread* beginning);
 
 /// Ocarina of Time's present poll, EDEN_NX2_EXP24 (live, off by default). Called by svcSleepThread
 /// with its positive timeout. When the sleep is the one in the game's loop

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/audio_core.h"
@@ -11,6 +10,7 @@
 #include "audio_core/sink/silent_input_stream.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/guest_memory.h"
@@ -53,7 +53,15 @@ Result DeviceSession::Initialize(std::string_view name_, SampleFormat sample_for
     } else {
         sink = &system.AudioCore().GetOutputSink();
     }
-    stream = sink->AcquireSinkStream(system, channel_count, name, type);
+    // Opening a Bluetooth headset's mic drops it into the low-quality hands-free profile.
+    if (type == Sink::StreamType::In &&
+        Settings::values.audio_input_device_id.GetValue() == Sink::no_input_device_name) {
+        LOG_INFO(Service_Audio, "{}: input device is none, capturing silence", name);
+        silent_input = std::make_unique<Sink::SilentInputStream>(system, channel_count);
+        stream = silent_input.get();
+    } else {
+        stream = sink->AcquireSinkStream(system, channel_count, name, type);
+    }
     if (type == Sink::StreamType::In && !stream->IsReady()) {
         UseSilentInput();
     }

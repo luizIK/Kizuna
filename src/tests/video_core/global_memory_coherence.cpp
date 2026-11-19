@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <span>
@@ -131,6 +132,82 @@ struct GlobalAtomicProgram : Program {
         program.info.constant_buffer_descriptors = {{0, 1}, {1, 1}};
     }
 };
+
+// Sets EDEN_NX2_SPIRV_INLINE_GLOBALS for one emission and restores it after.
+struct InlineGlobalsMode {
+    static constexpr const char* name = "EDEN_NX2_SPIRV_INLINE_GLOBALS";
+    std::string previous;
+    bool existed{};
+
+    explicit InlineGlobalsMode(const char* mode) {
+        if (const char* value = std::getenv(name)) {
+            previous = value;
+            existed = true;
+        }
+        Set(mode);
+    }
+
+    static void Set(const char* value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+#endif
+    }
+
+    ~InlineGlobalsMode() {
+        Set(existed ? previous.c_str() : nullptr);
+    }
+};
+
+// A global load and store at an address from a constant buffer, with two NVN storage buffers
+// the address can route to.
+std::vector<u32> EmitRoutedGlobals(Stage stage, const char* mode) {
+    const InlineGlobalsMode guard{mode};
+    Program fixture;
+    fixture.program.stage = stage;
+    auto& info = fixture.program.info;
+    info.used_storage_buffer_types = IR::Type::U32;
+    info.storage_buffers_descriptors = {{0, 0x340, 1, true}, {0, 0x400, 1, true}};
+    info.nvn_buffer_base = 0x310;
+    info.nvn_buffer_used.set(3);
+    info.nvn_buffer_used.set(15);
+    info.uses_global_memory = true;
+    info.uses_int64 = true;
+    info.stores_global_memory = true;
+    info.constant_buffer_descriptors = {{0, 1}};
+    info.used_constant_buffer_types = IR::Type::U32 | IR::Type::U32x2;
+    fixture.profile.support_int64 = true;
+    fixture.profile.support_descriptor_aliasing = true;
+    IR::IREmitter ir{fixture.block};
+    const auto address = ir.PackUint2x32(
+        ir.CompositeConstruct(ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x10)), ir.Imm32(0)));
+    ir.WriteGlobal32(address, ir.LoadGlobal32(address));
+    return Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+}
+
+constexpr u32 SpvOpEntryPoint = 15;
+constexpr u32 SpvOpFunction = 54;
+constexpr u32 SpvOpFunctionCall = 57;
+constexpr u32 SpvOpBranchConditional = 250;
+constexpr u32 SpvOpSwitch = 251;
+constexpr u32 SpvDontInline = 0x2;
+
+// The functions emitted with DontInline.
+std::vector<u32> DontInlineFunctions(const std::vector<u32>& code) {
+    std::vector<u32> result;
+    for (const auto& op : Instructions(code, SpvOpFunction)) {
+        REQUIRE(op.size() == 4);
+        if ((op[2] & SpvDontInline) != 0) {
+            result.push_back(op[1]);
+        }
+    }
+    return result;
+}
 } // namespace
 
 TEST_CASE("Native LDG cache policy reaches every global load width", "[video_core][coherence]") {
@@ -403,6 +480,8 @@ TEST_CASE("SPIR-V global memory helpers are emitted as DontInline functions",
         ir.PackUint2x32(ir.CompositeConstruct(ir.LocalInvocationIdX(), ir.Imm32(0)));
     ir.WriteGlobal32(address, ir.LoadGlobal32(address));
 
+    // DontInline helpers are mode 0 (the default, 1, inlines them).
+    const InlineGlobalsMode mode{"0"};
     const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
     constexpr u32 OpEntryPoint = 15;
     constexpr u32 OpFunction = 54;
@@ -428,6 +507,76 @@ TEST_CASE("SPIR-V global memory helpers are emitted as DontInline functions",
         CAPTURE(callee);
         REQUIRE(controls.contains(callee));
         CHECK((controls.at(callee) & DontInline) != 0);
+    }
+}
+
+TEST_CASE("SPIR-V global memory mode 3 searches the buffers in one DontInline function",
+          "[video_core][spirv][global_memory]") {
+    const auto code = EmitRoutedGlobals(Stage::Compute, "3");
+    // Only the search is DontInline: the helpers and the entry point stay inlinable.
+    const auto dont_inline = DontInlineFunctions(code);
+    REQUIRE(dont_inline.size() == 1);
+    const u32 search = dont_inline[0];
+    const auto entry_points = Instructions(code, SpvOpEntryPoint);
+    REQUIRE(entry_points.size() == 1);
+    CHECK(entry_points[0][1] != search);
+
+    // Each of the 32, 64 and 128-bit load and store helpers calls it once.
+    const auto calls = Instructions(code, SpvOpFunctionCall);
+    CHECK(std::ranges::count_if(calls, [&](const auto& op) {
+              REQUIRE(op.size() >= 3);
+              return op[2] == search;
+          }) == 6);
+
+    // and then switches once over the two NVN buffers (selector, default, then value/label pairs).
+    const auto switches = Instructions(code, SpvOpSwitch);
+    REQUIRE(switches.size() == 6);
+    for (const auto& op : switches) {
+        REQUIRE(op.size() == 6);
+        CHECK(op[2] == 0);
+        CHECK(op[4] == 1);
+    }
+
+    // The per-buffer range tests live only in the search; mode 1 repeats them in every helper.
+    const auto search_branches = Instructions(code, SpvOpBranchConditional).size();
+    CHECK(search_branches == 2);
+    const auto inlined = EmitRoutedGlobals(Stage::Compute, "1");
+    CHECK(DontInlineFunctions(inlined).empty());
+    CHECK(Instructions(inlined, SpvOpSwitch).empty());
+    CHECK(Instructions(inlined, SpvOpBranchConditional).size() == 6 * search_branches);
+}
+
+TEST_CASE("SPIR-V global memory mode 3 leaves graphics programs as mode 1 emits them",
+          "[video_core][spirv][global_memory]") {
+    const auto inlined = EmitRoutedGlobals(Stage::Fragment, "1");
+    CHECK_FALSE(Instructions(inlined, SpvOpBranchConditional).empty());
+    CHECK(EmitRoutedGlobals(Stage::Fragment, "3") == inlined);
+}
+
+TEST_CASE("SPIR-V global memory mode 3 routes atomics through the shared search",
+          "[video_core][spirv][global_memory][global_atomic]") {
+    for (const bool native : {false, true}) {
+        CAPTURE(native);
+        const InlineGlobalsMode mode{"3"};
+        GlobalAtomicProgram fixture{native};
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        const size_t candidates = native ? 3U : 2U;
+        // One atomic per candidate buffer, each one's old value returned.
+        const auto atomics = Instructions(code, 234);
+        REQUIRE(atomics.size() == candidates);
+        const auto returns = Instructions(code, 254);
+        for (const auto& op : atomics) {
+            REQUIRE(op.size() == 6);
+            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
+                return returned.size() == 1 && returned[0] == op[1];
+            }));
+        }
+        REQUIRE(DontInlineFunctions(code).size() == 1);
+        const auto switches = Instructions(code, SpvOpSwitch);
+        REQUIRE_FALSE(switches.empty());
+        for (const auto& op : switches) {
+            CHECK(op.size() == 2 + 2 * candidates);
+        }
     }
 }
 

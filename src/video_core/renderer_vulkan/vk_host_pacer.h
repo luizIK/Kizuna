@@ -71,8 +71,13 @@ public:
     /// wait is taken as broken on this driver and the pacer turns itself off for the session.
     void NoteShownWait(bool shown);
 
-    /// Target made the present thread wait `hold`.
-    void NoteHold(std::chrono::nanoseconds hold);
+    /// Target made the present thread wait from `start` until it woke at `woke`.
+    void NoteHold(Clock::time_point start, Clock::time_point woke);
+
+    /// FRITCHII_PACE_FIX as Refresh read it (bits: 1 present early, 2 copy before the hold).
+    [[nodiscard]] int Fix() const {
+        return fix;
+    }
 
     /// vkWaitForPresentKHR returned for `id` at `shown`, or the present was lost.
     void NoteShown(u64 id, Clock::time_point shown, bool was_lost);
@@ -94,9 +99,15 @@ private:
         u64 id;
         Clock::time_point submitted;
         std::optional<Clock::time_point> intended; // the refresh it was held for
+        std::optional<Clock::time_point> target;   // when it was to be presented
+        std::optional<Clock::time_point> woke;     // when the hold ended
+        bool catch_up;                             // shown a refresh early on purpose
     };
 
     void Report(Clock::time_point now);
+
+    /// How long before the intended refresh a frame is presented.
+    [[nodiscard]] double LeadNs() const;
 
     bool pacing{};
     bool broken{};           ///< Present wait does not signal here: pacing stays off
@@ -114,6 +125,11 @@ private:
     std::optional<Clock::time_point> last_shown;
     u64 last_shown_id{};
     std::optional<Clock::time_point> pending_intended;
+    std::optional<Clock::time_point> pending_target;
+    std::optional<Clock::time_point> pending_woke;
+    bool pending_catch_up{};
+    int fix{};               ///< FRITCHII_PACE_FIX
+    double guard_extra_ns{}; ///< FRITCHII_PACE_FIX 1: added after frames shown a refresh early
     double lead_ns{2.0e6};
     u32 early_streak{}; ///< Frames in a row that could have been shown a refresh earlier
     u64 outstanding{};
@@ -124,6 +140,13 @@ private:
     std::array<u32, 6> refreshes_shown{}; // 0 (same refresh), 1, 2, 3, 4, 5+
     u32 frames{}, held{}, missed{}, lost{}, caught_up{};
     double interval_sum_ms{}, interval_max_ms{}, hold_sum_ms{}, latency_sum_ms{};
+    // Why frames missed their refresh, and the present path's time (FRITCHII_PACE_FIX's proof).
+    u32 missed_catch_up{}, missed_woke{}, missed_copy{}, missed_after{}, game_late{}, early{};
+    u32 copies{};
+    double missed_left_sum_ms{}, missed_left_max_ms{}, copy_sum_ms{}, copy_max_ms{};
 };
+
+/// The primary display's height in pixels (its current mode), 0 when unknown.
+[[nodiscard]] u32 PrimaryDisplayHeight();
 
 } // namespace Vulkan

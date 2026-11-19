@@ -380,11 +380,13 @@ bool Start(const std::filesystem::path& path, double seconds, bool detail) {
     g_guest.store(GuestEnabled(), std::memory_order_relaxed);
     g_detail.store(detail, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
+    g_zone_gate.fetch_or(ZoneGateTimeline, std::memory_order_release);
     LOG_INFO(Debug, "Timeline: recording {:.1f} s{}", seconds,
              g_guest.load(std::memory_order_relaxed) ? " with the guest layer" : "");
     std::thread([path, seconds] {
         std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
         g_active.store(false, std::memory_order_release);
+        g_zone_gate.fetch_and(static_cast<u8>(~ZoneGateTimeline), std::memory_order_release);
         // Spans that began before the end finish their Record under their buffer's lock.
         std::this_thread::sleep_for(std::chrono::milliseconds{50});
         Write(path, seconds);

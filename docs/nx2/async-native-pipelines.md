@@ -54,10 +54,10 @@ The pipeline cache drains its workers and explicitly destroys graphics pipelines
 pool cache and other build dependencies are still alive. Destruction may claim a queued native
 build; ordinary native draw waits never do.
 
-## Upstream alternative
+## Alternative design
 
-[Eglantine PR #503](https://github.com/Djihads80/Eglantine/pull/503), inspected at
-`7584d618f8dec5fc1fa8c76fde68489ab5f76c9c`, implements full async translation with detached
+A related change in another build, inspected at its latest revision,
+implements full async translation with detached
 environments. Its desktop timeout discards native draws, and its texture snapshots still read
 live descriptor memory later without synchronization. Porting that behavior would violate this
 track's correctness requirements. Making GPUBack wait for the entire translation instead would

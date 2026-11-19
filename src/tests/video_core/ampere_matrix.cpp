@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Half conversion oracle and RTX 4090 reference fragments adapted from Duck912/eden-fefw
-// native_shader.cpp at 8c6f0522b6ee07caa47ab4363823d3dc00aa8ac1.
+// Half conversion oracle and RTX 4090 reference fragments adapted from a ported
+// native_shader.cpp.
 #include <array>
 #include <bit>
 #include <cmath>

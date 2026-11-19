@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -23,6 +22,11 @@ public:
 
     bool IsLockedByCurrentThread() const {
         return m_owner_thread == GetCurrentThreadPointer(m_kernel);
+    }
+
+    // EXP98 (KScheduler's yield early return): the spin lock word reads free.
+    bool IsFree() const {
+        return m_spin_lock.IsFree();
     }
 
     void Lock() {

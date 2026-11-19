@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <fmt/format.h>
 #include "common/frizti_settings.h"
 
@@ -10,6 +11,7 @@ constexpr std::string_view RevisionKey = "revision";
 constexpr std::string_view GlobalPrefix = "global.";
 constexpr std::string_view PerGamePrefix = "game.";
 constexpr std::string_view UseGlobal = "global";
+constexpr std::string_view FoldedKey = "oot_folded";
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
@@ -34,7 +36,7 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.use_docked_mode,          // Docked
         &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
         &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
-        &values.scaling_filter,           // ScaleForce (newer Lichii builds seed FSR)
+        &values.scaling_filter,           // Auto: Area above the window size, else ScaleForce
         &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
         &values.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
         &values.cpu_accuracy,             // Auto
@@ -52,6 +54,9 @@ std::string SerializeRecord(const Record& record) {
     std::string text = "# Written by the Frizti builds: the tuned settings as they last saved "
                        "them. Other builds share qt-config.ini but not this file.\n";
     text += fmt::format("{}={}\n", RevisionKey, record.revision);
+    if (record.oot_folded) {
+        text += fmt::format("{}=1\n", FoldedKey);
+    }
     for (const auto& [label, value] : record.global) {
         text += fmt::format("{}{}={}\n", GlobalPrefix, label, value);
     }
@@ -79,6 +84,8 @@ Record ParseRecord(std::string_view text) {
             } catch (...) {
                 record.revision = 0;
             }
+        } else if (key == FoldedKey) {
+            record.oot_folded = value == "1";
         } else if (key.starts_with(GlobalPrefix)) {
             record.global.insert_or_assign(std::string{key.substr(GlobalPrefix.size())}, value);
         } else if (key.starts_with(PerGamePrefix)) {
@@ -133,6 +140,47 @@ std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, co
     return changes;
 }
 
+std::vector<Moved> FoldPerGame(std::span<BasicSetting* const> settings) {
+    std::vector<Moved> moved;
+    for (BasicSetting* const setting : settings) {
+        if (!setting->Switchable() || !setting->Save() || setting->UsingGlobal()) {
+            continue;
+        }
+        const std::string value = setting->ToString();
+        setting->SetGlobal(true);
+        if (setting->ToString() == value) {
+            continue; // the override matched the main value
+        }
+        const std::string from = setting->Canonicalize();
+        setting->LoadString(value);
+        moved.push_back({setting, from, setting->Canonicalize()});
+    }
+    return moved;
+}
+
+std::vector<Change> FoldPerGamePlayers(Values& values) {
+    std::vector<Change> changes;
+    const bool was_global = values.players.UsingGlobal();
+    values.players.SetGlobal(false);
+    auto& custom = values.players.GetValue();
+    auto& global = values.players.GetValue(true);
+    for (size_t index = 0; index < custom.size(); ++index) {
+        if (custom[index].profile_name.empty()) {
+            continue; // this player already uses the main controls
+        }
+        const std::string from = global[index].profile_name;
+        global[index] = custom[index];
+        custom[index].profile_name.clear();
+        if (from != global[index].profile_name) {
+            changes.push_back({fmt::format("player_{}_profile", index),
+                               from.empty() ? std::string{"own"} : from,
+                               global[index].profile_name});
+        }
+    }
+    values.players.SetGlobal(was_global);
+    return changes;
+}
+
 std::vector<Change> FixDockedController(Values& values) {
     auto& player = values.players.GetValue(true)[0];
     if (values.use_docked_mode.GetValue(true) != ConsoleMode::Docked ||
@@ -158,6 +206,25 @@ std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> 
                        setting->UsingGlobal() ? std::string{UseGlobal} : setting->ToString());
     }
     return values;
+}
+
+StartupApply DecideStartup(u32 stored, u32 recorded, std::string_view prompt) {
+    if (prompt == "ask") {
+        return StartupApply::Ask;
+    }
+    if ((std::min)(stored, recorded) >= Revision) {
+        return StartupApply::Reconcile;
+    }
+    // frizti.ini says this revision was handled (answered) already, only qt-config.ini lost it:
+    // as before the prompt, the tuned values again.
+    if (recorded >= Revision) {
+        return StartupApply::Full;
+    }
+    // Nothing from an earlier Fritchii: a fresh install or another build's config.
+    if (stored == 0 && recorded == 0) {
+        return StartupApply::Full;
+    }
+    return prompt == "0" ? StartupApply::Reconcile : StartupApply::Ask;
 }
 
 std::string FormatChanges(std::span<const Change> changes) {

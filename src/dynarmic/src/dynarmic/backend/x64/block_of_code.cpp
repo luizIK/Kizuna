@@ -83,6 +83,39 @@ Xbyak::Allocator* CodeAllocator() {
     static auto* const allocator = new ReservingAllocator;
     return allocator;
 }
+
+// Commits [base, base + needed), rounded up to the next step, at most to base + limit;
+// `committed` is how much of it already is. The space is only reserved (CodeAllocator), so
+// everything up to the end of the next emission has to be committed; in steps, as each
+// VirtualAlloc call is a kernel call.
+void CommitPrefix(u8* base, size_t& committed, size_t needed, size_t limit) {
+    if (committed >= needed) {
+        return;
+    }
+    const size_t new_size = std::min<size_t>(limit, (std::max)(committed + COMMIT_STEP, needed));
+#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+    constexpr DWORD protection = PAGE_READWRITE;
+#    else
+    constexpr DWORD protection = PAGE_EXECUTE_READWRITE;
+#    endif
+    // CheezyEmu ed3246c6f2 (#310, Kaj): Windows denies commits while the system is at its
+    // commit limit, including while it grows the paging file. Emitting into pages that
+    // aren't committed crashes, so wait for the commit, up to ~10 s, then stop with a clear
+    // message. committed only grows once the commit succeeded.
+    for (int attempt = 0; !VirtualAlloc(base, new_size, MEM_COMMIT, protection); ++attempt) {
+        const DWORD error = GetLastError();
+        if (attempt == 0) {
+            LOG_WARNING(Core, "Can't commit {} MiB of JIT code space yet (error {}), retrying",
+                        new_size >> 20, error);
+        }
+        if (attempt == 100) {
+            UNREACHABLE_MSG("Can't commit {} MiB of JIT code space, out of memory (error {})",
+                            new_size >> 20, error);
+        }
+        Sleep(attempt < 10 ? 10 : 100);
+    }
+    committed = new_size;
+}
 #else
 Xbyak::Allocator* CodeAllocator() {
     return nullptr;
@@ -170,7 +203,7 @@ bool IsUnderRosetta() {
 
 }  // anonymous namespace
 
-BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp)
+BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins_, StateRefConfig state_refs_)
     : Xbyak::CodeGenerator(total_code_size
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         , Xbyak::DontSetProtectRWE
@@ -181,6 +214,8 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     , constant_pool(*this, CONSTANT_POOL_SIZE)
     , jsi(jsi)
     , cb(std::move(cb))
+    , pins(std::move(pins_))
+    , state_refs(state_refs_)
 {
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
@@ -202,8 +237,11 @@ void BlockOfCode::EnableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, false);
+    if (far_committed_size != 0) {
+        ProtectMemory(getCode() + far_code_begin, far_committed_size, false);
+    }
 #    else
-    ProtectMemory(getCode(), maxSize_, false);
+    ProtectMemory(getCode(), GetTotalCodeSize(), false);
 #    endif
 #endif
 }
@@ -212,19 +250,35 @@ void BlockOfCode::DisableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, true);
+    if (far_committed_size != 0) {
+        ProtectMemory(getCode() + far_code_begin, far_committed_size, true);
+    }
 #    else
-    ProtectMemory(getCode(), maxSize_, true);
+    ProtectMemory(getCode(), GetTotalCodeSize(), true);
 #    endif
 #endif
 }
 
 void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
+    if (far_code_begin != 0) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): both regions start over, emission in the near one.
+        in_far_code = false;
+        far_code_offset = far_code_begin;
+    }
     SetCodePtr(code_begin);
 }
 
 size_t BlockOfCode::SpaceRemaining() const {
     ASSERT(prelude_complete);
+    if (far_code_begin != 0) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): the fuller region decides.
+        const size_t near_offset = in_far_code ? near_code_offset : size_;
+        const size_t far_offset = in_far_code ? size_ : far_code_offset;
+        const size_t near_left = near_offset >= far_code_begin ? 0 : far_code_begin - near_offset;
+        const size_t far_left = far_offset >= code_space_size ? 0 : code_space_size - far_offset;
+        return (std::min)(near_left, far_left);
+    }
     const u8* current_ptr = getCurr<const u8*>();
     if (current_ptr >= &top_[maxSize_])
         return 0;
@@ -233,17 +287,63 @@ size_t BlockOfCode::SpaceRemaining() const {
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #ifdef _WIN32
-    if (committed_size < size_ + codesize) {
-        // The code space is only reserved (CodeAllocator), so everything up to the end of the next
-        // emission has to be committed; in steps, as each VirtualAlloc call is a kernel call.
-        committed_size = std::min<size_t>(maxSize_, (std::max)(committed_size + COMMIT_STEP, size_ + codesize));
-#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_READWRITE);
-#    else
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-#    endif
+    if (far_code_begin == 0) {
+        CommitPrefix(top_, committed_size, size_ + codesize, maxSize_);
+        return;
     }
+    // Fritchii (FRITCHII_JIT_FAR_CODE): each region from its own start, at its write position.
+    const size_t near_offset = in_far_code ? near_code_offset : size_;
+    const size_t far_offset = in_far_code ? size_ : far_code_offset;
+    CommitPrefix(top_, committed_size, near_offset + codesize, far_code_begin);
+    CommitPrefix(top_ + far_code_begin, far_committed_size, far_offset - far_code_begin + codesize,
+                 code_space_size - far_code_begin);
 #endif
+}
+
+void BlockOfCode::EnableFarCode(size_t far_size) {
+    ASSERT(!prelude_complete && far_code_begin == 0);
+    constexpr size_t page = 64 * 1024; // VirtualAlloc's granularity, so commits of the regions never share a page
+    far_size &= ~(page - 1);
+    ASSERT(far_size >= page && far_size + size_ + page <= maxSize_);
+    code_space_size = maxSize_;
+    far_code_begin = maxSize_ - far_size;
+    far_code_offset = far_code_begin;
+    near_code_offset = 0;
+    in_far_code = false;
+    // Xbyak stops near code at the far region (ERR_CODE_IS_TOO_BIG, as at the end of the space).
+    maxSize_ = far_code_begin;
+}
+
+void BlockOfCode::SwitchToFarCode() {
+    ASSERT(far_code_begin != 0 && !in_far_code);
+    near_code_offset = size_;
+    maxSize_ = code_space_size;
+    setSize(far_code_offset);
+    in_far_code = true;
+}
+
+void BlockOfCode::SwitchToNearCode() {
+    ASSERT(far_code_begin != 0 && in_far_code);
+    far_code_offset = size_;
+    maxSize_ = far_code_begin;
+    setSize(near_code_offset);
+    in_far_code = false;
+}
+
+CodePtr BlockOfCode::GetFarCodeCurr() const {
+    if (far_code_begin == 0) {
+        return nullptr;
+    }
+    return in_far_code ? getCurr() : getCode() + far_code_offset;
+}
+
+size_t BlockOfCode::SmallestRegionSize() const {
+    if (far_code_begin == 0) {
+        return maxSize_;
+    }
+    const size_t prelude = code_begin != nullptr ? size_t(static_cast<const u8*>(code_begin) - getCode()) : 0;
+    const size_t near_size = far_code_begin - prelude;
+    return (std::min)(near_size, code_space_size - far_code_begin);
 }
 
 HaltReason BlockOfCode::RunCode(void* jit_state, CodePtr code_ptr) const {
@@ -292,6 +392,8 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     // r14 = page table
     // r13 = fastmem pointer
     rcp(*this);
+    LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
+    ShadowPinnedRegisters();
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -312,6 +414,8 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     }
 
     rcp(*this);
+    LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
+    ShadowPinnedRegisters();
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -321,15 +425,22 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     jmp(ABI_PARAM2);
 
     // Dispatcher loop
+    // Fritchii (FRITCHII_JIT_PIN): from here the pins are live, calls out store and reload them.
+    // The stores and reloads make the code to the exit longer than a short jump reaches.
+    SetPinCallHook(true);
+    const LabelType exit_jump = pins.regs.empty() ? T_AUTO : T_NEAR;
 
     align();
     return_from_run_code[0] = getCurr<const void*>();
 
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
-    jne(return_to_caller);
+    jne(return_to_caller, exit_jump);
     if (cb.enable_cycle_counting) {
         cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
-        jng(return_to_caller);
+        jng(return_to_caller, exit_jump);
     }
     cb.LookupBlock.EmitCall(*this);
     jmp(ABI_RETURN);
@@ -337,11 +448,14 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     align();
     return_from_run_code[MXCSR_ALREADY_EXITED] = getCurr<const void*>();
 
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
-    jne(return_to_caller_mxcsr_already_exited);
+    jne(return_to_caller_mxcsr_already_exited, exit_jump);
     if (cb.enable_cycle_counting) {
         cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
-        jng(return_to_caller_mxcsr_already_exited);
+        jng(return_to_caller_mxcsr_already_exited, exit_jump);
     }
     SwitchMxcsrOnEntry();
     cb.LookupBlock.EmitCall(*this);
@@ -357,6 +471,13 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     return_from_run_code[MXCSR_ALREADY_EXITED | FORCE_RETURN] = getCurr<const void*>();
     L(return_to_caller_mxcsr_already_exited);
 
+    // Fritchii (FRITCHII_JIT_PIN): the guest registers go back to the state block for the caller.
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
+    StorePinnedRegisters();
+    SetPinCallHook(false);
+
     if (cb.enable_cycle_counting) {
         cb.AddTicks.EmitCall(*this, [this](RegList param) {
             mov(param[0], qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_to_run)]);
@@ -371,6 +492,105 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     ret();
 
     PerfMapRegister(run_code, getCurr(), "dynarmic_dispatcher");
+}
+
+void BlockOfCode::PinsBeforeCall() {
+    if (!pin_call_hook) {
+        return;
+    }
+    // FRITCHII_JIT_VERIFY=1: guest register writes went to the state block too; a store here
+    // would hide a pinned register that something else changed.
+    if (pins.verify) {
+        CheckPinnedRegisters();
+        if (!pins.shadow) {
+            return;
+        }
+    }
+    // =2 stores like the code without verify: the callee sees what the shipping code gives it.
+    StorePinnedRegisters();
+}
+
+void BlockOfCode::PinsAfterCall() {
+    if (!pin_call_hook) {
+        return;
+    }
+    if (pins.shadow) {
+        ReloadPinnedRegistersVerified();
+    } else {
+        LoadPinnedRegisters();
+    }
+}
+
+void BlockOfCode::StorePinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(qword[ABI_JIT_PTR + pin.state_offset], pin.host);
+    }
+}
+
+void BlockOfCode::LoadPinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+    }
+}
+
+void BlockOfCode::CheckPinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        // FRITCHII_JIT_VERIFY=2 compares with the shadow, =1 with the state block.
+        const u32 copy = pins.shadow ? pin.shadow_offset : pin.state_offset;
+        Xbyak::Label same;
+        cmp(pin.host, qword[ABI_JIT_PTR + copy]);
+        je(same);
+        inc(qword[ABI_JIT_PTR + pins.mismatch_offset]);
+        mov(pin.host, qword[ABI_JIT_PTR + copy]);
+        L(same);
+        if (pins.shadow) {
+            // The own slot must still hold the poison: the last call out's reload poisoned it
+            // again, and nothing in generated code writes it.
+            Xbyak::Label poisoned, written;
+            cmp(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+            jne(written);
+            cmp(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+            je(poisoned);
+            L(written);
+            inc(qword[ABI_JIT_PTR + pins.slot_written_offset]);
+            mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+            mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+            L(poisoned);
+        }
+    }
+}
+
+void BlockOfCode::ShadowPinnedRegisters() {
+    if (!pins.shadow) {
+        return;
+    }
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(qword[ABI_JIT_PTR + pin.shadow_offset], pin.host);
+        mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+    }
+}
+
+void BlockOfCode::ReloadPinnedRegistersVerified() {
+    // After a call out the flags are dead (the callee wrote them); rax (the return value) and
+    // the other caller-saved registers are not touched.
+    for (const PinnedRegister& pin : pins.regs) {
+        Xbyak::Label fresh;
+        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        // Still the poison: the store before this call did not run, so the callee saw the poison
+        // and the value from before the call is only in the shadow.
+        cmp(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        jne(fresh);
+        cmp(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+        jne(fresh);
+        inc(qword[ABI_JIT_PTR + pins.store_missed_offset]);
+        mov(pin.host, qword[ABI_JIT_PTR + pin.shadow_offset]);
+        L(fresh);
+        // A value the callee wrote (SetRegister) is taken as it is, like LoadPinnedRegisters.
+        mov(qword[ABI_JIT_PTR + pin.shadow_offset], pin.host);
+        mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+    }
 }
 
 void BlockOfCode::SwitchMxcsrOnEntry() {
@@ -471,7 +691,7 @@ CodePtr BlockOfCode::GetCodeBegin() const {
 }
 
 size_t BlockOfCode::GetTotalCodeSize() const {
-    return maxSize_;
+    return far_code_begin != 0 ? code_space_size : maxSize_;
 }
 
 void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {
@@ -491,6 +711,13 @@ void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {
 void BlockOfCode::SetCodePtr(CodePtr code_ptr) {
     // The "size" defines where top_, the insertion point, is.
     size_t required_size = reinterpret_cast<const u8*>(code_ptr) - getCode();
+    if (far_code_begin != 0) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): a patch may sit in either region; Xbyak's limit
+        // follows the region of the new position (its start counts as the near region's end
+        // while near code is emitted).
+        const bool to_far = required_size > far_code_begin || (required_size == far_code_begin && in_far_code);
+        maxSize_ = to_far ? code_space_size : far_code_begin;
+    }
     setSize(required_size);
 }
 

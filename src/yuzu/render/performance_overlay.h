@@ -32,6 +32,8 @@ public:
 
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -40,6 +42,8 @@ protected:
 private:
     void resetPosition(const QPoint& pos);
     void updateStats(const Core::PerfStatsResults& results, const VideoCore::ShaderNotify& shaders);
+    /// View > Frame Times on or off (render/frame_budget_view.h).
+    void applyTimes();
 
     MainWindow* m_mainWindow = nullptr;
     Ui::PerformanceOverlay* ui;
@@ -70,6 +74,10 @@ private:
     QValueAxis* m_fpsY = nullptr;
 
     QLabel* m_dlssLabel = nullptr;
+
+    // frame times: GPU, CPU, the main threads and what limits the frame rate
+    QLabel* m_timesLabel = nullptr;
+    bool m_timesOn = false;
 
 signals:
     void closed();

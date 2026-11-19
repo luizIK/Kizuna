@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <vector>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/host1x/syncpoint_manager.h"
@@ -114,4 +116,35 @@ TEST_CASE("Syncpoint action IDs stay distinct across counters and host guest ban
     manager.IncrementHost(1);
     REQUIRE(guest_calls == 1);
     REQUIRE(host_calls == 1);
+}
+
+TEST_CASE("The guest mirror sees each increment before it is published and its actions run",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::vector<u32> mirrored;
+    bool published_early{};
+    int owner{};
+    int other{};
+    manager.SetGuestMirror(&owner, [&](u32 id, u32 value) {
+        REQUIRE(id == 3);
+        published_early |= manager.IsReadyGuest(id, value);
+        mirrored.push_back(value);
+    });
+    u32 mirrored_at_action{};
+    manager.RegisterGuestAction(3, 2, [&] { mirrored_at_action = mirrored.back(); });
+    manager.IncrementGuest(3);
+    manager.IncrementGuest(3);
+    manager.IncrementHost(3);
+    REQUIRE(mirrored == std::vector<u32>{1, 2});
+    REQUIRE_FALSE(published_early);
+    REQUIRE(mirrored_at_action == 2);
+
+    // Another owner's clear leaves the mirror in place; the owner's removes it.
+    manager.ClearGuestMirror(&other);
+    manager.IncrementGuest(3);
+    REQUIRE(mirrored.size() == 3);
+    manager.ClearGuestMirror(&owner);
+    manager.IncrementGuest(3);
+    REQUIRE(mirrored.size() == 3);
+    REQUIRE(manager.GetGuestSyncpointValue(3) == 4);
 }

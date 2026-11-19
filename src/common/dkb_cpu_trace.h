@@ -23,6 +23,7 @@ enum class Role : size_t {
     GpuCommand,
     GpuBack,
     VulkanWorker,
+    GpuMem,
     Count,
 };
 
@@ -31,7 +32,7 @@ inline constexpr size_t RoleCount = static_cast<size_t>(Role::Count);
 inline constexpr std::array<std::string_view, RoleCount> RoleNames{
     "guest_core_0_host", "guest_core_1_host", "guest_core_2_host", "guest_core_3_host",
     "guest_core_4_host", "guest_core_5_host", "guest_single_core_host", "gpu_command",
-    "gpu_back", "vulkan_worker",
+    "gpu_back", "vulkan_worker", "gpu_mem",
 };
 
 struct ThreadSample {

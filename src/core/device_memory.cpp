@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _WIN32
@@ -7,7 +6,6 @@
 #include <condition_variable>
 #include <mutex>
 #include <new>
-#include <utility>
 
 #include <cstdlib>
 
@@ -16,7 +14,12 @@
 #include "common/thread.h"
 #endif
 
+#include <algorithm>
+
+#include <fmt/format.h>
+
 #include "core/device_memory.h"
+#include "common/memory_detect.h"
 #include "common/nx2_hitch.h"
 #include "hle/kernel/board/nintendo/nx/k_system_control.h"
 
@@ -41,9 +44,37 @@ DeviceMemory::DeviceMemory()
         memory_probe_thread = std::jthread{[this](std::stop_token stop) { ProbeMemory(stop); }};
     }
 #endif
+    // FRITCHII_MEM_CENSUS (boot): the guest ranges named in the census, and the sampled guest
+    // residency (backing, views, pages resident through both) beside it.
+    if (Common::MemCensus::Mode() != 0) {
+        Common::MemCensus::Tag(
+            "guest backing", buffer.BackingBasePointer(),
+            Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize());
+        Common::MemCensus::Tag("guest views", buffer.VirtualBasePointer(), buffer.VirtualSize());
+#ifdef _WIN32
+        Common::MemCensus::SetGuestSampler([this] {
+            const auto sample = buffer.SampleResident();
+            const u64 unique = sample.backing_bytes + sample.view_bytes -
+                               (std::min)(sample.view_bytes, sample.both_bytes);
+            return fmt::format("guest sampled: backing {} + views {} - both {} = {} MiB of RAM "
+                               "(views map {} MiB, {} us)",
+                               sample.backing_bytes >> 20, sample.view_bytes >> 20,
+                               sample.both_bytes >> 20, unique >> 20,
+                               sample.view_mapped_bytes >> 20, sample.micros);
+        });
+#endif
+        Common::MemCensus::Start();
+    }
 }
 
-DeviceMemory::~DeviceMemory() = default;
+DeviceMemory::~DeviceMemory() {
+    if (Common::MemCensus::Mode() != 0) {
+        Common::MemCensus::Stop();
+        Common::MemCensus::SetGuestSampler(nullptr);
+        Common::MemCensus::Untag(buffer.BackingBasePointer());
+        Common::MemCensus::Untag(buffer.VirtualBasePointer());
+    }
+}
 
 #ifdef _WIN32
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
@@ -76,6 +107,16 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         return total;
     };
     const std::chrono::seconds max_interval = idle_timing ? 300s : 60s;
+    // FRITCHII_ZERO_TRIM_CHUNK's part of the pass lines (helper CR): with either value, the
+    // longest VirtualUnlock call and the guest map/unmap/protect calls made while the pass
+    // unlocked (the longest is what a frame can wait for).
+    const auto chunk_text = [](const Common::HostMemory::ZeroTrimPhases& phases) {
+        return fmt::format("; FRITCHII_ZERO_TRIM_CHUNK={}: {} unlock calls, longest {:.1f} ms; "
+                           "guest map/protect calls meanwhile {}, longest {:.1f} ms",
+                           phases.chunk_mode, phases.unlock_calls,
+                           static_cast<double>(phases.longest_call_us) / 1e3, phases.guest_calls,
+                           static_cast<double>(phases.longest_guest_us) / 1e3);
+    };
     while (true) {
         {
             std::unique_lock lock{mutex};
@@ -86,6 +127,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         }
         // Busy: over 32 MiB mapped, unmapped or protected in the last half second. At most 10
         // waits (5 s), then the pass runs anyway.
+        bool mapping_nonstop = idle_timing;
         for (int wait = 0; idle_timing && wait < 10; ++wait) {
             const u64 before = mapped_bytes();
             {
@@ -96,6 +138,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 return;
             }
             if (mapped_bytes() - before < (u64{32} << 20)) {
+                mapping_nonstop = false;
                 break;
             }
         }
@@ -105,10 +148,9 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         try {
             result = buffer.TrimZeroPages();
         } catch (const std::bad_alloc&) {
-            // From zortos293/Lichii#1451: a pass needs 32 MiB and more of scratch. When Windows
-            // runs out of commit, the exception leaving this thread ended the emulator; the pass
-            // is only a saving.
             Common::Nx2Hitch::ZeroTrimEnd();
+            // A pass needs 32 MiB and more of scratch. When Windows runs out of commit, the
+            // exception leaving this thread ended the emulator; the pass is only a saving.
             interval = std::chrono::seconds{60};
             const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
             LOG_WARNING(HW_Memory,
@@ -131,24 +173,31 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 LOG_INFO(HW_Memory,
                          "Zero-page pass: {} MiB trimmed of {} MiB resident in {} ms (next in {} s); "
                          "working set query {} ms, page reads {} ms, {} unlock runs {} ms "
-                         "(longest {:.1f})",
+                         "(longest {:.1f}){}",
                          trimmed >> 20, resident >> 20, ms,
                          (std::min)(interval * 2, std::chrono::seconds{max_interval}).count(),
                          phases.query_us / 1000, phases.scan_us / 1000, phases.unlock_runs,
-                         phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3);
+                         phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3,
+                         chunk_text(phases));
             }
             interval = (std::min)(interval * 2, std::chrono::seconds{max_interval});
             continue;
         }
-        interval = 5s;
+        // The game mapped through every wait (a fight spawning and killing every frame): don't
+        // come back in 5 s, or the next pass lands in it again (fable52_answer_backdraw (b) 1).
+        interval = mapping_nonstop
+                       ? (std::min)((std::max)(interval * 2, std::chrono::seconds{60}),
+                                    std::chrono::seconds{max_interval})
+                       : 5s;
         const auto phases = Common::HostMemory::LastZeroTrimPhases();
         LOG_INFO(HW_Memory,
                  "Trimmed {} MiB of all-zero guest pages out of {} MiB resident in {} ms; the kernel "
                  "zero-filled {} MiB so far; working set query {} ms, page reads {} ms, {} unlock "
-                 "runs {} ms (longest {:.1f})",
+                 "runs {} ms (longest {:.1f}){}",
                  trimmed >> 20, resident >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20,
                  phases.query_us / 1000, phases.scan_us / 1000, phases.unlock_runs,
-                 phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3);
+                 phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3,
+                 chunk_text(phases));
     }
 }
 
@@ -166,7 +215,14 @@ void DeviceMemory::ProbeMemory(std::stop_token stop) {
             return;
         }
         // Published for the GPU thread's line (Vulkan::LogMemoryOwners), which reads the last ones.
-        {
+        // Only for a memory hunt: EDEN_NX2_MEM_SAMPLE=1. The walk holds kernel locks for 35-48 ms
+        // every 10 s, which the owner's playtest (2026-11-14) showed inside a 217 ms hitch; nothing
+        // but that log line uses it, which shows 0 resident without it.
+        static const bool sample_resident = [] {
+            const char* value = std::getenv("EDEN_NX2_MEM_SAMPLE");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (sample_resident) {
             const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::MemorySample};
             static_cast<void>(buffer.SampleResident());
         }

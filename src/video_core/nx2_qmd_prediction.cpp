@@ -235,20 +235,50 @@ enum class FeedOff : u32 {
     Unpredicted,     ///< A back release or reduction no record predicted
     Phantom,         ///< A record the back never made
     LostEvents,      ///< A full ring dropped back releases or landings
+    WrongMeet,       ///< FRITCHII_FEED_REARM: the audit judged an acquire the feed met wrong
     Count,
 };
+/// FRITCHII_FEED_REARM: the quiet time before the feed comes back on, and the turn-offs per split
+/// session after which it stays off.
+constexpr auto RearmQuiet = std::chrono::seconds{10};
+constexpr u32 MaxOffs = 3;
+/// Why the feed turned itself off, for the ERROR lines.
+constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> FeedOffReasons{
+    "", "a reduction bound was violated", "a predicted release's payload differs",
+    "the back made a release or reduction nothing predicted", "a record the back never made",
+    "a full ring dropped events", "the audit judged an acquire the feed met wrong"};
 /// What met an acquire in the feed.
 enum class Fed : u32 { QueuedPlain, LandedPending, Bound, Count };
 
 constexpr std::array<const char*, static_cast<size_t>(Source::Count)> source_names{
     "not a QMD", "inline QMD", "patched inline QMD", "overlay from memory", "upload shadow",
-    "memory", "memory after a wait"};
+    "memory", "memory after a wait", "overlay from memory (not checked for the feed)",
+    "overlay from memory (the stamped overflow queued)", "memory, checked"};
+
+/// The sources EXP127 = 2 adds to the feed (fable_fence_writers_brief piece 2), with
+/// EDEN_NX2_FEED_MEMORY_OVERLAY on. Overlays from memory built while the ranged overflow was the
+/// only unbounded writer queued: its writes are stamped by GPU and device address (EXP126 = 1),
+/// and the overlay was built only with no stamp over the QMD newer than the back. Plain memory
+/// reads past the same guards as an overlay from memory (mapped, not GPU-written, no inline QMD
+/// of it queued or evicted, no stamp over it newer than the back) and its belt (no unbounded
+/// writer queued): the back reads the same bytes unless something outside the stream writes the
+/// QMD in between, the overlays' exposure too.
+constexpr std::array<Source, 2> NewSources{Source::OverlayFromMemoryOverflow,
+                                           Source::MemoryChecked};
+bool NewFeedSource(Source source) {
+    return std::ranges::find(NewSources, source) != NewSources.end() && FeedMemoryOverlays();
+}
 
 /// Provenance gating (6f (b) 3): what the feed takes predictions from until the audit is clean
-/// for the others.
+/// for the others. Overlays from memory with EDEN_NX2_FEED_MEMORY_OVERLAY (fable_answer_pair_2
+/// section 2): built only from a guarded read (no queued write noted over the QMD, not
+/// GPU-written, no inline QMD of it queued or evicted, no unbounded writer queued), and verified
+/// by the back like every other record. EXP127 = 2: NewFeedSource's too.
 bool FeedSource(Source source) {
     return source == Source::Other || source == Source::InlineOverlay ||
-           source == Source::PatchedOverlay || source == Source::Shadow;
+           source == Source::PatchedOverlay || source == Source::Shadow ||
+           (source == Source::OverlayFromMemory && FeedMemoryOverlays()) ||
+           (FeedSourcesMode() == 2 && NewFeedSource(source));
 }
 
 /// For the audit at a turn-off: the word, the offending record (sequence; position, decisions
@@ -403,6 +433,10 @@ struct State {
     u64 deferred_events{};
     /// EXP13=3: acquires the narrow feed left for records of dependency-waiting QMDs.
     u64 not_fed_nonsimple{};
+    /// Of the fed acquires, those met through a record (the newest plain one, or any folded one
+    /// still to land) whose QMD was read from an overlay from memory
+    /// (EDEN_NX2_FEED_MEMORY_OVERLAY).
+    u64 fed_memory_overlay{};
     std::array<std::array<u64, 2>, static_cast<size_t>(Fed::Count)> fed{};
     u64 fed_checks_passed{};
     u64 fed_checks_violated{};
@@ -484,6 +518,49 @@ struct State {
     u64 session_audit_checked{};
     u64 session_audit_wrong{};
     u32 audit_logged{};
+    /// EXP127 (fable_fence_writers_brief piece 2): the back's check of the QMD records by their
+    /// source: matched, payload differs, and unpredicted (by the source of the copy's last read).
+    std::array<std::array<u64, 3>, static_cast<size_t>(Source::Count)> back_by_source{};
+    /// EXP127 = 1: the acquires the feed would have met through NewFeedSource's records, by
+    /// source and by how (Fed), and those decisions, checked as the audit's are (CheckAudit).
+    std::array<std::array<u64, static_cast<size_t>(Fed::Count)>,
+               static_cast<size_t>(Source::Count)>
+        would_fed{};
+    /// 4096 (about 8 s of decisions at the market's rate), checked every 256 decisions as well
+    /// as at each report, so none leaves the ring unjudged (they turn unknown after 2 s);
+    /// `would_dropped` counts those that do anyway.
+    std::array<Decision, 4096> would_audit{};
+    u64 would_audit_count{};
+    u64 would_checked{};
+    u64 would_wrong{};
+    u64 would_unknown{};
+    u64 would_dropped{};
+    u64 session_would_checked{};
+    u64 session_would_wrong{};
+    u32 would_logged{};
+    /// EXP127 = 2: the acquires fed through NewFeedSource's records, by source.
+    std::array<u64, static_cast<size_t>(Source::Count)> fed_through{};
+
+    /// FRITCHII_FEED_REARM (kept with the switch at 0 too; only its use waits on it). Per split
+    /// session unless said otherwise.
+    u64 split_session{};
+    Clock::time_point off_at{}; ///< The newest turn-off or divergence while off: quiet since
+    u32 offs{};
+    u32 rearms{};
+    u64 run_offs{};   ///< The run's
+    u64 run_rearms{}; ///< The run's
+    u64 diverged_while_off{};
+    u32 diverged_logged{};
+    bool off_for_good{};
+    const char* off_for_good_why{};
+    bool wrong_meet_seen{}; ///< The run's: never re-armed after it
+    u64 audit_wrong_at_off{};
+    /// The words a turn-off named: the feed leaves them alone for the split session (a phantom's
+    /// sweep dropped their records, an unrecorded release wrote them).
+    std::array<u64, 64> tainted{};
+    size_t tainted_count{};
+    u64 taint_refused{};
+    Clock::time_point test_off_since{}; ///< FRITCHII_TEST_FEED_OFF
 
     /// Re-reads the pending violations (of `device` only, if given): recovered once the word
     /// reached the bound, never recovered after 100 ms.
@@ -525,6 +602,23 @@ struct State {
             feed_off_detail.clear();
             feed_check_count = 0;
             lost_seen = GetRings().Lost();
+            off_for_good = false;
+            off_for_good_why = nullptr;
+            if (wrong_meet_seen && FeedRearm()) {
+                // FRITCHII_FEED_REARM: an acquire met wrongly keeps it off for the run.
+                feed_off = FeedOff::WrongMeet;
+                feed_off_detail = "an acquire was met wrongly earlier in the run";
+                SetForGood("an acquire was met wrongly earlier in the run");
+            }
+        }
+        if (IsFeedMode(mode) && FeedRearm()) {
+            if (feed_off != FeedOff::None) {
+                if (!off_for_good && now - off_at >= RearmQuiet) {
+                    MaybeRearm(now);
+                }
+            } else if (const int every = TestFeedOffSeconds(); every > 0) [[unlikely]] {
+                TestFeedOff(now, every);
+            }
         }
         if (since == Clock::time_point{}) {
             since = now;
@@ -536,6 +630,7 @@ struct State {
         }
         CheckLost();
         CheckAudit(now);
+        CheckWouldAudit(now);
         // Bounds whose newest folded record never landed (dropped from the table, or far late).
         for (size_t i = 0; i < feed_check_count;) {
             if (now - feed_checks[i].since >= std::chrono::seconds{2}) {
@@ -570,7 +665,8 @@ struct State {
                  "ran ({:.0f} landed pending, {:.0f} really wrong), {:.0f} no prediction, {:.0f} "
                  "newest release a puller or report one; met after fences by: {:.0f} QMD "
                  "release, {:.0f} QMD reduction, {:.0f} copy semaphore, {:.0f} other writer "
-                 "({:.0f} of the met by a release run before the check), {:.0f} still unmet; "
+                 "({:.0f} puller payload releases, {:.0f} other payload releases; {:.0f} of the "
+                 "met by a release run before the check), {:.0f} still unmet; "
                  "QMD copy: QMD reads/s "
                  "{:.0f} from inline QMDs, {:.0f} from memory, {:.0f} after a wait; {:.0f} "
                  "inline QMDs patched by uploads/s; {:.0f} reads/s from upload shadows ({:.0f} "
@@ -590,7 +686,8 @@ struct State {
                  covered(Coverage::LandedPending), covered(Coverage::ReallyWrong),
                  covered(Coverage::None), covered(Coverage::OtherRelease),
                  met(MetBy::QmdRelease), met(MetBy::QmdReduction), met(MetBy::DmaRelease),
-                 met(MetBy::Other), met(MetBy::BeforeCheck), met(MetBy::Unmet),
+                 met(MetBy::Other), met(MetBy::OtherPullerRelease),
+                 met(MetBy::OtherPayloadRelease), met(MetBy::BeforeCheck), met(MetBy::Unmet),
                  mirrored(Mirror::Overlay), mirrored(Mirror::Memory), mirrored(Mirror::Waited),
                  mirrored(Mirror::Patched), mirrored(Mirror::Shadow),
                  mirrored(Mirror::ShadowCreated), mirrored(Mirror::ShadowEvicted),
@@ -617,7 +714,8 @@ struct State {
                 "off: a payload mismatch",
                 "off: an unpredicted back release",
                 "off: a phantom record",
-                "off: lost events"};
+                "off: lost events",
+                "off: an acquire wrongly met (audit)"};
             LOG_INFO(HW_GPU,
                      "QMD release prediction feed (EXP13=3): acquires/s met by a queued plain "
                      "release {:.0f} (+{:.0f} at resume polls), by a run but unlanded one {:.0f} "
@@ -633,14 +731,20 @@ struct State {
                      "path stopped (/s) by: {:.0f} newest a reduction or landed, {:.0f} an "
                      "earlier one to land, {:.0f} ran with the word moved, {:.0f} value short, "
                      "{:.0f} a later writer (stamp), {:.0f} QMD source, {:.0f} not simple; feed "
-                     "{}{}",
+                     "{}{}; overlays from memory (EDEN_NX2_FEED_MEMORY_OVERLAY={}): {:.0f} "
+                     "acquires/s fed through them, {} of the refused not checked for the feed, "
+                     "{:.0f} built/s with an unbounded writer queued",
                      fed_rate(Fed::QueuedPlain, 0), fed_rate(Fed::QueuedPlain, 1),
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
                      fed_checks_violated, fed_checks_unverified, fed_checks_full,
-                     feed_check_count, not_fed_source[static_cast<size_t>(Source::Memory)],
+                     feed_check_count,
+                     not_fed_source[static_cast<size_t>(Source::Memory)] +
+                         not_fed_source[static_cast<size_t>(Source::MemoryChecked)],
                      not_fed_source[static_cast<size_t>(Source::Waited)],
-                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)],
+                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)] +
+                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)] +
+                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryOverflow)],
                      audit_checked, audit_wrong, audit_unknown, session_audit_checked,
                      session_audit_wrong, mode == 3 ? "narrow" : "full",
                      rate(not_fed_nonsimple), narrow_share, deferred_events,
@@ -649,7 +753,65 @@ struct State {
                      rate(plain_gates[2]), rate(plain_gates[3]), rate(plain_gates[4]),
                      rate(plain_gates[5]), rate(plain_gates[6]),
                      off_names[static_cast<size_t>(feed_off)],
-                     feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")");
+                     feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")",
+                     FeedMemoryOverlays() ? 1 : 0, rate(fed_memory_overlay),
+                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)],
+                     mirrored(Mirror::OverlayFromMemoryUnbounded));
+            if (run_offs != 0) {
+                const auto quiet =
+                    std::chrono::duration<double>(RearmQuiet - (now - off_at)).count();
+                LOG_INFO(HW_GPU,
+                         "QMD release prediction feed re-arm (FRITCHII_FEED_REARM={}): this "
+                         "split session {} turn-offs of {}, {} re-arms, {} divergences while "
+                         "off, {} words kept out ({:.0f} acquires/s refused for them); feed {}; "
+                         "run totals {} turn-offs, {} re-arms, audit {} checked, {} wrongly met",
+                         FeedRearm() ? 1 : 0, offs, MaxOffs, rearms, diverged_while_off,
+                         tainted_count, rate(taint_refused),
+                         feed_off == FeedOff::None ? std::string{"on"}
+                         : off_for_good
+                             ? fmt::format("off for good ({})", off_for_good_why)
+                             : fmt::format("off, back on in {:.0f} s if nothing diverges and the "
+                                           "audit stays clean",
+                                           (std::max)(quiet, 0.0)),
+                         run_offs, run_rearms, session_audit_checked, session_audit_wrong);
+            }
+        }
+        if (const int sources_mode = FeedSourcesMode(); sources_mode != 0 && MirrorMode()) {
+            // fable_fence_writers_brief piece 2: the back's check by source, and what the new
+            // sources would meet (1) or met (2).
+            std::string checks;
+            for (size_t i = 1; i < back_by_source.size(); ++i) {
+                checks += fmt::format("{}{} {:.0f}/{:.0f}/{:.0f}", checks.empty() ? "" : ", ",
+                                      source_names[i], rate(back_by_source[i][0]),
+                                      rate(back_by_source[i][1]), rate(back_by_source[i][2]));
+            }
+            std::string would;
+            std::string through;
+            for (const Source source : NewSources) {
+                const size_t i = static_cast<size_t>(source);
+                would += fmt::format("{}{} {:.0f}/{:.0f}/{:.0f}", would.empty() ? "" : ", ",
+                                     source_names[i], rate(would_fed[i][0]),
+                                     rate(would_fed[i][1]), rate(would_fed[i][2]));
+                through += fmt::format("{}{} {:.0f}", through.empty() ? "" : ", ",
+                                       source_names[i], rate(fed_through[i]));
+            }
+            LOG_INFO(HW_GPU,
+                     "QMD feed sources (EXP127={}, EXP126={}): back checks of QMD records by "
+                     "source, /s matched/payload differs/unpredicted (by the copy's last read): "
+                     "{}; overlays from memory built/s with only the stamped ranged overflow "
+                     "queued {:.0f}; QMD reads/s from memory (nothing queued over them) with no "
+                     "unbounded writer queued {:.0f}, with one {:.0f}, GPU-written by then "
+                     "{:.0f}; acquires/s the feed would "
+                     "meet through the new sources "
+                     "(queued plain/run unlanded/bound): {}; those checked at their landing: {} "
+                     "right, {} wrongly met, {} unknown, {} dropped unchecked (session {} "
+                     "checked, {} wrongly met); acquires/s fed through them: {}",
+                     sources_mode, VideoCore::Nx2Debug::Experiment(126), checks,
+                     mirrored(Mirror::OverlayFromMemoryOverflow),
+                     mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded),
+                     mirrored(Mirror::MemoryGpuWritten), would,
+                     would_checked - would_wrong, would_wrong, would_unknown, would_dropped,
+                     session_would_checked, session_would_wrong, through);
         }
         if (MirrorMode()) {
             LOG_INFO(HW_GPU,
@@ -730,8 +892,8 @@ struct State {
                      "write, {:.0f} unbounded compute/copy writer, {:.0f} unranged writer, {:.0f} "
                      "queued function, {:.0f} 3D method write, {:.0f} unknown noted write ({}), "
                      "{:.0f} noted-write scan limit, {:.0f} writer-range scan limit, {:.0f} "
-                     "evicted inline QMD, {:.0f} none; writer ranges waited on by (kind, word "
-                     "in the QMD, bytes): {}",
+                     "evicted inline QMD, {:.0f} ranged overflow, {:.0f} none; writer ranges "
+                     "waited on by (kind, word in the QMD, bytes): {}",
                      waited(GuestWriterCause::Pending), waited(GuestWriterCause::WriterRange),
                      waited(GuestWriterCause::Ranged), waited(GuestWriterCause::UnboundedWriter),
                      waited(GuestWriterCause::Unranged), waited(GuestWriterCause::Function),
@@ -739,7 +901,8 @@ struct State {
                      waited(GuestWriterCause::UnknownPending), whats,
                      waited(GuestWriterCause::PendingScanLimit),
                      waited(GuestWriterCause::WriterScanLimit),
-                     waited(GuestWriterCause::OverlayEvicted), waited(GuestWriterCause::None),
+                     waited(GuestWriterCause::OverlayEvicted),
+                     waited(GuestWriterCause::RangedOverflow), waited(GuestWriterCause::None),
                      ranges);
         }
         signals = {};
@@ -773,7 +936,13 @@ struct State {
         plain_gates = {};
         not_fed_source = {};
         audit_checked = audit_wrong = audit_unknown = 0;
+        back_by_source = {};
+        would_fed = {};
+        would_checked = would_wrong = would_unknown = would_dropped = 0;
+        fed_through = {};
+        taint_refused = 0;
         not_fed_nonsimple = 0;
+        fed_memory_overlay = 0;
         deferred_events = 0;
         unpredicted_evicted = 0;
         since = now;
@@ -1026,9 +1195,14 @@ struct State {
         feed_check_count = 0;
     }
 
-    /// EXP13=3: the feed stops for the rest of the session (until EXP13 leaves 3).
+    /// EXP13=3: the feed stops: for the rest of the session (until EXP13 leaves 3) with
+    /// FRITCHII_FEED_REARM=0, else until MaybeRearm brings it back, or for good.
     void TurnFeedOff(FeedOff reason, std::string detail, const AuditKey* key = nullptr) {
-        if (!IsFeedMode(last_mode) || feed_off != FeedOff::None) {
+        if (!IsFeedMode(last_mode)) {
+            return;
+        }
+        if (feed_off != FeedOff::None) {
+            DivergedWhileOff(reason, detail, key);
             return;
         }
         if (key != nullptr && key->recovery) {
@@ -1036,35 +1210,184 @@ struct State {
                               "judged when its word is re-read (1 ms, 100 ms)",
                       key->device);
         } else {
-            ScanAudit(key);
+            ScanAudit(key, true);
         }
         feed_off = reason;
         feed_off_detail = std::move(detail);
-        constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> reasons{
-            "", "a reduction bound was violated", "a predicted release's payload differs",
-            "the back made a release or reduction nothing predicted",
-            "a record the back never made", "a full ring dropped events"};
+        const auto& reasons = FeedOffReasons;
+        // FRITCHII_FEED_REARM's books (kept with the switch at 0 as well).
+        ++offs;
+        ++run_offs;
+        off_at = Clock::now();
+        audit_wrong_at_off = session_audit_wrong;
+        if (key != nullptr) {
+            Taint(key->device);
+        }
+        if (reason == FeedOff::LostEvents) {
+            SetForGood("events were lost: the tables may be wrong for any word");
+        } else if (reason == FeedOff::WrongMeet) {
+            SetForGood("an acquire was met wrongly");
+        } else if (offs >= MaxOffs) {
+            SetForGood("the third turn-off this split session");
+        }
+        if (!FeedRearm()) {
+            LOG_ERROR(HW_GPU,
+                      "QMD release prediction feed (EXP13=3) off for the rest of the session: {} "
+                      "({})",
+                      reasons[static_cast<size_t>(reason)], feed_off_detail);
+            return;
+        }
         LOG_ERROR(HW_GPU,
-                  "QMD release prediction feed (EXP13=3) off for the rest of the session: {} "
-                  "({})",
-                  reasons[static_cast<size_t>(reason)], feed_off_detail);
+                  "QMD release prediction feed (EXP13=3/4) off ({} of {} this split session): {} "
+                  "({}); {}",
+                  offs, MaxOffs, reasons[static_cast<size_t>(reason)], feed_off_detail,
+                  off_for_good ? fmt::format("off for good: {}", off_for_good_why)
+                               : std::string{"back on after 10 s with no new divergence if the "
+                                             "audit stays clean (FRITCHII_FEED_REARM=1)"});
+    }
+
+    /// FRITCHII_FEED_REARM: another divergence while the feed is off. The quiet time starts
+    /// again, its word stays out, and the decisions on it are scanned as at a turn-off (they
+    /// were made while the feed was on).
+    void DivergedWhileOff(FeedOff reason, const std::string& detail, const AuditKey* key) {
+        off_at = Clock::now();
+        ++diverged_while_off;
+        if (key != nullptr) {
+            Taint(key->device);
+            if (!key->recovery) {
+                ScanAudit(key, false);
+            }
+        }
+        if (reason == FeedOff::LostEvents) {
+            SetForGood("events were lost: the tables may be wrong for any word");
+        } else if (reason == FeedOff::WrongMeet) {
+            SetForGood("an acquire was met wrongly");
+        }
+        if (FeedRearm() && diverged_logged < 8) {
+            ++diverged_logged;
+            LOG_WARNING(HW_GPU,
+                        "QMD release prediction feed (EXP13=3/4) still off: another divergence "
+                        "({}), the quiet time starts again",
+                        detail);
+        }
+    }
+
+    /// FRITCHII_FEED_REARM: the feed stays off for the split session (an acquire met wrongly:
+    /// the run).
+    void SetForGood(const char* why) {
+        if (off_for_good) {
+            return;
+        }
+        off_for_good = true;
+        off_for_good_why = why;
+        if (FeedRearm()) {
+            LOG_ERROR(HW_GPU,
+                      "QMD release prediction feed (EXP13=3/4) stays off for the {}: {}",
+                      wrong_meet_seen ? "run" : "split session", why);
+        }
+    }
+
+    /// FRITCHII_FEED_REARM: a word a turn-off named stays out of the feed (Feed: with the switch
+    /// on, or once the feed came back by it).
+    void Taint(u64 device) {
+        if (Tainted(device)) {
+            return;
+        }
+        if (tainted_count == tainted.size()) {
+            SetForGood("more than 64 words kept out");
+            return;
+        }
+        tainted[tainted_count++] = device;
+    }
+
+    [[nodiscard]] bool Tainted(u64 device) const {
+        for (size_t i = 0; i < tainted_count; ++i) {
+            if (tainted[i] == device) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// FRITCHII_FEED_REARM, RearmQuiet after the newest turn-off or divergence: back on when
+    /// nothing says a decision was wrong. Every decision made before the turn-off is judged by now
+    /// (CheckAudit gives up on a record after 2 s), the re-reads of violated bounds are done, no
+    /// event was lost, and the audit found no acquire met wrongly since the turn-off.
+    void MaybeRearm(Clock::time_point now) {
+        if (recheck_count != 0) {
+            return; // A violation still being re-read: judged at 100 ms
+        }
+        CheckLost(); // Lost events count as a divergence (for good)
+        CheckAudit(now);
+        if (off_for_good || now - off_at < RearmQuiet) {
+            return;
+        }
+        if (session_audit_wrong != audit_wrong_at_off) {
+            SetForGood("the audit judged an acquire met wrongly");
+            return;
+        }
+        const u64 stored = (std::min<u64>)(audit_count, audit.size());
+        for (u64 i = 0; i < stored; ++i) {
+            if (!audit[i].checked) {
+                return; // Still to be judged
+            }
+        }
+        const auto off_for = std::chrono::duration<double>(now - off_at).count();
+        LOG_WARNING(HW_GPU,
+                    "QMD release prediction feed (EXP13=3/4) back on (FRITCHII_FEED_REARM=1): "
+                    "{:.0f} s with no new divergence since it went off ({}: {}); audit: run {} "
+                    "checked, {} wrongly met; {} words kept out; {} of {} turn-offs this split "
+                    "session",
+                    off_for, FeedOffReasons[static_cast<size_t>(feed_off)], feed_off_detail,
+                    session_audit_checked, session_audit_wrong, tainted_count, offs, MaxOffs);
+        feed_off = FeedOff::None;
+        feed_off_detail.clear();
+        ++rearms;
+        ++run_rearms;
+        test_off_since = now;
+    }
+
+    /// FRITCHII_TEST_FEED_OFF: every `every` seconds of feed on, a turn-off as for an
+    /// unpredicted back release of no word (device 0: no decision is on it).
+    void TestFeedOff(Clock::time_point now, int every) {
+        if (test_off_since == Clock::time_point{}) {
+            test_off_since = now;
+            return;
+        }
+        if (now - test_off_since < std::chrono::seconds{every}) {
+            return;
+        }
+        test_off_since = now;
+        const AuditKey key{0, 0, 0, false, 0, Kind::Plain, true};
+        TurnFeedOff(FeedOff::Unpredicted,
+                    fmt::format("test: FRITCHII_TEST_FEED_OFF={}, no real release", every), &key);
     }
 
     /// EXP13=3, at a turn-off: the decisions on the offending word since its record that the
-    /// value it really got does not meet (unknown value: every such decision is suspect).
-    void ScanAudit(const AuditKey* key) {
+    /// value it really got does not meet (unknown value: every such decision is suspect). How
+    /// many (FRITCHII_FEED_REARM: any keeps the feed off for good). `log`: the line even when
+    /// none.
+    u32 ScanAudit(const AuditKey* key, bool log) {
         const u64 stored = (std::min<u64>)(audit_count, audit.size());
         if (key == nullptr) {
-            LOG_ERROR(HW_GPU,
-                      "QMD release prediction feed (EXP13=3) audit: {} decisions in the ring, "
-                      "the cause names no word",
-                      stored);
-            return;
+            if (log) {
+                LOG_ERROR(HW_GPU,
+                          "QMD release prediction feed (EXP13=3) audit: {} decisions in the "
+                          "ring, the cause names no word",
+                          stored);
+            }
+            return 0;
         }
-        if (key->positional) {
-            ScanAuditPositional(*key, stored);
-            return;
+        const u32 suspects =
+            key->positional ? ScanAuditPositional(*key, stored, log) : ScanAuditByValue(*key, stored, log);
+        if (suspects != 0) {
+            SetForGood("the audit named acquires the feed may have met wrongly");
         }
+        return suspects;
+    }
+
+    u32 ScanAuditByValue(const AuditKey& key_ref, u64 stored, bool log) {
+        const AuditKey* const key = &key_ref;
         u32 match_count = 0;
         u32 wrong = 0;
         std::string first;
@@ -1085,11 +1408,14 @@ struct State {
                 }
             }
         }
-        LOG_ERROR(HW_GPU,
-                  "QMD release prediction feed (EXP13=3) audit: {} acquires {} met on device "
-                  "{:#x} (of {} decisions on it since the record){}",
-                  wrong, key->has_made ? "wrongly" : "possibly wrongly", key->device, match_count,
-                  first);
+        if (log || wrong != 0) {
+            LOG_ERROR(HW_GPU,
+                      "QMD release prediction feed (EXP13=3) audit: {} acquires {} met on device "
+                      "{:#x} (of {} decisions on it since the record){}",
+                      wrong, key->has_made ? "wrongly" : "possibly wrongly", key->device,
+                      match_count, first);
+        }
+        return wrong;
     }
 
     /// An unpredicted back release of `key.kind` at entry E = key.position (6g (b)): a missed
@@ -1097,7 +1423,7 @@ struct State {
     /// be wrong is timing. With no unmatched record of that kind on the word before E the word
     /// was under-modelled (safe). Otherwise a decision d with record.position <= d.position < E
     /// that folded it (d.sequence >= record.sequence) met E - d.position ring words early.
-    void ScanAuditPositional(const AuditKey& key, u64 stored) {
+    u32 ScanAuditPositional(const AuditKey& key, u64 stored, bool log) {
         std::array<const Prediction*, MaxWays> early_records{};
         size_t early_count = 0;
         for (const Prediction& way : predictions[Bucket(key.device)]) {
@@ -1129,22 +1455,51 @@ struct State {
             }
         }
         if (early_count == 0) {
-            LOG_ERROR(HW_GPU,
-                      "QMD release prediction feed (EXP13=3/4) audit: safe, the word was "
-                      "under-modelled (no unmatched record before entry {} on device {:#x}; {} "
-                      "decisions on it stand)",
-                      key.position, key.device, on_word);
-            return;
+            if (log) {
+                LOG_ERROR(HW_GPU,
+                          "QMD release prediction feed (EXP13=3/4) audit: safe, the word was "
+                          "under-modelled (no unmatched record before entry {} on device {:#x}; "
+                          "{} decisions on it stand)",
+                          key.position, key.device, on_word);
+            }
+            return 0;
         }
-        LOG_ERROR(HW_GPU,
-                  "QMD release prediction feed (EXP13=3/4) audit: {} acquires wrongly met (early) "
-                  "on device {:#x} against {} unmatched records before entry {} (of {} decisions "
-                  "on it){}",
-                  early, key.device, early_count, key.position, on_word, first);
+        if (log || early != 0) {
+            LOG_ERROR(HW_GPU,
+                      "QMD release prediction feed (EXP13=3/4) audit: {} acquires wrongly met "
+                      "(early) on device {:#x} against {} unmatched records before entry {} (of "
+                      "{} decisions on it){}",
+                      early, key.device, early_count, key.position, on_word, first);
+        }
+        return early;
     }
 
     /// EXP13=3, each report: the decisions whose record has landed since, against the value it
     /// landed with; those whose record left the table, or did not land in 2 s, are unknown.
+    /// A decision against its record: still to land, unknown (left the table, or not landed in
+    /// 2 s), met by the value it landed with, or not. Marks it checked once judged.
+    enum class Judged { Pending, Unknown, Right, Wrong };
+    Judged Judge(Decision& decision, Clock::time_point now, const Prediction*& record) const {
+        record = nullptr;
+        for (const Prediction& way : predictions[Bucket(decision.device)]) {
+            if (way.position != 0 && way.sequence == decision.sequence) {
+                record = &way;
+                break;
+            }
+        }
+        if (record == nullptr || !record->landed) {
+            if (record == nullptr || now - decision.when >= std::chrono::seconds{2}) {
+                decision.checked = true;
+                return Judged::Unknown;
+            }
+            return Judged::Pending;
+        }
+        decision.checked = true;
+        return Meets(CompareOf(decision.operation), decision.value, record->landed_value)
+                   ? Judged::Right
+                   : Judged::Wrong;
+    }
+
     void CheckAudit(Clock::time_point now) {
         const u64 stored = (std::min<u64>)(audit_count, audit.size());
         for (u64 i = 0; i < stored; ++i) {
@@ -1153,23 +1508,17 @@ struct State {
                 continue;
             }
             const Prediction* record = nullptr;
-            for (const Prediction& way : predictions[Bucket(decision.device)]) {
-                if (way.position != 0 && way.sequence == decision.sequence) {
-                    record = &way;
-                    break;
-                }
-            }
-            if (record == nullptr || !record->landed) {
-                if (record == nullptr || now - decision.when >= std::chrono::seconds{2}) {
-                    decision.checked = true;
-                    ++audit_unknown;
-                }
+            const Judged judged = Judge(decision, now, record);
+            if (judged == Judged::Pending) {
                 continue;
             }
-            decision.checked = true;
+            if (judged == Judged::Unknown) {
+                ++audit_unknown;
+                continue;
+            }
             ++audit_checked;
             ++session_audit_checked;
-            if (Meets(CompareOf(decision.operation), decision.value, record->landed_value)) {
+            if (judged == Judged::Right) {
                 continue;
             }
             ++audit_wrong;
@@ -1184,11 +1533,68 @@ struct State {
                           decision.kind == Fed::Bound ? "the bound" : "a release",
                           decision.expected, record->landed_value);
             }
+            // FRITCHII_FEED_REARM: off, and never back on in this run.
+            wrong_meet_seen = true;
+            if (FeedRearm()) {
+                TurnFeedOff(FeedOff::WrongMeet,
+                            fmt::format("device {:#x}: op {} value {:#x}, the word landed {:#x}",
+                                        decision.device, decision.operation, decision.value,
+                                        record->landed_value));
+            }
         }
     }
 
     void Audit(const Decision& decision) {
         audit[audit_count++ % audit.size()] = decision;
+    }
+
+    /// EXP127 = 1: the feed would have met an acquire through a record of `source`
+    /// (NewFeedSource). Counted and checked like a decision, nothing else.
+    void WouldFeed(Source source, const Decision& decision) {
+        ++would_fed[static_cast<size_t>(source)][static_cast<size_t>(decision.kind)];
+        if (would_audit_count % 256 == 0) {
+            CheckWouldAudit(decision.when);
+        }
+        Decision& slot = would_audit[would_audit_count++ % would_audit.size()];
+        would_dropped += would_audit_count > would_audit.size() && !slot.checked ? 1 : 0;
+        slot = decision;
+    }
+
+    /// EXP127 = 1, each report: CheckAudit for WouldFeed's decisions.
+    void CheckWouldAudit(Clock::time_point now) {
+        const u64 stored = (std::min<u64>)(would_audit_count, would_audit.size());
+        for (u64 i = 0; i < stored; ++i) {
+            Decision& decision = would_audit[i];
+            if (decision.checked) {
+                continue;
+            }
+            const Prediction* record = nullptr;
+            const Judged judged = Judge(decision, now, record);
+            if (judged == Judged::Pending) {
+                continue;
+            }
+            if (judged == Judged::Unknown) {
+                ++would_unknown;
+                continue;
+            }
+            ++would_checked;
+            ++session_would_checked;
+            if (judged == Judged::Right) {
+                continue;
+            }
+            ++would_wrong;
+            ++session_would_wrong;
+            if (would_logged < 8) {
+                ++would_logged;
+                LOG_ERROR(HW_GPU,
+                          "QMD feed sources (EXP127=1) audit: an acquire the feed would have met "
+                          "wrongly on device {:#x}: op {} value {:#x}, by {} {:#x}, the word "
+                          "landed {:#x}",
+                          decision.device, decision.operation, decision.value,
+                          decision.kind == Fed::Bound ? "the bound" : "a release",
+                          decision.expected, record->landed_value);
+            }
+        }
     }
 
     /// EXP13=3: events lost to full rings make the marks and matches unreliable.
@@ -1287,7 +1693,7 @@ struct State {
             // Nothing to re-read: by value, as before.
             AuditKey by_value = key;
             by_value.recovery = false;
-            ScanAudit(&by_value);
+            ScanAudit(&by_value, true);
             return;
         }
         if (recheck_count < rechecks.size()) {
@@ -1329,7 +1735,7 @@ struct State {
                 AuditKey by_value = entry.key;
                 by_value.recovery = false;
                 by_value.made = word;
-                ScanAudit(&by_value);
+                ScanAudit(&by_value, true);
             }
             entry = rechecks[--recheck_count];
         }
@@ -1679,7 +2085,15 @@ void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_t
         return;
     }
     const size_t index = static_cast<size_t>(writer);
+    // EXP127: by source (0 matched, 1 payload differs, 2 unpredicted, by the copy's last read).
+    const auto by_source = [&](size_t outcome) {
+        if (writer == Writer::Qmd) {
+            const Source source = found != nullptr ? found->source : state.last_read_source;
+            ++state.back_by_source[static_cast<size_t>(source)][outcome];
+        }
+    };
     if (reduction) {
+        by_source(!found ? 2 : found->payload == payload ? 0 : 1);
         if (!found) {
             ++state.unpredicted_reductions;
             log_unpredicted();
@@ -1717,6 +2131,7 @@ void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_t
     if (found) {
         found->matched = true;
     }
+    by_source(!found ? 2 : found->payload == payload ? 0 : 1);
     if (!found) {
         ++state.unpredicted[index];
         log_unpredicted();
@@ -1910,7 +2325,63 @@ void SetRecordsValid(bool valid, u64 position) {
     if (!valid) {
         // The copy stopped: its records and their landed counts start over with it.
         state.Clear();
+    } else if (position < state.horizon) [[unlikely]] {
+        // Positions only go back in a new split session (StartSplitSession takes it there); a
+        // horizon past the ring kept every back release from waiting for its record.
+        LOG_WARNING(HW_GPU,
+                    "QMD release prediction (EXP13=2-4): records valid from {}, behind the "
+                    "horizon {}: the horizon starts there",
+                    position, state.horizon);
+        state.horizon = state.signal_start = state.signal_end = position;
+        state.deferred_count = 0;
     }
+}
+
+void StartSplitSession(u64 session) {
+    // The last session's back releases and landings first, against its own records.
+    auto& state = Front();
+    if (state.split_session == session) {
+        return;
+    }
+    const bool first = state.split_session == 0;
+    state.split_session = session;
+    // Ring positions start again at 0: what is kept by position goes. The horizon most of all:
+    // kept, `entry_position >= horizon` (ApplyVerify) stayed false until the new ring passed
+    // the old one, so a back release that ran before its record (a dependency-waiting QMD,
+    // recorded at the next signal) was judged at once, unpredicted, and turned the feed off.
+    state.horizon = state.signal_start = state.signal_end = 0;
+    state.deferred_count = 0;
+    // Their words' host pointers were the last session's guest memory.
+    state.recheck_count = 0;
+    state.pending_count = 0;
+    // The last session's decisions: their records go with SetRecordsValid(false).
+    state.audit_count = 0;
+    state.would_audit_count = 0;
+    // FRITCHII_FEED_REARM: a new session starts with the feed on, as a fresh run (unless an
+    // acquire was met wrongly in this run).
+    state.offs = 0;
+    state.rearms = 0;
+    state.diverged_while_off = 0;
+    state.tainted_count = 0;
+    if (first) {
+        return;
+    }
+    const FeedOff was = state.feed_off;
+    if (FeedRearm() && !state.wrong_meet_seen) {
+        state.feed_off = FeedOff::None;
+        state.feed_off_detail.clear();
+        state.off_for_good = false;
+        state.off_for_good_why = nullptr;
+        state.test_off_since = {};
+    }
+    LOG_INFO(HW_GPU,
+             "QMD release prediction (EXP13=2-4): split session {}, ring positions start again at "
+             "0 (horizon, waiting back releases, re-reads and the audit's decisions start over); "
+             "feed {}",
+             session,
+             was == FeedOff::None              ? "on"
+             : state.feed_off == FeedOff::None ? "back on (it was off in the last session)"
+                                               : "still off");
 }
 
 void NoteWait(GuestWriterCause cause, const char* what) {
@@ -2062,12 +2533,18 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     return result;
 }
 
-bool Feed(const AcquireCheck& check, bool resume) {
+bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
     auto& state = Front();
     state.Tick();
     state.CheckLost();
     if (!IsFeedMode(state.last_mode) || state.feed_off != FeedOff::None || !state.records_valid ||
         state.records_valid_from > check.done || check.gpu_dirty) {
+        return false;
+    }
+    // FRITCHII_FEED_REARM: a word a turn-off named stays out after the feed came back.
+    if (state.tainted_count != 0 && (FeedRearm() || state.run_rearms != 0) &&
+        state.Tainted(check.device)) [[unlikely]] {
+        ++state.taint_refused;
         return false;
     }
     std::array<const Prediction*, MaxWays> records{};
@@ -2112,6 +2589,14 @@ bool Feed(const AcquireCheck& check, bool resume) {
         } else if (!FeedSource(newest.source)) {
             stop(PlainGate::Source);
             ++state.not_fed_source[static_cast<size_t>(newest.source)];
+            // EXP127 = 1: what 2 would do here (the gate below included).
+            if (FeedSourcesMode() == 1 && NewFeedSource(newest.source) &&
+                !(narrow && newest.writer == Writer::Qmd && !newest.simple)) {
+                state.WouldFeed(newest.source,
+                                {check.device, newest.sequence, newest.position, Clock::now(),
+                                 check.value, check.operation, newest.payload,
+                                 queued ? Fed::QueuedPlain : Fed::LandedPending, false});
+            }
             return false;
         } else if (narrow && newest.writer == Writer::Qmd && !newest.simple) {
             stop(PlainGate::NotSimple);
@@ -2120,6 +2605,16 @@ bool Feed(const AcquireCheck& check, bool resume) {
         } else {
             const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
             ++state.fed[static_cast<size_t>(kind)][resumed];
+            state.fed_memory_overlay += newest.source == Source::OverlayFromMemory ? 1 : 0;
+            state.fed_through[static_cast<size_t>(newest.source)] +=
+                NewFeedSource(newest.source) ? 1 : 0;
+            if (fed != nullptr) {
+                *fed = {.payload = newest.payload,
+                        .position = newest.position,
+                        .exact = queued && newest.kind == Kind::Plain &&
+                                 (newest.writer == Writer::Dma ||
+                                  (newest.writer == Writer::Qmd && newest.simple))};
+            }
             state.Audit({check.device, newest.sequence, newest.position, Clock::now(),
                          check.value, check.operation, newest.payload, kind, false});
             return true;
@@ -2134,19 +2629,44 @@ bool Feed(const AcquireCheck& check, bool resume) {
     if (!folded.ok || folded.bound.value < check.value) {
         return false;
     }
-    for (size_t i = 0; i < count; ++i) {
-        if (!records[i]->landed && !FeedSource(records[i]->source)) {
-            ++state.not_fed_source[static_cast<size_t>(records[i]->source)];
-            return false;
-        }
-    }
     // The narrow feed: an unlanded record of a dependency-waiting QMD on the word, whose timing
     // is the uncertain thing, means no feed.
-    for (size_t i = 0; narrow && i < count; ++i) {
-        if (!records[i]->landed && records[i]->writer == Writer::Qmd && !records[i]->simple) {
-            ++state.not_fed_nonsimple;
-            return false;
+    const auto nonsimple_unlanded = [&] {
+        for (size_t i = 0; narrow && i < count; ++i) {
+            if (!records[i]->landed && records[i]->writer == Writer::Qmd && !records[i]->simple) {
+                return true;
+            }
         }
+        return false;
+    };
+    // The first unlanded record of a source the feed refuses, and whether EXP127 = 2 takes all
+    // of them (NewFeedSource).
+    const Prediction* refused = nullptr;
+    bool all_new = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && !FeedSource(records[i]->source)) {
+            refused = refused != nullptr ? refused : records[i];
+            all_new = all_new && NewFeedSource(records[i]->source);
+        }
+    }
+    if (refused != nullptr) {
+        ++state.not_fed_source[static_cast<size_t>(refused->source)];
+        // EXP127 = 1: what 2 would do here (the narrow gate included; 2 may still find the check
+        // table full).
+        if (FeedSourcesMode() == 1 && all_new && !nonsimple_unlanded()) {
+            u64 position = 0;
+            for (size_t i = 0; i < count; ++i) {
+                position = records[i]->sequence == folded.newest ? records[i]->position : position;
+            }
+            state.WouldFeed(refused->source,
+                            {check.device, folded.newest, position, Clock::now(), check.value,
+                             check.operation, folded.bound.value, Fed::Bound, false});
+        }
+        return false;
+    }
+    if (nonsimple_unlanded()) {
+        ++state.not_fed_nonsimple;
+        return false;
     }
     if (state.feed_check_count == state.feed_checks.size()) {
         ++state.fed_checks_full;
@@ -2157,6 +2677,21 @@ bool Feed(const AcquireCheck& check, bool resume) {
                  folded.bound.folded, {}, state.session_evicted_unlanded, state.session_foreign};
     std::copy_n(folded.bound.sequences.begin(), folded.bound.folded, fed_check.sequences.begin());
     ++state.fed[static_cast<size_t>(Fed::Bound)][resumed];
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && records[i]->source == Source::OverlayFromMemory) {
+            ++state.fed_memory_overlay;
+            break;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && NewFeedSource(records[i]->source)) {
+            ++state.fed_through[static_cast<size_t>(records[i]->source)];
+            break;
+        }
+    }
+    if (fed != nullptr) {
+        *fed = {.payload = folded.bound.value, .position = 0, .exact = false};
+    }
     const Prediction* newest_folded = nullptr;
     for (size_t i = 0; i < count; ++i) {
         if (records[i]->sequence == folded.newest) {
@@ -2268,6 +2803,17 @@ std::optional<BackRelease> BackReleaseLatest(u64 device) {
 void NoteMetBy(MetBy met_by) {
     auto& state = Get();
     ++state.met_by[static_cast<size_t>(met_by)];
+}
+
+u64 NewestUnlandedPosition(u64 device) {
+    auto& state = Front();
+    u64 newest = 0;
+    for (const Prediction& way : state.predictions[Bucket(device)]) {
+        if (way.position != 0 && way.device == device && !way.landed) {
+            newest = (std::max)(newest, way.position);
+        }
+    }
+    return newest;
 }
 
 } // namespace VideoCommon::QmdPrediction

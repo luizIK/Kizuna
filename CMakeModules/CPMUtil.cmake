@@ -935,7 +935,7 @@ function(AddPackage)
     endif()
 endfunction()
 
-# TODO(crueter): we could do an AddMultiArchPackage, multiplatformpackage?
+# TODO: we could do an AddMultiArchPackage, multiplatformpackage?
 # name is the artifact name, package is for find_package override
 function(AddCIPackage)
     set(oneValueArgs

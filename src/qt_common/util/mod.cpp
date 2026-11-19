@@ -117,7 +117,7 @@ QStringList GetModFolders(const QString& root, const QString& fallbackName) {
     }
 }
 
-// TODO(crueter): Make this a common extract_to_tmp func
+// TODO: Make this a common extract_to_tmp func
 const QString ExtractMod(const QString& path) {
     namespace fs = std::filesystem;
     fs::path tmp{fs::temp_directory_path() / "eden" / "unzip_mod"};
@@ -134,7 +134,7 @@ const QString ExtractMod(const QString& path) {
 
     QFile zip{path};
 
-    // TODO(crueter): use QtCompress
+    // TODO: use QtCompress
     QStringList result = JlCompress::extractDir(&zip, qCacheDir);
     if (result.isEmpty()) {
         QtCommon::Frontend::Critical(tr("Mod Extract Failed"),

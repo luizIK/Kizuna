@@ -79,7 +79,7 @@ std::vector<u8> TryLoadFromDisk(const std::filesystem::path& path) {
     return data;
 }
 
-// TODO(crueter): Migrate to use Common::Net
+// TODO: Migrate to use Common::Net
 std::vector<u8> DownloadImage(const std::string& url_path, const std::filesystem::path& cache_path) {
     LOG_DEBUG(Service_BCAT, "Downloading image: https://eden-emu.dev{}", url_path);
     try {

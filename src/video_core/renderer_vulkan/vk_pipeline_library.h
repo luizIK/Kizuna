@@ -41,7 +41,7 @@ namespace Vulkan {
 // it is less reuse than possible when the emission depends on the partner stage or on state (see
 // MakeRuntimeInfo), which can be narrowed later in the emission.
 //
-// Based in part on suyu-main 3157ae0ce0 and f80bbc701a (library cache with build outside the
+// Based in part on ported changes (library cache with build outside the
 // lock, fast link then optimized link, link statistics); unlike there, the shader libraries here
 // do not depend on the partner stage.
 

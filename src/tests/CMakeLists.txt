@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
     video_core/vulkan_overlay_filter.cpp
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp
+    video_core/instance_fold.cpp
+    video_core/nx2_grid_taint.cpp
+    video_core/nx2_list_dispatch.cpp
+    video_core/nx2_list_draw.cpp
     video_core/aftermath_dump.cpp
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
+    core/kernel_finish_termination.cpp
+    core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
@@ -25,6 +30,7 @@ add_executable(tests
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
+    video_core/join_whole_copy.cpp
     audio_core/batch_decoder.cpp
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
@@ -42,6 +48,7 @@ add_executable(tests
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
+    video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
@@ -61,6 +68,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/unbacked_fallback.cpp
+    video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
@@ -115,6 +123,8 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_nan_safe_min_max.cpp
+    video_core/spirv_scalar_constants.cpp
+    video_core/ssa_fixed_variables.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
     video_core/fsr4_support.cpp
@@ -131,6 +141,7 @@ add_executable(tests
     common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
+    common/poll_window.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
@@ -156,6 +167,7 @@ add_executable(tests
     video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
+    video_core/semaphore_waiters.cpp
     video_core/vertex_repack.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
@@ -170,6 +182,7 @@ add_executable(tests
     video_core/usage_tracker.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp
+    video_core/draw_template.cpp
     video_core/descriptor_payload_growth.cpp
     video_core/global_address_tracking.cpp
     video_core/nvn_storage_descriptor.cpp

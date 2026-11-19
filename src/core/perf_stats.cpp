@@ -16,6 +16,7 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
 
@@ -33,6 +34,8 @@ namespace Core {
 PerfStats::PerfStats(u64 title_id_) : title_id(title_id_) {}
 
 PerfStats::~PerfStats() {
+    LogRunSummary();
+
     if (!Settings::values.record_frame_times || title_id == 0) {
         return;
     }
@@ -78,6 +81,19 @@ void PerfStats::EndSystemFrame() {
     }
     accumulated_frametime += frame_time;
     system_frames += 1;
+
+    // The whole run past the boot frames, for the summary at game stop.
+    if (current_index > IgnoreFrames) {
+        const auto us = std::chrono::duration_cast<microseconds>(frame_time).count();
+        const std::size_t bucket =
+            std::min(static_cast<std::size_t>((std::max)(us, decltype(us){0})) / RunBucketUs,
+                     RunBuckets - 1);
+        ++run_buckets[bucket];
+        ++run_frames;
+        run_time += frame_time;
+        run_longest = (std::max)(run_longest, frame_time);
+        run_over_100ms += frame_time > 100ms ? 1 : 0;
+    }
 
     previous_frame_length = frame_end - previous_frame_end;
     previous_frame_end = frame_end;
@@ -126,6 +142,34 @@ PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us
     previous_fps = current_fps;
 
     return results;
+}
+
+// One line at game stop: the run's average fps and its 1% / 0.1% lows (the fps of the slowest 1% /
+// 0.1% of frames, the same way profile_toggle.py reads its histograms), loading screens included.
+void PerfStats::LogRunSummary() const {
+    std::scoped_lock lock{object_mutex};
+
+    if (run_frames == 0) {
+        return;
+    }
+    const auto low_fps = [this](double share) {
+        const u64 need = (std::max)(u64{1}, static_cast<u64>(static_cast<double>(run_frames) * share));
+        u64 seen = 0;
+        for (std::size_t i = RunBuckets; i-- > 0;) {
+            seen += run_buckets[i];
+            if (seen >= need) {
+                return 1e6 / static_cast<double>((i + 1) * RunBucketUs);
+            }
+        }
+        return 0.0;
+    };
+    const double seconds = duration_cast<DoubleSecs>(run_time).count();
+    LOG_INFO(Frontend,
+             "Run summary: {} frames in {:.0f} s, average {:.1f} fps, 1% low {:.1f} fps, 0.1% low "
+             "{:.1f} fps, longest frame {:.1f} ms, {} frames over 100 ms",
+             run_frames, seconds, seconds > 0.0 ? static_cast<double>(run_frames) / seconds : 0.0,
+             low_fps(0.01), low_fps(0.001),
+             std::chrono::duration<double, std::milli>(run_longest).count(), run_over_100ms);
 }
 
 double PerfStats::GetLastFrameTimeScale() const {

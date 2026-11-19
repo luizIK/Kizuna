@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -122,8 +123,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
 
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
-    unsigned depth = 0;
+void WalkUnguarded(CONTEXT& context, std::array<DWORD64, MaxDepth>& frames, unsigned& depth) {
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
@@ -143,6 +143,23 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+}
+
+// A guest core stopped in JIT code (or a thread in driver code) can leave the unwinder a garbage
+// return address and stack pointer: it then faulted inside ntdll on the DebugServer thread and
+// took the emulator down (the AMD tester's `sample` with threads "CPUCore_0,...,CPUCore_5",
+// access violation 0xc0000005). Keep the frames found up to the fault instead, as the sample
+// profile's walker does (nx2_sample_profile.cpp).
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+    unsigned depth = 0;
+#ifdef _MSC_VER
+    __try {
+        WalkUnguarded(context, frames, depth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    WalkUnguarded(context, frames, depth);
+#endif
     return depth;
 }
 
@@ -211,10 +228,19 @@ struct Symbolizer {
     std::string jit_name;
 };
 
+// SymInitialize fails on a second call without SymCleanup, so keep one symbolizer for the
+// sampler and the lock census (DbgHelp is single-threaded: its users hold the mutex).
+std::mutex g_symbolizer_mutex;
+
+Symbolizer& SharedSymbolizer() {
+    static Symbolizer symbolizer;
+    return symbolizer;
+}
+
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
-    // SymInitialize fails on a second call without SymCleanup, so keep one symbolizer.
-    static Symbolizer symbolizer;
+    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
+    Symbolizer& symbolizer = SharedSymbolizer();
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
@@ -355,6 +381,40 @@ std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
 }
 
+void* OpenThreadForCapture(unsigned os_id) {
+    return OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                      FALSE, os_id);
+}
+
+unsigned CaptureSuspended(void* thread, unsigned long long* frames, unsigned max,
+                          bool (*still)(const void*), const void* context) {
+    if (thread == nullptr || max == 0) {
+        return 0;
+    }
+    const HANDLE handle = static_cast<HANDLE>(thread);
+    if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+        return 0;
+    }
+    unsigned depth = 0;
+    CONTEXT thread_context{};
+    thread_context.ContextFlags = CONTEXT_FULL;
+    // GetThreadContext waits for the suspension to take effect; only then is the test valid.
+    if (GetThreadContext(handle, &thread_context) && (still == nullptr || still(context))) {
+        std::array<DWORD64, MaxDepth> walked{};
+        depth = (std::min)(Walk(thread_context, walked), max);
+        for (unsigned i = 0; i < depth; ++i) {
+            frames[i] = walked[i];
+        }
+    }
+    ResumeThread(handle);
+    return depth;
+}
+
+std::string SymbolName(unsigned long long address) {
+    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
+    return SharedSymbolizer().Name(address);
+}
+
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
     if (names == nullptr || *names == '\0') {
@@ -373,10 +433,24 @@ void StartFromEnvironment() {
 
 #else
 
+#include <cstdio>
+
 namespace Nx2Sampler {
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
+}
+void* OpenThreadForCapture(unsigned) {
+    return nullptr;
+}
+unsigned CaptureSuspended(void*, unsigned long long*, unsigned, bool (*)(const void*),
+                          const void*) {
+    return 0;
+}
+std::string SymbolName(unsigned long long address) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "0x%llx", address);
+    return text;
 }
 } // namespace Nx2Sampler
 

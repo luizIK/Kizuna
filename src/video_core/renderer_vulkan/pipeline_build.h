@@ -12,7 +12,6 @@
 #include <utility>
 
 #include "common/logging.h"
-#include "common/thread.h"
 #include "common/thread_worker.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 
@@ -71,10 +70,6 @@ class PipelineBuild {
             if (claimed.exchange(true)) {
                 return;
             }
-            {
-                std::scoped_lock lock{mutex};
-                runner = Common::OpenCurrentThreadForRaise();
-            }
             try {
                 task();
             } catch (const std::exception& exception) {
@@ -87,18 +82,12 @@ class PipelineBuild {
             }
             task = {};
             std::scoped_lock lock{mutex};
-            Common::CloseRaisableThread(runner, raised);
             complete.store(true, std::memory_order_release);
             condition.notify_all();
         }
 
         std::function<void()> task;
         bool failed{};
-        /// Kizuna: the thread running the task, raised while a draw waits for it (Wait): the
-        /// builders run below the guest cores, and a held draw's build shared a core with up to
-        /// ten others (2026-11-11: up to 5 s for one pipeline, the game frozen meanwhile).
-        Common::RaisableThread runner;
-        bool raised{};
         std::atomic_bool claimed{};
         std::atomic_bool complete{};
         std::mutex mutex;
@@ -133,15 +122,17 @@ public:
             shared->Run();
         }
         std::unique_lock lock{shared->mutex};
-        const auto done = [&] { return shared->complete.load(std::memory_order_acquire); };
-        while (!done()) {
-            // A queued task has no thread yet: checked again while waiting.
-            if (!shared->raised && shared->runner.handle != nullptr) {
-                Common::RaiseThread(shared->runner);
-                shared->raised = true;
-            }
-            shared->condition.wait_for(lock, std::chrono::milliseconds{2}, done);
-        }
+        shared->condition.wait(lock,
+                               [&] { return shared->complete.load(std::memory_order_acquire); });
+    }
+
+    /// Waits at most `timeout` for the build, never running it on this thread (one build can
+    /// take seconds). True once built.
+    bool WaitFor(std::chrono::nanoseconds timeout) const {
+        const auto shared = state;
+        std::unique_lock lock{shared->mutex};
+        return shared->condition.wait_for(
+            lock, timeout, [&] { return shared->complete.load(std::memory_order_acquire); });
     }
 
     PipelineBuild(const PipelineBuild&) = delete;

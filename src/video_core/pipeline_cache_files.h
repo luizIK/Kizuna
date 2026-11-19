@@ -19,16 +19,20 @@
 namespace VideoCommon {
 
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-/// 54 since 2026-11-08 (was 52): zortos293/Lichii writes the same records under 53 and 54, and our
+/// 54 since 2026-11-08 (was 52): the builds we port from write the same records under 53 and 54, and our
 /// graphics keys already keep only the attribute types a program reads (KeyedAttributeTypes, their
-/// #408), which is all their version 55 changes. So shared caches and #895 recipes of 54 are taken as
+/// own change), which is all their version 55 changes. So shared caches and precompile recipes of 54 are taken as
 /// they are, and moving to 55 later is this number plus VulkanOwnPreviousVersions.
 inline constexpr u32 VulkanPipelineCacheVersion = 54;
 /// This fork's earlier versions of the same record format, newest first: their files are copied
 /// once to the current version's names (header version rewritten; records unchanged).
 inline constexpr std::array<u32, 1> VulkanOwnPreviousVersions{52};
+/// Versions of the shared cache names (vulkan.fork-v<N>.bin, and the legacy vulkan.bin by its
+/// header) whose records MergeCompatiblePipelineCaches merges into this fork's cache. Shared
+/// caches of other versions are never read.
+inline constexpr std::array<u32, 3> VulkanCompatibleSharedVersions{55, 54, 53};
 
-// Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
+// An earlier build (cache version 18) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file
 // with another version at boot, so alternating builds made every run start with no pipelines
 // (MKW log: "Deleting old pipeline cache", "Total Pipeline Count: 0", then hundreds of
@@ -81,7 +85,7 @@ inline void CopyOwnUnversionedFile(const std::filesystem::path& old_file,
 }
 
 /// Copies a cache whose records this build reads, written with another cache version, to
-/// `destination` with this build's version in its header (from zortos293/Lichii#194). The
+/// `destination` with this build's version in its header (ported). The
 /// source is never changed; an existing destination is kept.
 inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
                                         const std::filesystem::path& destination,
@@ -161,14 +165,6 @@ PipelineCacheMergeResult MergePipelineCache(const std::filesystem::path& source,
 /// file has another magic (then nothing is written).
 std::optional<size_t> MergeUsedPipelineLists(const std::filesystem::path& source,
                                              const std::filesystem::path& destination, u32 magic);
-
-/// The last write time of `path` as MSVC's std::filesystem::file_time_type counts it: FILETIME,
-/// 100 ns ticks since 1601-01-01 UTC. The MinGW standard library counts nanoseconds from another
-/// epoch and drops the fractions of a second, so a stamp an MSVC build wrote (the Fritchii
-/// releases) never matched one a MinGW build read, and every cache keyed on a file's time (the
-/// "Preparing shaders" marker, the warm-up stamps, the merge log) looked changed. 0, with `error`
-/// set, when the time cannot be read.
-[[nodiscard]] s64 FileWriteTicks(const std::filesystem::path& path, std::error_code& error);
 
 /// Size and modification time of a file, to tell whether it changed since it was merged.
 struct PipelineCacheFileStamp {

@@ -199,8 +199,21 @@ std::shared_ptr<const Api> Acquire() {
         return nullptr;
     }
     LOG_INFO(Render_Vulkan, "AMD FSR 4: FidelityFX SDK {} runtime loaded", SDK_VERSION);
+    // The upscaler the loader brought in goes with it, so the next game loads both afresh with
+    // its own device (CheezyEmu found a kept AMD DLL holding the stopped game's device). Holders
+    // destroy their contexts first. The deleter takes the lock: release happens outside it.
     std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
+                                             std::scoped_lock unload_lock{mutex};
                                              FreeLibrary(l->module);
+                                             for (int i = 0; i < 8; ++i) {
+                                                 const HMODULE upscaler = GetModuleHandleW(
+                                                     L"amd_fidelityfx_upscaler_vk.dll");
+                                                 if (!upscaler || !FreeLibrary(upscaler)) {
+                                                     break;
+                                                 }
+                                             }
+                                             LOG_INFO(Render_Vulkan,
+                                                      "AMD FSR 4: FidelityFX runtime unloaded");
                                              delete l;
                                          }};
     current = shared;

@@ -24,4 +24,7 @@ void Clear();
 /// The name of the block holding the host address, if one is registered.
 std::optional<std::string> Lookup(const void* address);
 
+/// Writes every registered range as "start end name" lines (hex addresses); false if it can't.
+bool DumpTo(const std::string& path);
+
 } // namespace Common::JitSymbols

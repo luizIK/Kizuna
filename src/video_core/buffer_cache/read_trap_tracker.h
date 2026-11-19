@@ -5,6 +5,7 @@
 #include "common/common_types.h"
 #include "common/range_sets.h"
 #include "common/range_sets.inc"
+#include "video_core/buffer_cache/gpu_written_mirror.h"
 
 namespace VideoCommon {
 
@@ -28,8 +29,18 @@ public:
         ranges.Subtract(address, size);
     }
 
+    /// Whether any armed byte lies in [address, address + size) (EXP86's verify).
+    [[nodiscard]] bool Intersects(DAddr address, u64 size) const {
+        return ranges.Intersects(address, size);
+    }
+
+    /// EXP86 (fable52_answer_gpuwritten 2.1): keep `bitmap` equal to "a byte armed on the page".
+    void AttachMirror(PageBitmap* bitmap, MirrorSeq* seq) {
+        ranges.Attach(bitmap, seq);
+    }
+
 private:
-    Common::RangeSet<DAddr> ranges;
+    MirroredRangeSet<DAddr> ranges;
 };
 
 } // namespace VideoCommon

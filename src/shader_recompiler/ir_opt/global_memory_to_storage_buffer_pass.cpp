@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -9,10 +8,13 @@
 #include <bit>
 #include <deque>
 #include <map>
+#include <numeric>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -25,6 +27,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/ir_opt/dominance.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/storage_write_extent.h"
 
@@ -76,6 +79,10 @@ struct StorageInfo {
     /// instructions (the IR does not change while storage buffers are collected).
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> biased_tracks;
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> unbiased_tracks;
+    /// Instructions from which a search with (or without) the bias cannot succeed, so later
+    /// searches from other addresses skip what failed ones walked.
+    std::unordered_set<const IR::Inst*> biased_exhausted;
+    std::unordered_set<const IR::Inst*> unbiased_exhausted;
     std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
@@ -406,7 +413,8 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
 }
 
 /// Tries to track the storage buffer address used by a global memory instruction
-std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias) {
+std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
+                                       std::unordered_set<const IR::Inst*>& exhausted) {
     const auto pred{[bias](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 &&
             inst->GetOpcode() != IR::Opcode::GetCbufU32x2) {
@@ -447,7 +455,7 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
         }
         return operand;
     };
-    return BreadthFirstSearch(value, pred, stop_at_memory);
+    return BreadthFirstSearchPruned(value, pred, exhausted, stop_at_memory);
 }
 
 /// Finds the one constant buffer word added directly into the low address, which is the base
@@ -1441,15 +1449,15 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
         storage_buffer = paired_pointer;
     }
-    const auto cached_track = [&](const Bias* bias, auto& cache) {
+    const auto cached_track = [&](const Bias* bias, auto& cache, auto& exhausted) {
         if (low_addr.IsImmediate()) {
-            return Track(low_addr, bias);
+            return Track(low_addr, bias, exhausted);
         }
         const IR::Inst* const start{low_addr.InstRecursive()};
         if (const auto it = cache.find(start); it != cache.end()) {
             return it->second;
         }
-        const std::optional<StorageBufferAddr> result{Track(low_addr, bias)};
+        const std::optional<StorageBufferAddr> result{Track(low_addr, bias, exhausted)};
         cache.emplace(start, result);
         return result;
     };
@@ -1460,11 +1468,11 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         storage_buffer = TrackAddend(low_addr);
     }
     if (!storage_buffer) {
-        storage_buffer = cached_track(&nvn_bias, info.biased_tracks);
+        storage_buffer = cached_track(&nvn_bias, info.biased_tracks, info.biased_exhausted);
     }
     if (!storage_buffer) {
         // If it fails, track without a bias
-        storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        storage_buffer = cached_track(nullptr, info.unbiased_tracks, info.unbiased_exhausted);
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
@@ -1547,20 +1555,747 @@ bool IsGlobalMemoryRead(const IR::Inst& inst) {
     }
 }
 
+/// FRITCHII_EXTENT_SHARED: whether a compute program keeps one private shared memory slot per
+/// invocation, and which stores a load of a slot word reads back. A program can park values it
+/// computed (a record offset made from its ids) in shared memory and load them again later; the
+/// store analyses follow such a load to the values stored when
+///
+///  - every shared write and atomic of the program has an exact address
+///      c.x * tid.x + c.y * tid.y + c.z * tid.z + k
+///    (tid = gl_LocalInvocationID; ExactLocal: no 32-bit wrap anywhere for any invocation) with
+///    the same coefficients c, all non-negative multiples of 4, and those slots never overlap:
+///    with each access widened to whole 32-bit words (the backend may write a byte or a half as
+///    its word) and `span` the bytes from the lowest to the highest one, the dimensions of more
+///    than one invocation sorted by coefficient each step past everything the smaller ones reach:
+///      c1 >= span, c2 >= c1 * (w1 - 1) + span, c3 >= c1 * (w1 - 1) + c2 * (w2 - 1) + span
+///    and the last byte stays inside the program's shared memory. Then only the invocation itself
+///    writes its slot's bytes (no barrier is needed: an invocation sees its own writes in order);
+///  - the load has the same coefficients and reads one whole word that only 32-bit writes of
+///    exactly that word write, and one of them runs before the load on every path to it.
+///
+/// The loaded value is then the newest of those stores' values on the invocation's own path, so
+/// a bound or congruence of each of the stored values (every dynamic instance of each) holds for
+/// it. Anything else follows nothing.
+class SharedSlots {
+public:
+    explicit SharedSlots(const IR::Program& program_) : program{program_} {}
+
+    struct Forward {
+        /// Known when the load reads back `stores`, else why not
+        ExtentUnknownWhy why{};
+        boost::container::small_vector<const IR::Inst*, 4> stores;
+    };
+
+    /// Whether the program loads a 32-bit shared word (the only load followed)
+    bool AnyLoad() {
+        if (!scanned) {
+            Scan();
+        }
+        return any_load;
+    }
+
+    /// The stores a LoadSharedU32 reads back, or why they are not known
+    Forward Resolve(const IR::Inst& load) {
+        if (!scanned) {
+            Scan();
+        }
+        Forward result;
+        if (proof.kind != ExtentUnknown::Known) {
+            result.why = proof;
+            return result;
+        }
+        const auto fail = [&](ExtentUnknown kind, const IR::Inst& at) {
+            result.why = ExtentUnknownWhy{.kind = kind,
+                                          .opcode = static_cast<u16>(at.GetOpcode())};
+            result.stores.clear();
+            return result;
+        };
+        const std::optional<Affine> address{ExactLocal(load.Arg(0), 0)};
+        if (!address || address->c != coefficients) {
+            // Not its own slot (or not exact): another invocation's bytes need a barrier
+            return fail(ExtentUnknown::SharedNotPrivate, load);
+        }
+        const s64 begin{address->k};
+        if (begin % 4 != 0) {
+            return fail(ExtentUnknown::SharedPartialWrite, load);
+        }
+        for (const Access& access : writes) {
+            if (access.word_end <= begin || begin + 4 <= access.word_begin) {
+                continue;
+            }
+            if (access.inst->GetOpcode() != IR::Opcode::WriteSharedU32 || access.k != begin) {
+                return fail(ExtentUnknown::SharedPartialWrite, *access.inst);
+            }
+            result.stores.push_back(access.inst);
+        }
+        if (result.stores.empty()) {
+            return fail(ExtentUnknown::SharedNotDominated, load);
+        }
+        if (!dominance) {
+            dominance.emplace(program);
+        }
+        const bool dominated{std::ranges::any_of(result.stores, [&](const IR::Inst* store) {
+            return dominance->Dominates(store, &load);
+        })};
+        if (!dominated) {
+            return fail(ExtentUnknown::SharedNotDominated, load);
+        }
+        result.why = ExtentUnknownWhy{.kind = ExtentUnknown::Known};
+        return result;
+    }
+
+private:
+    static constexpr s64 LIMIT = s64{1} << 40;
+    static constexpr s64 U32_END = s64{1} << 32;
+    static constexpr u32 MAX_DEPTH = 64;
+    static constexpr u32 MAX_WORKGROUP = 0x10000;
+
+    /// c . tid + k, exactly the unsigned 32-bit value for every invocation of the workgroup (a
+    /// constant: k is its value as a signed 32-bit number)
+    struct Affine {
+        std::array<s64, 3> c{};
+        s64 k{};
+
+        bool IsConstant() const {
+            return c[0] == 0 && c[1] == 0 && c[2] == 0;
+        }
+    };
+
+    struct Access {
+        const IR::Inst* inst{};
+        s64 k{};
+        s64 word_begin{};
+        s64 word_end{};
+    };
+
+    static s64 Signed32(s64 value) {
+        return static_cast<s64>(static_cast<s32>(static_cast<u32>(static_cast<u64>(value))));
+    }
+
+    /// Bytes a shared write or atomic writes (0: not one)
+    static u32 WriteSize(IR::Opcode opcode) {
+        switch (opcode) {
+        case IR::Opcode::WriteSharedU8:
+            return 1;
+        case IR::Opcode::WriteSharedU16:
+            return 2;
+        case IR::Opcode::WriteSharedU32:
+            return 4;
+        case IR::Opcode::WriteSharedU64:
+            return 8;
+        case IR::Opcode::WriteSharedU128:
+            return 16;
+        case IR::Opcode::SharedAtomicExchange64:
+        case IR::Opcode::SharedAtomicExchange32x2:
+            return 8;
+        default:
+            break;
+        }
+        const std::string_view name{IR::NameOf(opcode)};
+        if (name.starts_with("SharedAtomic")) {
+            // A 64-bit or paired atomic not listed above: as wide as the widest
+            return name.find("64") != std::string_view::npos ||
+                           name.find("32x2") != std::string_view::npos
+                       ? 8U
+                       : 4U;
+        }
+        if (name.starts_with("WriteShared")) {
+            return 16; // a store width not listed above: the widest
+        }
+        return 0;
+    }
+
+    /// The smallest and largest value over the workgroup's invocations
+    std::pair<s64, s64> Range(const Affine& value) const {
+        s64 low{value.k};
+        s64 high{value.k};
+        for (size_t i = 0; i < 3; ++i) {
+            // Scan refuses workgroups past MAX_WORKGROUP (and |c| <= LIMIT): no overflow
+            const u32 size{(std::min)(program.workgroup_size[i], MAX_WORKGROUP)};
+            const s64 span{value.c[i] * static_cast<s64>(size > 0 ? size - 1 : 0)};
+            (span < 0 ? low : high) += span;
+        }
+        return {low, high};
+    }
+
+    /// A non-constant result that is exact: in [0, 2^32) for every invocation, small terms
+    std::optional<Affine> Exact(Affine value) const {
+        if (value.IsConstant()) {
+            value.k = Signed32(value.k);
+            return value;
+        }
+        if (value.k > LIMIT || value.k < -LIMIT) {
+            return std::nullopt;
+        }
+        for (const s64 c : value.c) {
+            if (c > LIMIT || c < -LIMIT) {
+                return std::nullopt;
+            }
+        }
+        const auto [low, high] = Range(value);
+        if (low < 0 || high >= U32_END) {
+            return std::nullopt;
+        }
+        return value;
+    }
+
+    std::optional<Affine> Scale(const Affine& value, s64 factor) const {
+        if (value.IsConstant()) {
+            // The 32-bit product (both are 32-bit numbers)
+            const u32 product{static_cast<u32>(static_cast<u64>(value.k)) *
+                              static_cast<u32>(static_cast<u64>(factor))};
+            return Affine{.k = Signed32(static_cast<s64>(product))};
+        }
+        const auto magnitude{[](s64 x) { return x < 0 ? -x : x; }};
+        const s64 scale{magnitude(factor)};
+        const auto fits{[&](s64 x) { return scale == 0 || magnitude(x) <= LIMIT / scale; }};
+        if (!fits(value.k) || !std::ranges::all_of(value.c, fits)) {
+            return std::nullopt;
+        }
+        Affine result{.k = value.k * factor};
+        for (size_t i = 0; i < 3; ++i) {
+            result.c[i] = value.c[i] * factor;
+        }
+        return Exact(result);
+    }
+
+    std::optional<Affine> ExactLocal(const IR::Value& value, u32 depth) {
+        if (value.IsImmediate()) {
+            if (value.Type() != IR::Type::U32) {
+                return std::nullopt;
+            }
+            return Affine{.k = static_cast<s64>(static_cast<s32>(value.U32()))};
+        }
+        if (depth > MAX_DEPTH) {
+            return std::nullopt;
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (const auto it{memo.find(inst)}; it != memo.end()) {
+            return it->second;
+        }
+        const std::optional<Affine> result{ExactLocalInst(*inst, depth)};
+        memo.emplace(inst, result);
+        return result;
+    }
+
+    std::optional<Affine> ExactLocalInst(const IR::Inst& inst, u32 depth) {
+        const auto arg{[&](size_t index) { return ExactLocal(inst.Arg(index), depth + 1); }};
+        const auto imm{[&](size_t index) -> std::optional<u32> {
+            if (!inst.Arg(index).IsImmediate()) {
+                return std::nullopt;
+            }
+            return inst.Arg(index).U32();
+        }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::CompositeExtractU32x3: {
+            if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() ||
+                inst.Arg(1).U32() > 2 ||
+                inst.Arg(0).InstRecursive()->GetOpcode() != IR::Opcode::LocalInvocationId) {
+                return std::nullopt;
+            }
+            Affine result;
+            const u32 element{inst.Arg(1).U32()};
+            // A dimension of one invocation: its id is 0
+            result.c[element] = program.workgroup_size[element] > 1 ? 1 : 0;
+            return result;
+        }
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::ISub32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            const s64 sign{inst.GetOpcode() == IR::Opcode::IAdd32 ? 1 : -1};
+            Affine result{.k = lhs->k + sign * rhs->k};
+            for (size_t i = 0; i < 3; ++i) {
+                result.c[i] = lhs->c[i] + sign * rhs->c[i];
+            }
+            return Exact(result);
+        }
+        case IR::Opcode::IMul32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            if (rhs->IsConstant()) {
+                return Scale(*lhs, rhs->k);
+            }
+            if (lhs->IsConstant()) {
+                return Scale(*rhs, lhs->k);
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::ShiftLeftLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            const auto lhs{shift && *shift < 32 ? arg(0) : std::nullopt};
+            return lhs ? Scale(*lhs, s64{1} << *shift) : std::nullopt;
+        }
+        case IR::Opcode::BitFieldUExtract: {
+            const std::optional<u32> offset{imm(1)};
+            const std::optional<u32> count{imm(2)};
+            const auto source{offset && count && *offset < 32 && *count != 0 && *count <= 32
+                                  ? arg(0)
+                                  : std::nullopt};
+            if (!source) {
+                return std::nullopt;
+            }
+            if (source->IsConstant()) {
+                const u64 bits{static_cast<u32>(static_cast<u64>(source->k))};
+                const u64 field{(bits >> *offset) & ((u64{1} << *count) - 1)};
+                return Exact(Affine{.k = static_cast<s64>(field)});
+            }
+            const s64 high{Range(*source).second};
+            if (*offset == 0 && high < (s64{1} << *count)) {
+                return source; // the whole value
+            }
+            if ((high >> *offset) == 0) {
+                return Affine{}; // above every bit it has (a lowered multiplication's high half)
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::BitFieldInsert: {
+            const std::optional<u32> offset{imm(2)};
+            const std::optional<u32> count{imm(3)};
+            if (!offset || !count || *count == 0 || *offset + *count > 32) {
+                return std::nullopt;
+            }
+            const auto base{arg(0)};
+            const auto insert{base ? arg(1) : std::nullopt};
+            if (!base || !insert) {
+                return std::nullopt;
+            }
+            // A constant as its unsigned value (Exact keeps constants signed)
+            const auto as_unsigned{[](Affine v) {
+                if (v.IsConstant()) {
+                    v.k = static_cast<s64>(static_cast<u32>(static_cast<u64>(v.k)));
+                }
+                return v;
+            }};
+            const Affine low{as_unsigned(*base)};
+            const Affine field{as_unsigned(*insert)};
+            const auto fits{[&](const Affine& v, u32 bits) {
+                const auto [lowest, highest] = Range(v);
+                return lowest >= 0 && highest < (s64{1} << bits);
+            }};
+            // The base below the field and the inserted value inside it: a sum
+            if (!fits(low, *offset) || !fits(field, *count)) {
+                return std::nullopt;
+            }
+            Affine result{.c = low.c, .k = low.k + (field.k << *offset)};
+            for (size_t i = 0; i < 3; ++i) {
+                result.c[i] += field.c[i] << *offset;
+            }
+            return Exact(result);
+        }
+        case IR::Opcode::BitwiseAnd32: {
+            // A mask of low bits over a value inside them
+            for (const size_t side : {size_t{1}, size_t{0}}) {
+                const std::optional<u32> mask{imm(side)};
+                if (!mask || (u64{*mask} & (u64{*mask} + 1)) != 0) {
+                    continue;
+                }
+                const auto other{arg(1 - side)};
+                if (other && !other->IsConstant() && Range(*other).second <= s64{*mask}) {
+                    return other;
+                }
+            }
+            return std::nullopt;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    /// The proof over every shared write and atomic of the program (once)
+    void Scan() {
+        scanned = true;
+        proof = ExtentUnknownWhy{.kind = ExtentUnknown::Known};
+        if (std::ranges::any_of(program.workgroup_size,
+                                [](u32 size) { return size == 0 || size > MAX_WORKGROUP; })) {
+            proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+        }
+        bool have_coefficients{};
+        s64 lowest{};
+        s64 highest{};
+        for (const IR::Block* const block : program.post_order_blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                const IR::Opcode opcode{inst.GetOpcode()};
+                any_load |= opcode == IR::Opcode::LoadSharedU32;
+                const u32 size{WriteSize(opcode)};
+                if (size == 0 || proof.kind != ExtentUnknown::Known) {
+                    continue;
+                }
+                const auto refuse{[&] {
+                    proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate,
+                                             .opcode = static_cast<u16>(opcode)};
+                }};
+                const std::optional<Affine> address{ExactLocal(inst.Arg(0), 0)};
+                if (!address || address->k < 0 ||
+                    std::ranges::any_of(address->c, [](s64 c) { return c < 0 || c % 4 != 0; })) {
+                    refuse();
+                    continue;
+                }
+                if (!have_coefficients) {
+                    coefficients = address->c;
+                    have_coefficients = true;
+                } else if (address->c != coefficients) {
+                    refuse();
+                    continue;
+                }
+                const Access access{
+                    .inst = &inst,
+                    .k = address->k,
+                    .word_begin = address->k & ~s64{3},
+                    .word_end = (address->k + size + 3) & ~s64{3},
+                };
+                lowest = writes.empty() ? access.word_begin : (std::min)(lowest, access.word_begin);
+                highest = writes.empty() ? access.word_end : (std::max)(highest, access.word_end);
+                writes.push_back(access);
+            }
+        }
+        if (proof.kind != ExtentUnknown::Known || writes.empty()) {
+            return;
+        }
+        // The slots one invocation apart in each dimension never overlap (mixed radix), and the
+        // last invocation's slot ends inside the shared memory
+        const s64 span{highest - lowest};
+        std::array<size_t, 3> dims{0, 1, 2};
+        std::ranges::sort(dims, [&](size_t a, size_t b) { return coefficients[a] < coefficients[b]; });
+        s64 reach{};
+        for (const size_t dim : dims) {
+            const s64 size{static_cast<s64>(program.workgroup_size[dim])};
+            if (size <= 1) {
+                continue;
+            }
+            if (coefficients[dim] < reach + span) {
+                proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+                return;
+            }
+            reach += coefficients[dim] * (size - 1);
+        }
+        if (highest + reach > static_cast<s64>(program.shared_memory_size)) {
+            proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+        }
+    }
+
+    const IR::Program& program;
+    bool scanned{};
+    bool any_load{};
+    ExtentUnknownWhy proof{};
+    std::array<s64, 3> coefficients{};
+    std::vector<Access> writes;
+    std::unordered_map<const IR::Inst*, std::optional<Affine>> memo;
+    std::optional<Dominance> dominance;
+};
+
+/// FRITCHII_EXTENT_GUARD: the branch conditions every path to a store passes, as path facts. An
+/// append list's store sits behind `if (index < capacity)` (or an early exit when it is not), so
+/// its index is bounded on the store's path although nothing bounds the index itself (an atomic's
+/// result). The facts come from the structured control flow's conditional edges (If: header to
+/// body when the condition holds, to the merge when not; Break and Repeat alike), each checked
+/// against the header's two successors. An edge H -> T gives its condition to a block S when T
+/// dominates S and every other predecessor of T is dominated by T (a loop's back edge): then
+/// every path to S entered T last from outside through H -> T, so the condition held when H
+/// evaluated it. The condition splits into atoms (any boolean instruction, with its value)
+/// through ConditionRef, LogicalNot, LogicalAnd (true) and LogicalOr (false).
+///
+/// Two uses, both exact for an invocation that runs the store:
+///  - a bound: `x < K` (unsigned) bounds x by K - 1 when x is defined in a block of no cycle (it
+///    has one value in the invocation, the one the branch compared) and K is bounded (an
+///    immediate, a constant buffer word, ...). Signed compares and `x + c < K` with c > 0 (it may
+///    wrap) refuse; `x - d < K` bounds x by K - 1 + d (a wrap makes the compare fail).
+///  - an edge never taken: a phi's incoming edge needs an atom with the other value than a path
+///    fact of the store. When that atom is invariant (defined in a block of no cycle, or a compare
+///    of such values, immediates and constant buffer words), it has one value in the invocation,
+///    so the store's path and that edge never meet in one invocation: the incoming is dropped
+///    (predicated moves into the store's address, `@!P mov; @!P st`).
+class GuardFacts {
+public:
+    /// A boolean instruction and the value it has on every path through an edge
+    struct Atom {
+        const IR::Inst* inst{};
+        bool value{};
+    };
+
+    explicit GuardFacts(const IR::Program& program) : dominance{program} {
+        const IR::AbstractSyntaxList& list{program.syntax_list};
+        for (size_t index = 0; index < list.size(); ++index) {
+            const IR::AbstractSyntaxNode& node{list[index]};
+            const IR::Block* const header{
+                index > 0 && list[index - 1].type == IR::AbstractSyntaxNode::Type::Block
+                    ? list[index - 1].data.block
+                    : nullptr};
+            switch (node.type) {
+            case IR::AbstractSyntaxNode::Type::If:
+                AddBranch(header, node.data.if_node.body, node.data.if_node.merge,
+                          node.data.if_node.cond);
+                break;
+            case IR::AbstractSyntaxNode::Type::Break:
+                AddBranch(header, node.data.break_node.merge, node.data.break_node.skip,
+                          node.data.break_node.cond);
+                break;
+            case IR::AbstractSyntaxNode::Type::Repeat:
+                AddBranch(header, node.data.repeat.loop_header, node.data.repeat.merge,
+                          node.data.repeat.cond);
+                break;
+            default:
+                break;
+            }
+        }
+        // Census: the values some branch compares (a guard that may not dominate a store)
+        std::vector<Atom> atoms;
+        for (const Edge& edge : edges) {
+            atoms.clear();
+            Implied(edge.cond, edge.value, atoms, 0);
+            for (const Atom& atom : atoms) {
+                for (size_t arg = 0; arg < 2 && arg < atom.inst->NumArgs(); ++arg) {
+                    const IR::Value operand{atom.inst->Arg(arg).Resolve()};
+                    if (operand.IsImmediate()) {
+                        continue;
+                    }
+                    const IR::Inst* const compared_inst{operand.InstRecursive()};
+                    compared.insert(compared_inst);
+                    const IR::Opcode opcode{compared_inst->GetOpcode()};
+                    if (opcode == IR::Opcode::IAdd32 || opcode == IR::Opcode::ISub32) {
+                        for (size_t term = 0; term < 2; ++term) {
+                            const IR::Value inner{compared_inst->Arg(term).Resolve()};
+                            if (!inner.IsImmediate()) {
+                                compared.insert(inner.InstRecursive());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The atoms every path to the store passed with their value
+    const std::vector<Atom>& FactsAt(const IR::Inst& store) {
+        static const std::vector<Atom> none;
+        const IR::Block* const block{dominance.BlockOf(&store)};
+        if (block == nullptr) {
+            return none;
+        }
+        const auto [it, inserted]{facts.try_emplace(block)};
+        if (inserted) {
+            for (const Edge& edge : edges) {
+                if (EdgeDominates(edge, block)) {
+                    Implied(edge.cond, edge.value, it->second, 0);
+                }
+            }
+        }
+        return it->second;
+    }
+
+    /// Whether the edge from -> to is never taken in an invocation that holds `path` (an atom it
+    /// needs is invariant and has the other value there)
+    bool Excluded(const IR::Block* from, const IR::Block* to, const std::vector<Atom>& path) {
+        if (path.empty()) {
+            return false;
+        }
+        std::vector<Atom> needed;
+        for (const Edge& edge : edges) {
+            if (edge.from != from || edge.to != to) {
+                continue;
+            }
+            needed.clear();
+            Implied(edge.cond, edge.value, needed, 0);
+            for (const Atom& atom : needed) {
+                for (const Atom& fact : path) {
+                    if (fact.inst == atom.inst && fact.value != atom.value &&
+                        Invariant(*atom.inst)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Whether an instruction may run more than once in an invocation (its block is on a cycle,
+    /// or not known)
+    bool InLoop(const IR::Inst& inst) {
+        const IR::Block* const block{dominance.BlockOf(&inst)};
+        return block == nullptr || InCycle(block);
+    }
+
+    /// Whether some branch of the program compares the value (FRITCHII_EXTENT_CENSUS)
+    bool Compared(const IR::Inst& inst) const {
+        return compared.contains(&inst);
+    }
+
+    const IR::Block* BlockOf(const IR::Inst& inst) const {
+        return dominance.BlockOf(&inst);
+    }
+
+private:
+    struct Edge {
+        const IR::Block* from{};
+        const IR::Block* to{};
+        IR::U1 cond;
+        bool value{};
+    };
+
+    /// A conditional branch of `header`: to on_true when cond holds, else to on_false
+    void AddBranch(const IR::Block* header, const IR::Block* on_true, const IR::Block* on_false,
+                   const IR::U1& cond) {
+        if (header == nullptr || on_true == nullptr || on_false == nullptr || on_true == on_false ||
+            cond.IsImmediate()) {
+            return;
+        }
+        const std::span<IR::Block* const> successors{header->ImmSuccessors()};
+        if (successors.size() != 2 || successors[0] != on_true || successors[1] != on_false) {
+            // Not the shape the structured control flow builds: no facts from it
+            return;
+        }
+        edges.push_back(Edge{.from = header, .to = on_true, .cond = cond, .value = true});
+        edges.push_back(Edge{.from = header, .to = on_false, .cond = cond, .value = false});
+    }
+
+    /// The atoms `cond` == `value` implies
+    static void Implied(const IR::Value& cond, bool value, std::vector<Atom>& out, u32 depth) {
+        const IR::Value resolved{cond.Resolve()};
+        if (resolved.IsImmediate() || depth > 16) {
+            return;
+        }
+        const IR::Inst* const inst{resolved.InstRecursive()};
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::ConditionRef:
+            Implied(inst->Arg(0), value, out, depth + 1);
+            return;
+        case IR::Opcode::LogicalNot:
+            Implied(inst->Arg(0), !value, out, depth + 1);
+            return;
+        case IR::Opcode::LogicalAnd:
+            if (value) {
+                Implied(inst->Arg(0), true, out, depth + 1);
+                Implied(inst->Arg(1), true, out, depth + 1);
+            }
+            return;
+        case IR::Opcode::LogicalOr:
+            if (!value) {
+                Implied(inst->Arg(0), false, out, depth + 1);
+                Implied(inst->Arg(1), false, out, depth + 1);
+            }
+            return;
+        default:
+            out.push_back(Atom{.inst = inst, .value = value});
+            return;
+        }
+    }
+
+    /// Whether every path to `block` goes through the edge last when it enters edge.to
+    bool EdgeDominates(const Edge& edge, const IR::Block* block) const {
+        if (!dominance.BlockDominates(edge.to, block)) {
+            return false;
+        }
+        for (const IR::Block* const predecessor : edge.to->ImmPredecessors()) {
+            if (predecessor != edge.from && !dominance.BlockDominates(edge.to, predecessor)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether a path leads from the block back to itself
+    bool InCycle(const IR::Block* block) {
+        if (const auto it{cyclic.find(block)}; it != cyclic.end()) {
+            return it->second;
+        }
+        bool found{};
+        std::unordered_set<const IR::Block*> seen;
+        std::vector<const IR::Block*> stack(block->ImmSuccessors().begin(),
+                                            block->ImmSuccessors().end());
+        while (!stack.empty() && !found) {
+            const IR::Block* const current{stack.back()};
+            stack.pop_back();
+            if (current == block) {
+                found = true;
+                break;
+            }
+            if (!seen.insert(current).second) {
+                continue;
+            }
+            for (const IR::Block* const next : current->ImmSuccessors()) {
+                stack.push_back(next);
+            }
+        }
+        cyclic.emplace(block, found);
+        return found;
+    }
+
+    /// Whether a boolean has one value in an invocation
+    bool Invariant(const IR::Inst& atom) {
+        if (!InLoop(atom)) {
+            return true;
+        }
+        switch (atom.GetOpcode()) {
+        case IR::Opcode::SLessThan:
+        case IR::Opcode::ULessThan:
+        case IR::Opcode::IEqual:
+        case IR::Opcode::SLessThanEqual:
+        case IR::Opcode::ULessThanEqual:
+        case IR::Opcode::SGreaterThan:
+        case IR::Opcode::UGreaterThan:
+        case IR::Opcode::INotEqual:
+        case IR::Opcode::SGreaterThanEqual:
+        case IR::Opcode::UGreaterThanEqual:
+            break;
+        default:
+            return false;
+        }
+        // A compare in a loop of values that each have one value
+        for (size_t arg = 0; arg < atom.NumArgs(); ++arg) {
+            const IR::Value operand{atom.Arg(arg).Resolve()};
+            if (operand.IsImmediate()) {
+                continue;
+            }
+            const IR::Inst* const inst{operand.InstRecursive()};
+            if (CbufWord(inst)) {
+                continue;
+            }
+            if (InLoop(*inst)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    Dominance dominance;
+    std::vector<Edge> edges;
+    std::unordered_set<const IR::Inst*> compared;
+    std::unordered_map<const IR::Block*, std::vector<Atom>> facts;
+    std::unordered_map<const IR::Block*, bool> cyclic;
+};
+
 /// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
-/// bound is largest at the largest ids.
+/// bound is largest at the largest ids. FRITCHII_EXTENT_CBUF's analysis (terms mode) also adds
+/// constant buffer words times a non-negative coefficient (their values are read at bind time).
 struct IdBound {
+    struct Term {
+        u32 index{};
+        u32 offset{};
+        u64 coef{};
+    };
     s64 c{};
     std::array<u64, 6> coef{};
     u32 base{};
+    u32 num_terms{};
+    std::array<Term, MaxExtentTerms> terms{};
 
     bool IsConstant() const {
-        return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
+        return base == 0 && num_terms == 0 &&
+               std::ranges::all_of(coef, [](u64 value) { return value == 0; });
     }
     bool HasGroupTerms() const {
         return coef[3] != 0 || coef[4] != 0 || coef[5] != 0;
+    }
+    bool HasTerms() const {
+        return num_terms != 0;
     }
 };
 
@@ -1568,20 +2303,62 @@ struct IdBound {
 /// can land relative to its pointer word. Anything not provably affine in the invocation and
 /// workgroup ids with constant non-negative strides (a value loaded from memory or read from
 /// another constant buffer word, a loop-carried index, a signed or 64-bit computation) leaves the
-/// extent unknown.
+/// extent unknown, and the first such exit is kept (FRITCHII_EXTENT_CENSUS, Why()). In terms mode
+/// (FRITCHII_EXTENT_CBUF) another constant buffer word read at an immediate offset is a term of
+/// the bound instead. With `shared` (FRITCHII_EXTENT_SHARED) a 32-bit load from a private shared
+/// memory slot is bounded by the values its invocation stored there (SharedSlots).
+///
+/// With `guards` (FRITCHII_EXTENT_GUARD, terms mode) also, each exact for an invocation that runs
+/// the store being analysed:
+///  - a value no rule bounds is bounded by the path facts of the store (GuardFacts: the store
+///    only runs when `x < K` held), and a phi drops the incoming edges such an invocation never
+///    takes;
+///  - a subgroup shuffle is bounded by its operand's bound at the workgroup's largest local ids
+///    (any lane of the workgroup may be the source; group ids and constant buffer words are the
+///    same in all of them). The operand is evaluated without the path facts: the source lane may
+///    not run the store. A shuffle from an inactive lane is undefined, as in the guest program
+///    (an append list broadcasts from the lane that did the atomic);
+///  - a bit count of a 32-bit value is at most 32;
+///  - word - v (also v negated plus word) is at most the constant buffer word when the word is at
+///    least v's largest value, a floor the dispatch checks at bind time (a clamp
+///    min(old, capacity - count)).
 class StoreExtentAnalysis {
 public:
-    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
-        : buffer{buffer_}, workgroup{workgroup_} {}
+    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_,
+                                 bool terms_ = false, SharedSlots* shared_ = nullptr,
+                                 GuardFacts* guards_ = nullptr)
+        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_}, shared{shared_},
+          guards{guards_} {}
+
+    /// FRITCHII_EXTENT_SHARED: whether a load from shared memory was followed to its stores
+    bool Forwarded() const {
+        return forwarded;
+    }
 
     /// Extent of one access, merged into `extent`
     void AddAccess(IR::Inst& inst, StorageWriteExtent& extent) {
-        const std::optional<StorageWriteExtent> store{StoreExtent(inst)};
-        if (!store) {
+        const std::optional<StorageCbufExtent> store{StoreExtent(inst)};
+        if (!store || store->num_terms != 0 || store->num_guard_terms != 0 ||
+            store->num_floors != 0) {
             extent = StorageWriteExtent{};
             return;
         }
-        MergeStorageWriteExtent(extent, *store);
+        MergeStorageWriteExtent(extent, store->ids);
+    }
+
+    /// Terms mode: extent of one access with its constant buffer terms, merged into `extent`
+    void AddAccess(IR::Inst& inst, StorageCbufExtent& extent) {
+        const std::optional<StorageCbufExtent> store{StoreExtent(inst)};
+        if (!store) {
+            extent = StorageCbufExtent{};
+            return;
+        }
+        MergeStorageCbufExtent(extent, *store);
+    }
+
+    /// Why the first access that failed did (Unrecorded while none did)
+    const ExtentUnknownWhy& Why() const {
+        return why;
     }
 
 private:
@@ -1589,45 +2366,147 @@ private:
     static constexpr u64 COEF_LIMIT = u64{1} << 32;
     static constexpr u32 MAX_DEPTH = 256;
 
-    std::optional<StorageWriteExtent> StoreExtent(IR::Inst& inst) {
+    struct Memo {
+        std::optional<IdBound> result;
+        ExtentUnknownWhy why;
+    };
+
+    /// Notes the reason of the current evaluation's first exit
+    void Fail(const ExtentUnknownWhy& reason) {
+        if (failure.kind == ExtentUnknown::Unrecorded) {
+            failure = reason;
+        }
+    }
+    void Fail(ExtentUnknown kind, const IR::Inst* inst = nullptr) {
+        Fail(ExtentUnknownWhy{
+            .kind = kind,
+            .opcode = inst != nullptr ? static_cast<u16>(inst->GetOpcode()) : u16{0},
+        });
+    }
+
+    std::optional<StorageCbufExtent> StoreExtent(IR::Inst& inst) {
+        failure = {};
+        std::optional<StorageCbufExtent> result{StoreExtentOf(inst)};
+        if (!result && why.kind == ExtentUnknown::Unrecorded) {
+            why = failure.kind != ExtentUnknown::Unrecorded
+                      ? failure
+                      : ExtentUnknownWhy{.kind = ExtentUnknown::OtherOp,
+                                         .opcode = static_cast<u16>(inst.GetOpcode())};
+        }
+        return result;
+    }
+
+    std::optional<StorageCbufExtent> StoreExtentOf(IR::Inst& inst) {
         const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
         if (!addr) {
+            Fail(ExtentUnknown::AddressNotTracked, &inst);
             return std::nullopt;
         }
+        if (guards != nullptr) {
+            // FRITCHII_EXTENT_GUARD: this store's path facts; results evaluated under another
+            // store's facts may not hold here
+            const std::vector<GuardFacts::Atom>* const now{&guards->FactsAt(inst)};
+            if (now != path_facts) {
+                memo.clear();
+                path_facts = now;
+            }
+        }
         const std::optional<IdBound> low{Evaluate(addr->value, 0)};
-        if (!low || low->base != 1 || guard_failed) {
+        if (!low) {
+            return std::nullopt;
+        }
+        if (low->base != 1) {
+            Fail(ExtentUnknown::NoPointerTerm, &inst);
+            return std::nullopt;
+        }
+        if (guard_failed) {
+            Fail(ExtentUnknown::GuardFailed, &inst);
             return std::nullopt;
         }
         const s64 end{low->c + addr->imm_offset + AccessSize(inst.GetOpcode())};
         if (end > s64{0xffffffff}) {
+            Fail(ExtentUnknown::TooLarge, &inst);
             return std::nullopt;
         }
-        StorageWriteExtent result{
+        StorageCbufExtent result{};
+        if (floors.size() > MaxExtentFloors) {
+            Fail(ExtentUnknown::TooLarge, &inst);
+            return std::nullopt;
+        }
+        for (const StorageExtentFloor& floor : floors) {
+            result.floors[result.num_floors++] = floor;
+        }
+        result.ids = StorageWriteExtent{
             .bounded = true,
             .const_end = static_cast<u32>((std::max)(end, s64{0})),
         };
         for (size_t i = 0; i < 3; ++i) {
             if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
+                Fail(ExtentUnknown::TooLarge, &inst);
                 return std::nullopt;
             }
-            result.local_stride[i] = static_cast<u32>(low->coef[i]);
-            result.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
+            result.ids.local_stride[i] = static_cast<u32>(low->coef[i]);
+            result.ids.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
+        }
+        if (!CopyTerms(*low, result.terms, result.num_terms)) {
+            Fail(ExtentUnknown::TooLarge, &inst);
+            return std::nullopt;
         }
         if (guard) {
             if (guard->c > s64{0xffff}) {
+                Fail(ExtentUnknown::GuardFailed, &inst);
                 return std::nullopt;
             }
-            result.guarded = true;
-            result.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
+            result.ids.guarded = true;
+            result.ids.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
             for (size_t i = 0; i < 3; ++i) {
                 if (guard->coef[i] > 0xffff || guard->coef[i + 3] > 0xffff) {
+                    Fail(ExtentUnknown::GuardFailed, &inst);
                     return std::nullopt;
                 }
-                result.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
-                result.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
+                result.ids.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
+                result.ids.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
+            }
+            if (!CopyTerms(*guard, result.guard_terms, result.num_guard_terms)) {
+                Fail(ExtentUnknown::GuardFailed, &inst);
+                return std::nullopt;
             }
         }
         return result;
+    }
+
+    static bool CopyTerms(const IdBound& value, std::array<StorageExtentTerm, MaxExtentTerms>& out,
+                          u8& count) {
+        count = 0;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            if (value.terms[i].coef >= COEF_LIMIT) {
+                return false;
+            }
+            out[count++] = StorageExtentTerm{
+                .cbuf_index = value.terms[i].index,
+                .cbuf_offset = value.terms[i].offset,
+                .coef = static_cast<u32>(value.terms[i].coef),
+            };
+        }
+        return true;
+    }
+
+    /// Adds `term` to `into`'s terms: the sum, or with `max` the larger coefficient for a word
+    /// already there. False when they do not fit.
+    static bool AddTerm(IdBound& into, const IdBound::Term& term, bool max) {
+        for (u32 i = 0; i < into.num_terms; ++i) {
+            IdBound::Term& existing = into.terms[i];
+            if (existing.index == term.index && existing.offset == term.offset) {
+                existing.coef =
+                    max ? (std::max)(existing.coef, term.coef) : existing.coef + term.coef;
+                return true;
+            }
+        }
+        if (into.num_terms >= MaxExtentTerms) {
+            return false;
+        }
+        into.terms[into.num_terms++] = term;
+        return true;
     }
 
     static std::optional<IdBound> Checked(IdBound value) {
@@ -1636,6 +2515,11 @@ private:
         }
         for (const u64 coef : value.coef) {
             if (coef >= COEF_LIMIT) {
+                return std::nullopt;
+            }
+        }
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            if (value.terms[i].coef >= COEF_LIMIT) {
                 return std::nullopt;
             }
         }
@@ -1651,10 +2535,17 @@ private:
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = lhs.coef[i] + rhs.coef[i];
         }
+        result.num_terms = lhs.num_terms;
+        result.terms = lhs.terms;
+        for (u32 i = 0; i < rhs.num_terms; ++i) {
+            if (!AddTerm(result, rhs.terms[i], false)) {
+                return std::nullopt;
+            }
+        }
         return Checked(result);
     }
 
-    /// Component-wise maximum: a bound of either value (ids are non-negative)
+    /// Component-wise maximum: a bound of either value (ids and words are non-negative)
     static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
         if (lhs.base != rhs.base) {
             return std::nullopt;
@@ -1662,6 +2553,13 @@ private:
         IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
+        }
+        result.num_terms = lhs.num_terms;
+        result.terms = lhs.terms;
+        for (u32 i = 0; i < rhs.num_terms; ++i) {
+            if (!AddTerm(result, rhs.terms[i], true)) {
+                return std::nullopt;
+            }
         }
         return result;
     }
@@ -1676,6 +2574,15 @@ private:
                 return std::nullopt;
             }
             result.coef[i] = value.coef[i] * factor;
+        }
+        result.num_terms = value.num_terms;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            const u64 coef{value.terms[i].coef};
+            if (coef != 0 && factor > (COEF_LIMIT - 1) / coef) {
+                return std::nullopt;
+            }
+            result.terms[i] = value.terms[i];
+            result.terms[i].coef = coef * factor;
         }
         if (value.c > 0 && factor > static_cast<u64>(CONST_LIMIT / value.c)) {
             return std::nullopt;
@@ -1693,13 +2600,18 @@ private:
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = up(value.coef[i]);
         }
+        result.num_terms = value.num_terms;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            result.terms[i] = value.terms[i];
+            result.terms[i].coef = up(value.terms[i].coef);
+        }
         return result;
     }
 
     /// The value's bound when only its local-id terms vary (the workgroup size is fixed), or
-    /// nullopt when it has workgroup terms or the pointer
+    /// nullopt when it has workgroup terms, constant buffer words or the pointer
     std::optional<u64> StaticMax(const IdBound& value) const {
-        if (value.base != 0 || value.HasGroupTerms() || value.c < 0) {
+        if (value.base != 0 || value.HasGroupTerms() || value.HasTerms() || value.c < 0) {
             return std::nullopt;
         }
         u64 total{static_cast<u64>(value.c)};
@@ -1732,11 +2644,13 @@ private:
 
     std::optional<IdBound> BitFieldExtract(const IR::Inst& inst, u32 depth) {
         if (!inst.Arg(1).IsImmediate() || !inst.Arg(2).IsImmediate()) {
+            Fail(ExtentUnknown::OtherOp, &inst);
             return std::nullopt;
         }
         const u32 offset{inst.Arg(1).U32()};
         const u32 count{inst.Arg(2).U32()};
         if (offset >= 32 || count == 0 || count > 32) {
+            Fail(ExtentUnknown::OtherOp, &inst);
             return std::nullopt;
         }
         if (inst.Arg(0).IsImmediate()) {
@@ -1754,6 +2668,10 @@ private:
                 return Constant(0);
             }
         }
+        if (terms_mode && source->HasTerms() && offset < 16 && field_max) {
+            // A field of a constant buffer word: its width bounds it without the word
+            return field_max;
+        }
         if (offset == 0) {
             // A low field is at most the whole value
             return source;
@@ -1770,24 +2688,104 @@ private:
     std::optional<IdBound> Evaluate(const IR::Value& value, u32 depth) {
         if (value.IsImmediate()) {
             if (value.Type() != IR::Type::U32) {
+                Fail(ExtentUnknown::SignedOr64Bit);
                 return std::nullopt;
             }
             return Constant(static_cast<s64>(static_cast<s32>(value.U32())));
         }
         if (depth > MAX_DEPTH) {
+            Fail(ExtentUnknown::TooDeep);
             return std::nullopt;
         }
         const IR::Inst* const inst{value.InstRecursive()};
-        if (const auto it{memo.find(inst)}; it != memo.end()) {
-            return it->second;
+        // FRITCHII_EXTENT_GUARD: results without the path facts hold under any of them
+        auto& results{guards != nullptr && facts_off ? memo_no_facts : memo};
+        if (const auto it{results.find(inst)}; it != results.end()) {
+            if (!it->second.result) {
+                Fail(it->second.why);
+            }
+            return it->second.result;
         }
         if (!active.insert(inst).second) {
             // A cycle: a loop-carried value
+            Fail(ExtentUnknown::LoopCarried, inst);
             return std::nullopt;
         }
-        const std::optional<IdBound> result{EvaluateInst(*inst, depth)};
+        // The reason of this instruction's own exit (a failure its operands' evaluation noted
+        // but the instruction got past is dropped)
+        const ExtentUnknownWhy outer{failure};
+        failure = {};
+        std::optional<IdBound> result{EvaluateInst(*inst, depth)};
+        ExtentUnknownWhy mine{};
+        if (!result) {
+            mine = failure.kind != ExtentUnknown::Unrecorded ? failure : Classify(*inst);
+            if (guards != nullptr && !facts_off) {
+                // FRITCHII_EXTENT_GUARD: a branch on the store's path may bound it
+                ExtentUnknownWhy refusal{};
+                result = PathBound(*inst, depth, refusal);
+                if (result) {
+                    mine = {};
+                } else if (refusal.kind != ExtentUnknown::Unrecorded) {
+                    mine = refusal;
+                }
+            }
+        }
         active.erase(inst);
-        memo.emplace(inst, result);
+        results.emplace(inst, Memo{result, mine});
+        failure = outer;
+        if (!result) {
+            Fail(mine);
+        }
+        return result;
+    }
+
+    /// The reason an instruction with no other noted reason is not bounded
+    static ExtentUnknownWhy Classify(const IR::Inst& inst) {
+        const IR::Opcode opcode{inst.GetOpcode()};
+        const ExtentUnknownWhy why_of{[&] {
+            switch (opcode) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::ShiftLeftLogical32:
+            case IR::Opcode::ShiftRightLogical32:
+            case IR::Opcode::BitwiseOr32:
+            case IR::Opcode::BitwiseXor32:
+            case IR::Opcode::UMax32:
+            case IR::Opcode::BitFieldInsert:
+                // Handled, and failed on its limits (a large constant or stride, or the pointer
+                // where it can't be)
+                return ExtentUnknownWhy{.kind = ExtentUnknown::TooLarge};
+            case IR::Opcode::SelectU32:
+            case IR::Opcode::Phi:
+                // Max: one side adds the pointer and the other not
+                return ExtentUnknownWhy{.kind = ExtentUnknown::NoPointerTerm};
+            default:
+                break;
+            }
+            const std::string_view name{IR::NameOf(opcode)};
+            const auto has = [&](std::string_view part) {
+                return name.find(part) != std::string_view::npos;
+            };
+            if (name.starts_with("GetCbuf")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::DynamicCbuf};
+            }
+            if (has("Atomic")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::AtomicResult};
+            }
+            if (name.starts_with("Load") || name.starts_with("Image") || has("Fetch")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::LoadedFromMemory};
+            }
+            if (has("64") || has("Arithmetic") || name.starts_with("SConvert") ||
+                name.starts_with("SMin") || name.starts_with("SMax") || name.starts_with("SDiv") ||
+                name.starts_with("SClamp") || name.starts_with("INeg") ||
+                name.starts_with("IAbs") || name.starts_with("BitFieldSExtract") ||
+                name.starts_with("ConvertU32") || name.starts_with("ConvertS32") ||
+                name.starts_with("UConvert")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::SignedOr64Bit};
+            }
+            return ExtentUnknownWhy{.kind = ExtentUnknown::OtherOp};
+        }()};
+        ExtentUnknownWhy result{why_of};
+        result.opcode = static_cast<u16>(opcode);
         return result;
     }
 
@@ -1796,6 +2794,16 @@ private:
             if (*word == buffer) {
                 return IdBound{.base = 1};
             }
+            if (terms_mode) {
+                IdBound term{.num_terms = 1};
+                term.terms[0] =
+                    IdBound::Term{.index = word->index, .offset = word->offset, .coef = 1};
+                return term;
+            }
+            Fail(ExtentUnknownWhy{.kind = ExtentUnknown::OtherCbufWord,
+                                  .opcode = static_cast<u16>(inst.GetOpcode()),
+                                  .cbuf_index = word->index,
+                                  .cbuf_offset = word->offset});
             return std::nullopt;
         }
         const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
@@ -1804,7 +2812,8 @@ private:
             if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() > 2) {
                 return std::nullopt;
             }
-            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
+            const IR::Inst* const vector_inst{inst.Arg(0).InstRecursive()};
+            const IR::Opcode vector{vector_inst->GetOpcode()};
             const u32 element{inst.Arg(1).U32()};
             IdBound result;
             if (vector == IR::Opcode::LocalInvocationId) {
@@ -1812,19 +2821,43 @@ private:
             } else if (vector == IR::Opcode::WorkgroupId) {
                 result.coef[3 + element] = 1;
             } else {
+                Fail(Classify(*vector_inst));
                 return std::nullopt;
             }
             return result;
         }
         case IR::Opcode::IAdd32: {
+            if (guards != nullptr) {
+                // FRITCHII_EXTENT_GUARD: word + (-v) is word - v (a native IADD with a negated
+                // operand)
+                for (size_t side = 0; side < 2; ++side) {
+                    const IR::Value operand{inst.Arg(side).Resolve()};
+                    if (!operand.IsImmediate() &&
+                        operand.InstRecursive()->GetOpcode() == IR::Opcode::INeg32) {
+                        return Difference(inst, inst.Arg(1 - side),
+                                          operand.InstRecursive()->Arg(0), depth);
+                    }
+                }
+            }
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
             return lhs && rhs ? Sum(*lhs, *rhs) : std::nullopt;
         }
         case IR::Opcode::ISub32: {
+            if (guards != nullptr && !inst.Arg(1).Resolve().IsImmediate()) {
+                // FRITCHII_EXTENT_GUARD: a constant bound of the subtrahend (a bit count, a
+                // masked value) is not its value; x - v is bounded through the floor instead
+                return Difference(inst, inst.Arg(0), inst.Arg(1), depth);
+            }
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
-            if (!lhs || !rhs || !rhs->IsConstant()) {
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            // A constant IdBound is an upper bound, not the value: x - (v & 0xff) is at most x, not
+            // x - 0xff. Only an immediate subtrahend is its own value (helper DT, 2026-11-19).
+            if (!rhs->IsConstant() || !inst.Arg(1).Resolve().IsImmediate()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             return Sum(*lhs, IdBound{.c = -rhs->c});
@@ -1841,10 +2874,12 @@ private:
             if (lhs->IsConstant() && lhs->c >= 0) {
                 return Scale(*rhs, static_cast<u64>(lhs->c));
             }
+            Fail(ExtentUnknown::VariableProduct, &inst);
             return std::nullopt;
         }
         case IR::Opcode::ShiftLeftLogical32: {
             if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             const auto lhs{arg(0)};
@@ -1852,6 +2887,7 @@ private:
         }
         case IR::Opcode::ShiftRightLogical32: {
             if (!inst.Arg(1).IsImmediate()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             const auto lhs{arg(0)};
@@ -1867,6 +2903,14 @@ private:
             for (const auto* side : {&rhs, &lhs}) {
                 if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
                     return *side;
+                }
+            }
+            if (terms_mode) {
+                // A side without constant buffer words first
+                for (const auto* side : {&lhs, &rhs}) {
+                    if (usable(*side) && !(*side)->HasTerms()) {
+                        return *side;
+                    }
                 }
             }
             for (const auto* side : {&lhs, &rhs}) {
@@ -1890,6 +2934,13 @@ private:
         case IR::Opcode::UMin32: {
             const auto lhs{arg(0)};
             const auto rhs{arg(1)};
+            if (terms_mode) {
+                for (const auto* side : {&rhs, &lhs}) {
+                    if (*side && (*side)->base == 0 && (*side)->c >= 0 && !(*side)->HasTerms()) {
+                        return *side;
+                    }
+                }
+            }
             for (const auto* side : {&rhs, &lhs}) {
                 if (*side && (*side)->base == 0 && (*side)->c >= 0) {
                     return *side;
@@ -1903,6 +2954,7 @@ private:
             // (base & ~mask) | ((insert << offset) & mask) <= base + (insert << offset)
             if (!inst.Arg(2).IsImmediate() || !inst.Arg(3).IsImmediate() ||
                 inst.Arg(2).U32() >= 32) {
+                Fail(ExtentUnknown::OtherOp, &inst);
                 return std::nullopt;
             }
             const auto base_value{arg(0)};
@@ -1920,8 +2972,17 @@ private:
             return lhs && rhs ? Max(*lhs, *rhs) : std::nullopt;
         }
         case IR::Opcode::Phi: {
+            // FRITCHII_EXTENT_GUARD: the incoming edges an invocation running the store never
+            // takes are left out
+            const IR::Block* const phi_block{
+                guards != nullptr && !facts_off && path_facts != nullptr ? guards->BlockOf(inst)
+                                                                         : nullptr};
             std::optional<IdBound> result;
             for (size_t index = 0; index < inst.NumArgs(); ++index) {
+                if (phi_block != nullptr &&
+                    guards->Excluded(inst.PhiBlock(index), phi_block, *path_facts)) {
+                    continue;
+                }
                 const auto incoming{arg(index)};
                 if (!incoming) {
                     return std::nullopt;
@@ -1933,17 +2994,700 @@ private:
             }
             return result;
         }
+        case IR::Opcode::LoadSharedU32: {
+            if (shared == nullptr) {
+                return std::nullopt; // loaded from memory
+            }
+            // The newest of its invocation's stores to the word: at most the largest of them
+            const SharedSlots::Forward forward{shared->Resolve(inst)};
+            if (forward.why.kind != ExtentUnknown::Known) {
+                Fail(forward.why);
+                return std::nullopt;
+            }
+            std::optional<IdBound> result;
+            for (const IR::Inst* const store : forward.stores) {
+                const auto stored{Evaluate(store->Arg(1), depth + 1)};
+                if (!stored) {
+                    return std::nullopt;
+                }
+                result = result ? Max(*result, *stored) : stored;
+                if (!result) {
+                    return std::nullopt;
+                }
+            }
+            forwarded = true;
+            return result;
+        }
+        case IR::Opcode::ShuffleIndex:
+        case IR::Opcode::ShuffleUp:
+        case IR::Opcode::ShuffleDown:
+        case IR::Opcode::ShuffleButterfly: {
+            if (guards == nullptr) {
+                return std::nullopt;
+            }
+            // FRITCHII_EXTENT_GUARD: another lane's value. Its bound at the largest local ids
+            // covers every lane of the workgroup; the path facts are this invocation's only.
+            const bool was_off{facts_off};
+            facts_off = true;
+            const auto value{arg(0)};
+            facts_off = was_off;
+            if (!value || value->base != 0) {
+                return std::nullopt;
+            }
+            IdBound result{*value};
+            for (size_t i = 0; i < 3; ++i) {
+                if (result.coef[i] == 0) {
+                    continue;
+                }
+                if (workgroup[i] == 0) {
+                    return std::nullopt;
+                }
+                result.c += static_cast<s64>(result.coef[i] * (workgroup[i] - 1));
+                result.coef[i] = 0;
+            }
+            return Checked(result);
+        }
+        case IR::Opcode::BitCount32:
+            if (guards == nullptr) {
+                return std::nullopt;
+            }
+            // FRITCHII_EXTENT_GUARD: the set bits of a 32-bit value
+            return Constant(32);
         default:
             return std::nullopt;
         }
     }
 
+    /// FRITCHII_EXTENT_GUARD: word - v is at most word while word >= v. v's largest value is
+    /// checked against an immediate here, and against a constant buffer word at bind time (a
+    /// floor of the extent).
+    std::optional<IdBound> Difference(const IR::Inst& inst, const IR::Value& word,
+                                      const IR::Value& subtracted, u32 depth) {
+        const std::optional<IdBound> amount{Evaluate(subtracted, depth + 1)};
+        if (!amount) {
+            return std::nullopt;
+        }
+        const std::optional<u64> largest{StaticMax(*amount)};
+        if (!largest || *largest > 0xffffffff) {
+            Fail(ExtentUnknown::VariableProduct, &inst);
+            return std::nullopt;
+        }
+        const IR::Value resolved{word.Resolve()};
+        if (resolved.IsImmediate()) {
+            if (resolved.Type() != IR::Type::U32 || *largest > resolved.U32()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
+                return std::nullopt;
+            }
+            return Constant(static_cast<s64>(resolved.U32()));
+        }
+        const std::optional<StorageBufferAddr> address{CbufWord(resolved.InstRecursive())};
+        if (!address || *address == buffer) {
+            Fail(ExtentUnknown::VariableProduct, &inst);
+            return std::nullopt;
+        }
+        const u32 min{static_cast<u32>(*largest)};
+        const auto existing{std::ranges::find_if(floors, [&](const StorageExtentFloor& floor) {
+            return floor.cbuf_index == address->index && floor.cbuf_offset == address->offset;
+        })};
+        if (existing != floors.end()) {
+            existing->min = (std::max)(existing->min, min);
+        } else {
+            // More than MaxExtentFloors fails the store (StoreExtentOf)
+            floors.push_back(StorageExtentFloor{
+                .cbuf_index = address->index, .cbuf_offset = address->offset, .min = min});
+        }
+        IdBound term{.num_terms = 1};
+        term.terms[0] = IdBound::Term{.index = address->index, .offset = address->offset, .coef = 1};
+        return term;
+    }
+
+    /// FRITCHII_EXTENT_GUARD: `small <= big - (strict ? 1 : 0)` as unsigned (or signed) values
+    struct Relation {
+        IR::Value small;
+        IR::Value big;
+        bool strict{};
+        bool is_signed{};
+    };
+
+    /// The relations a compare with a known value states
+    static void Relations(const GuardFacts::Atom& atom,
+                         boost::container::small_vector<Relation, 2>& out) {
+        const IR::Inst& compare{*atom.inst};
+        if (compare.NumArgs() != 2 || compare.Arg(0).Type() != IR::Type::U32 ||
+            compare.Arg(1).Type() != IR::Type::U32) {
+            return;
+        }
+        const IR::Value a{compare.Arg(0)};
+        const IR::Value b{compare.Arg(1)};
+        const bool holds{atom.value};
+        const auto add = [&](const IR::Value& small, const IR::Value& big, bool strict,
+                             bool is_signed) {
+            out.push_back(Relation{.small = small, .big = big, .strict = strict,
+                                   .is_signed = is_signed});
+        };
+        switch (compare.GetOpcode()) {
+        case IR::Opcode::ULessThan:
+        case IR::Opcode::SLessThan: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SLessThan};
+            holds ? add(a, b, true, is_signed) : add(b, a, false, is_signed);
+            return;
+        }
+        case IR::Opcode::ULessThanEqual:
+        case IR::Opcode::SLessThanEqual: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SLessThanEqual};
+            holds ? add(a, b, false, is_signed) : add(b, a, true, is_signed);
+            return;
+        }
+        case IR::Opcode::UGreaterThan:
+        case IR::Opcode::SGreaterThan: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SGreaterThan};
+            holds ? add(b, a, true, is_signed) : add(a, b, false, is_signed);
+            return;
+        }
+        case IR::Opcode::UGreaterThanEqual:
+        case IR::Opcode::SGreaterThanEqual: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SGreaterThanEqual};
+            holds ? add(b, a, false, is_signed) : add(a, b, true, is_signed);
+            return;
+        }
+        case IR::Opcode::IEqual:
+        case IR::Opcode::INotEqual:
+            if (holds == (compare.GetOpcode() == IR::Opcode::IEqual)) {
+                add(a, b, false, false);
+                add(b, a, false, false);
+            }
+            return;
+        default:
+            return;
+        }
+    }
+
+    /// FRITCHII_EXTENT_GUARD: a bound of `inst` from the store's path facts, or why none holds
+    std::optional<IdBound> PathBound(const IR::Inst& inst, u32 depth, ExtentUnknownWhy& refusal) {
+        if (path_facts == nullptr) {
+            return std::nullopt;
+        }
+        const ExtentUnknownWhy saved{failure};
+        const auto refuse = [&](ExtentUnknown kind, const IR::Inst& at) {
+            if (refusal.kind == ExtentUnknown::Unrecorded) {
+                refusal = ExtentUnknownWhy{.kind = kind,
+                                           .opcode = static_cast<u16>(at.GetOpcode())};
+            }
+        };
+        std::optional<IdBound> best;
+        boost::container::small_vector<Relation, 2> relations;
+        for (const GuardFacts::Atom& atom : *path_facts) {
+            relations.clear();
+            Relations(atom, relations);
+            for (const Relation& relation : relations) {
+                const IR::Value small{relation.small.Resolve()};
+                if (small.IsImmediate()) {
+                    continue;
+                }
+                // The compared value is inst, or inst - d (slack d): a wrap below zero makes it
+                // huge and fails the compare, so inst <= limit + d. inst + c (c > 0) or plus a
+                // variable may wrap past 2^32 and pass: no bound.
+                const IR::Inst* const compared{small.InstRecursive()};
+                s64 slack{};
+                if (compared != &inst) {
+                    const IR::Opcode opcode{compared->GetOpcode()};
+                    if (opcode != IR::Opcode::IAdd32 && opcode != IR::Opcode::ISub32) {
+                        continue;
+                    }
+                    const size_t sides{opcode == IR::Opcode::ISub32 ? 1U : 2U};
+                    size_t side{sides};
+                    for (size_t i = 0; i < sides; ++i) {
+                        const IR::Value operand{compared->Arg(i).Resolve()};
+                        if (!operand.IsImmediate() && operand.InstRecursive() == &inst) {
+                            side = i;
+                            break;
+                        }
+                    }
+                    if (side == sides) {
+                        continue;
+                    }
+                    const IR::Value other{compared->Arg(1 - side).Resolve()};
+                    if (!other.IsImmediate() || other.Type() != IR::Type::U32) {
+                        refuse(ExtentUnknown::GuardWraps, *compared);
+                        continue;
+                    }
+                    const u32 immediate{other.U32()};
+                    if (opcode == IR::Opcode::ISub32) {
+                        slack = static_cast<s64>(immediate);
+                    } else if (static_cast<s32>(immediate) <= 0) {
+                        slack = -static_cast<s64>(static_cast<s32>(immediate));
+                    } else {
+                        refuse(ExtentUnknown::GuardWraps, *compared);
+                        continue;
+                    }
+                }
+                if (relation.is_signed) {
+                    // A negative value passes a signed `x < K`
+                    refuse(ExtentUnknown::GuardSigned, *atom.inst);
+                    continue;
+                }
+                if (guards->InLoop(inst)) {
+                    // Another iteration's value may not be the one compared
+                    refuse(ExtentUnknown::GuardInLoop, inst);
+                    continue;
+                }
+                std::optional<IdBound> limit;
+                const IR::Value big{relation.big.Resolve()};
+                if (big.IsImmediate()) {
+                    if (big.Type() == IR::Type::U32) {
+                        limit = Constant(static_cast<s64>(big.U32()));
+                    }
+                } else {
+                    limit = Evaluate(big, depth + 1);
+                }
+                failure = saved;
+                if (!limit || limit->base != 0) {
+                    refuse(ExtentUnknown::GuardLimitUnknown,
+                           big.IsImmediate() ? *atom.inst : *big.InstRecursive());
+                    continue;
+                }
+                IdBound bound{*limit};
+                bound.c += slack - (relation.strict ? 1 : 0);
+                if (bound.IsConstant() && bound.c < 0) {
+                    // `x < 0`: the store never runs
+                    bound.c = 0;
+                }
+                const std::optional<IdBound> checked{Checked(bound)};
+                if (checked && (!best || (best->HasTerms() && !checked->HasTerms()))) {
+                    best = checked;
+                }
+            }
+        }
+        failure = saved;
+        if (!best && refusal.kind == ExtentUnknown::Unrecorded && guards->Compared(inst)) {
+            refuse(ExtentUnknown::GuardNotDominating, inst);
+        }
+        return best;
+    }
+
     StorageBufferAddr buffer;
     std::array<u32, 3> workgroup;
-    std::unordered_map<const IR::Inst*, std::optional<IdBound>> memo;
+    bool terms_mode{};
+    SharedSlots* shared{};
+    bool forwarded{};
+    std::unordered_map<const IR::Inst*, Memo> memo;
     std::unordered_set<const IR::Inst*> active;
     std::optional<IdBound> guard;
     bool guard_failed{};
+    /// The current access' first exit, and the first failed access' (FRITCHII_EXTENT_CENSUS)
+    ExtentUnknownWhy failure{};
+    ExtentUnknownWhy why{};
+    /// FRITCHII_EXTENT_GUARD: the program's path facts, the current store's, whether they are
+    /// set aside (a shuffle's operand: another lane's value), the results evaluated without them
+    /// (kept across stores) and the words the bounds need at least a value in
+    GuardFacts* guards{};
+    const std::vector<GuardFacts::Atom>* path_facts{};
+    bool facts_off{};
+    std::unordered_map<const IR::Inst*, Memo> memo_no_facts;
+    std::vector<StorageExtentFloor> floors;
+};
+
+/// FRITCHII_STORE_FOOTPRINT: what is known of a 32-bit value as an exact congruence,
+///
+///   value = base * pointer word + c + k * m   for some integer k
+///
+/// with m == 0 meaning exactly base * pointer + c. Unlike IdBound (an upper bound), every step
+/// keeps the value's exact residue: an unknown value (loaded from memory, a constant buffer word,
+/// a loop counter) is (0, 1), and times a constant stride K it becomes (0, K), so a record index
+/// loaded from memory still says which bytes of a K-byte record a store can hit. Moduli that are
+/// not powers of two hold while products don't wrap 32 bits (StorageStoreFootprint says which).
+/// c is a residue in [0, m), or for m == 0 the value as a signed 32-bit number (an immediate
+/// 0xfffffff0 is -16, as a subtraction meant it).
+struct ExactCongruence {
+    s64 c{};
+    u64 m{1};
+    u32 base{};
+    /// Every unknown multiple came from invocation or workgroup ids (DL's exact index bound)
+    bool ids_only{true};
+};
+
+class StoreFootprintAnalysis {
+public:
+    /// With `shared` (FRITCHII_EXTENT_SHARED's SharedSlots) a 32-bit load from a private shared
+    /// memory slot is congruent like the values its invocation stored there
+    explicit StoreFootprintAnalysis(StorageBufferAddr buffer_, SharedSlots* shared_ = nullptr)
+        : buffer{buffer_}, shared{shared_} {}
+
+    /// One store or atomic to the buffer
+    void AddStore(IR::Inst& inst) {
+        if (why != StoreFootprintWhy::Recorded) {
+            return;
+        }
+        const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
+        if (!addr) {
+            why = StoreFootprintWhy::AddressNotTracked;
+            return;
+        }
+        const ExactCongruence value{Evaluate(addr->value, 0)};
+        if (value.base != 1) {
+            why = StoreFootprintWhy::NoPointerTerm;
+            return;
+        }
+        // The immediate offset is added to the low word in 32 bits like the rest
+        const ExactCongruence offset{
+            Sum(ExactCongruence{.c = value.c, .m = value.m, .ids_only = value.ids_only},
+                Constant(static_cast<u32>(addr->imm_offset)))};
+        // An exact offset's c is signed (below the pointer when negative)
+        stores.push_back(StoreCongruence{
+            .c = offset.c,
+            .m = offset.m,
+            .size = AccessSize(inst.GetOpcode()),
+        });
+        ids_only &= value.ids_only;
+    }
+
+    [[nodiscard]] StorageStoreFootprint Result() const {
+        if (why != StoreFootprintWhy::Recorded) {
+            StorageStoreFootprint none{};
+            none.why = why;
+            return none;
+        }
+        return MakeStoreFootprint(stores.data(), stores.size(), ids_only);
+    }
+
+private:
+    static constexpr u64 Exact = u64{1} << 32;
+    static constexpr u32 MAX_DEPTH = 256;
+
+    static u64 Gcd(u64 a, u64 b) {
+        return std::gcd(a, b);
+    }
+
+    /// The signed 32-bit number with value's low 32 bits
+    static s64 Signed32(s64 value) {
+        return static_cast<s64>(static_cast<s32>(static_cast<u32>(static_cast<u64>(value))));
+    }
+
+    /// value mod m in [0, m) (m != 0, at most 2^32)
+    static u64 Residue(s64 value, u64 m) {
+        const s64 r{value % static_cast<s64>(m)};
+        return static_cast<u64>(r < 0 ? r + static_cast<s64>(m) : r);
+    }
+
+    /// m capped to a divisor of itself no larger than 2^32 (2^32 itself: exact), c reduced
+    static ExactCongruence Normalize(ExactCongruence value) {
+        if (value.m > Exact) {
+            const u32 shift{static_cast<u32>((std::min)(std::countr_zero(value.m), 32))};
+            value.m = u64{1} << shift;
+        }
+        if (value.m == Exact) {
+            value.m = 0;
+        }
+        value.c = value.m == 0 ? Signed32(value.c) : static_cast<s64>(Residue(value.c, value.m));
+        return value;
+    }
+
+    static ExactCongruence Any(bool ids_only) {
+        return ExactCongruence{.c = 0, .m = 1, .base = 0, .ids_only = ids_only};
+    }
+
+    static ExactCongruence Constant(u32 value) {
+        return ExactCongruence{.c = static_cast<s64>(static_cast<s32>(value)), .m = 0};
+    }
+
+    /// |c| (a representative's size, for a product's modulus)
+    static u64 Magnitude(s64 c) {
+        return c < 0 ? static_cast<u64>(-c) : static_cast<u64>(c);
+    }
+
+    /// A product's modulus, or a power-of-two divisor of it when it doesn't fit 64 bits
+    static u64 Product(u64 a, u64 b) {
+        if (a == 0 || b == 0) {
+            return 0;
+        }
+        if (a > ~u64{0} / b) {
+            return u64{1} << (std::min)(std::countr_zero(a) + std::countr_zero(b), 32);
+        }
+        return a * b;
+    }
+
+    static ExactCongruence Sum(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base + b.base > 1) {
+            return Any(false);
+        }
+        return Normalize(ExactCongruence{.c = a.c + b.c,
+                                         .m = Gcd(a.m, b.m),
+                                         .base = a.base + b.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    static ExactCongruence Difference(const ExactCongruence& a, const ExactCongruence& b) {
+        if (b.base > a.base) {
+            return Any(false);
+        }
+        // |c| is below 2^32 on both sides: no overflow
+        return Normalize(ExactCongruence{.c = a.c - b.c,
+                                         .m = Gcd(a.m, b.m),
+                                         .base = a.base - b.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    static ExactCongruence Product(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base != 0 || b.base != 0) {
+            return Any(false);
+        }
+        // (a.c + i a.m)(b.c + j b.m) = a.c b.c + i a.m b.c + j b.m a.c + i j a.m b.m
+        const u64 m{Gcd(Gcd(Product(a.m, Magnitude(b.c)), Product(b.m, Magnitude(a.c))),
+                        Product(a.m, b.m))};
+        const bool ids_only{a.ids_only && b.ids_only};
+        if (m == 0) {
+            // Both exact: the 32-bit product
+            const u32 product{static_cast<u32>(static_cast<u64>(a.c)) *
+                              static_cast<u32>(static_cast<u64>(b.c))};
+            return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = 0,
+                                             .ids_only = ids_only});
+        }
+        const u64 capped{Normalize(ExactCongruence{.m = m}).m};
+        if (capped == 0) {
+            const u32 product{static_cast<u32>(static_cast<u64>(a.c)) *
+                              static_cast<u32>(static_cast<u64>(b.c))};
+            return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = 0,
+                                             .ids_only = ids_only});
+        }
+        // Residues below 2^32: the product fits 64 bits
+        const u64 product{(Residue(a.c, capped) * Residue(b.c, capped)) % capped};
+        return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = capped,
+                                         .ids_only = ids_only});
+    }
+
+    /// Either value (a select, a phi, a min or max)
+    static ExactCongruence Join(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base != b.base) {
+            return Any(false);
+        }
+        const u64 diff{Magnitude(a.c - b.c)};
+        return Normalize(ExactCongruence{.c = a.c,
+                                         .m = Gcd(Gcd(a.m, b.m), diff),
+                                         .base = a.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    /// The low bits a value's congruence fixes (32: all)
+    static u32 KnownBits(const ExactCongruence& value) {
+        return value.m == 0 ? 32U
+                            : static_cast<u32>((std::min)(std::countr_zero(value.m), 32));
+    }
+
+    /// A value from its bits: bit(i) gives {known, value}; the known prefix becomes the modulus
+    template <typename BitOf>
+    static ExactCongruence FromBits(BitOf&& bit_of, bool ids_only) {
+        u64 bits{};
+        u32 known{};
+        for (; known < 32; ++known) {
+            const auto [is_known, value] = bit_of(known);
+            if (!is_known) {
+                break;
+            }
+            bits |= u64{value ? 1U : 0U} << known;
+        }
+        return Normalize(ExactCongruence{.c = static_cast<s64>(bits),
+                                         .m = known >= 32 ? 0 : (u64{1} << known),
+                                         .ids_only = ids_only});
+    }
+
+    /// Bit `bit` of the value, when its congruence fixes it (an exact value's two's complement
+    /// bits, a residue's low bits below the modulus' power of two)
+    static std::pair<bool, bool> BitOf(const ExactCongruence& value, u32 bit) {
+        if (bit >= KnownBits(value)) {
+            return {false, false};
+        }
+        return {true, ((static_cast<u64>(value.c) >> bit) & 1) != 0};
+    }
+
+    ExactCongruence Evaluate(const IR::Value& value, u32 depth) {
+        if (value.IsImmediate()) {
+            if (value.Type() != IR::Type::U32) {
+                return Any(false);
+            }
+            return Constant(value.U32());
+        }
+        if (depth > MAX_DEPTH) {
+            return Any(false);
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (const auto it{memo.find(inst)}; it != memo.end()) {
+            return it->second;
+        }
+        if (!active.insert(inst).second) {
+            // A cycle (a loop-carried value): anything. Values computed from it while it is open
+            // are bounded through this "anything", so they stay exact congruences.
+            return Any(false);
+        }
+        const ExactCongruence result{EvaluateInst(*inst, depth)};
+        active.erase(inst);
+        memo.emplace(inst, result);
+        return result;
+    }
+
+    ExactCongruence EvaluateInst(const IR::Inst& inst, u32 depth) {
+        if (const std::optional<StorageBufferAddr> word{CbufWord(&inst)}) {
+            if (*word == buffer) {
+                return ExactCongruence{.c = 0, .m = 0, .base = 1};
+            }
+            return Any(false);
+        }
+        const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
+        const auto imm{[&](size_t index) -> std::optional<u32> {
+            if (!inst.Arg(index).IsImmediate()) {
+                return std::nullopt;
+            }
+            return inst.Arg(index).U32();
+        }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::CompositeExtractU32x3: {
+            if (inst.Arg(0).IsImmediate()) {
+                return Any(false);
+            }
+            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
+            return Any(vector == IR::Opcode::LocalInvocationId ||
+                       vector == IR::Opcode::WorkgroupId);
+        }
+        case IR::Opcode::IAdd32:
+            return Sum(arg(0), arg(1));
+        case IR::Opcode::ISub32:
+            return Difference(arg(0), arg(1));
+        case IR::Opcode::INeg32:
+            return Difference(Constant(0), arg(0));
+        case IR::Opcode::IMul32:
+            return Product(arg(0), arg(1));
+        case IR::Opcode::ShiftLeftLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            if (!shift) {
+                return Any(false);
+            }
+            if (*shift >= 32) {
+                return Constant(0);
+            }
+            return Product(arg(0), Constant(u32{1} << *shift));
+        }
+        case IR::Opcode::ShiftRightLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            const ExactCongruence source{arg(0)};
+            if (!shift || source.base != 0) {
+                return Any(false);
+            }
+            const u32 s{*shift};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    return bit + s < 32 ? BitOf(source, bit + s) : std::pair{true, false};
+                },
+                source.ids_only);
+        }
+        case IR::Opcode::BitwiseAnd32:
+        case IR::Opcode::BitwiseOr32:
+        case IR::Opcode::BitwiseXor32: {
+            const ExactCongruence lhs{arg(0)};
+            const ExactCongruence rhs{arg(1)};
+            if (lhs.base != 0 || rhs.base != 0) {
+                return Any(false);
+            }
+            const IR::Opcode opcode{inst.GetOpcode()};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    const auto [lk, lv] = BitOf(lhs, bit);
+                    const auto [rk, rv] = BitOf(rhs, bit);
+                    if (opcode == IR::Opcode::BitwiseAnd32) {
+                        if ((lk && !lv) || (rk && !rv)) {
+                            return {true, false};
+                        }
+                        return {lk && rk, lv && rv};
+                    }
+                    if (opcode == IR::Opcode::BitwiseOr32) {
+                        if ((lk && lv) || (rk && rv)) {
+                            return {true, true};
+                        }
+                        return {lk && rk, false};
+                    }
+                    return {lk && rk, lv != rv};
+                },
+                lhs.ids_only && rhs.ids_only);
+        }
+        case IR::Opcode::BitFieldUExtract: {
+            const std::optional<u32> offset{imm(1)};
+            const std::optional<u32> count{imm(2)};
+            const ExactCongruence source{arg(0)};
+            if (!offset || !count || *offset >= 32 || *count == 0 || *count > 32 ||
+                source.base != 0) {
+                return Any(false);
+            }
+            const u32 off{*offset};
+            const u32 bits{*count};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    if (bit >= bits || off + bit >= 32) {
+                        return {true, false};
+                    }
+                    return BitOf(source, off + bit);
+                },
+                source.ids_only);
+        }
+        case IR::Opcode::BitFieldInsert: {
+            const std::optional<u32> offset{imm(2)};
+            const std::optional<u32> count{imm(3)};
+            const ExactCongruence base_value{arg(0)};
+            const ExactCongruence insert{arg(1)};
+            if (!offset || !count || *offset >= 32 || base_value.base != 0 || insert.base != 0) {
+                return Any(false);
+            }
+            const u32 off{*offset};
+            const u32 bits{*count};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    if (bit >= off && bit - off < bits) {
+                        return BitOf(insert, bit - off);
+                    }
+                    return BitOf(base_value, bit);
+                },
+                base_value.ids_only && insert.ids_only);
+        }
+        case IR::Opcode::SelectU32:
+            return Join(arg(1), arg(2));
+        case IR::Opcode::UMin32:
+        case IR::Opcode::UMax32:
+        case IR::Opcode::SMin32:
+        case IR::Opcode::SMax32:
+            return Join(arg(0), arg(1));
+        case IR::Opcode::Phi: {
+            std::optional<ExactCongruence> result;
+            for (size_t index = 0; index < inst.NumArgs(); ++index) {
+                const ExactCongruence incoming{arg(index)};
+                result = result ? Join(*result, incoming) : incoming;
+            }
+            return result ? *result : Any(false);
+        }
+        case IR::Opcode::LoadSharedU32: {
+            if (shared == nullptr) {
+                return Any(false);
+            }
+            // The newest of its invocation's stores to the word: congruent like each of them
+            const SharedSlots::Forward forward{shared->Resolve(inst)};
+            if (forward.why.kind != ExtentUnknown::Known) {
+                return Any(false);
+            }
+            std::optional<ExactCongruence> result;
+            for (const IR::Inst* const store : forward.stores) {
+                const ExactCongruence stored{Evaluate(store->Arg(1), depth + 1)};
+                result = result ? Join(*result, stored) : stored;
+            }
+            return result ? *result : Any(false);
+        }
+        default:
+            return Any(false);
+        }
+    }
+
+    StorageBufferAddr buffer;
+    SharedSlots* shared{};
+    std::unordered_map<const IR::Inst*, ExactCongruence> memo;
+    std::unordered_set<const IR::Inst*> active;
+    std::vector<StoreCongruence> stores;
+    bool ids_only{true};
+    StoreFootprintWhy why{StoreFootprintWhy::Recorded};
 };
 
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
@@ -2135,7 +3879,36 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     program.info.native_global_bounds |= info.native_runtime_bounds;
     // Store extents, before the accesses are rebased (the analysis reads the guest addresses)
     std::map<StorageBufferAddr, StorageWriteExtent> extents;
+    // FRITCHII_EXTENT_CENSUS: why an extent stayed unknown; FRITCHII_EXTENT_CBUF: the extents
+    // with constant buffer words, for the buffers whose extent stayed unknown
+    std::map<StorageBufferAddr, ExtentUnknownWhy> unknown_whys;
+    std::map<StorageBufferAddr, StorageCbufExtent> cbuf_extents;
+    // FRITCHII_STORE_FOOTPRINT: the residues each written buffer's stores can land on
+    std::map<StorageBufferAddr, StorageStoreFootprint> footprints;
+    // FRITCHII_EXTENT_SHARED: why following offsets through shared memory slots failed (Known:
+    // the cbuf extent is proven that way)
+    std::map<StorageBufferAddr, ExtentUnknownWhy> shared_whys;
+    // FRITCHII_EXTENT_GUARD: why the path facts did not bound a buffer's stores (Known: the cbuf
+    // extent is proven that way)
+    std::map<StorageBufferAddr, ExtentUnknownWhy> guard_whys;
     if (!info.untracked_writes) {
+        // FRITCHII_EXTENT_SHARED / FRITCHII_STORE_FOOTPRINT: the private shared memory slots,
+        // proven on the first load the analyses follow
+        SharedSlots shared_slots{program};
+        std::map<StorageBufferAddr, StoreFootprintAnalysis> footprint_analyses;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            footprint_analyses
+                .try_emplace(storage_inst.storage_buffer, storage_inst.storage_buffer,
+                             &shared_slots)
+                .first->second.AddStore(*storage_inst.inst);
+        }
+        for (const auto& [storage_buffer, analysis] : footprint_analyses) {
+            footprints.emplace(storage_buffer, analysis.Result());
+        }
         std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
             if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
@@ -2153,6 +3926,120 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});
             }
             analysis->second.AddAccess(*storage_inst.inst, extents[storage_inst.storage_buffer]);
+        }
+        for (const auto& [storage_buffer, analysis] : analyses) {
+            unknown_whys.emplace(storage_buffer, analysis.Why());
+        }
+        // FRITCHII_EXTENT_CBUF: the buffers left unknown, again with constant buffer words as
+        // terms (its own analyses: the plain extents above stay exactly what they were)
+        std::map<StorageBufferAddr, StoreExtentAnalysis> term_analyses;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            const auto plain{extents.find(storage_inst.storage_buffer)};
+            if (plain == extents.end() || plain->second.bounded) {
+                continue;
+            }
+            auto analysis{term_analyses.find(storage_inst.storage_buffer)};
+            if (analysis == term_analyses.end()) {
+                analysis = term_analyses
+                               .emplace(storage_inst.storage_buffer,
+                                        StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                            program.workgroup_size, true})
+                               .first;
+                cbuf_extents.emplace(storage_inst.storage_buffer,
+                                     StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+            }
+            analysis->second.AddAccess(*storage_inst.inst,
+                                       cbuf_extents[storage_inst.storage_buffer]);
+        }
+        // FRITCHII_EXTENT_SHARED: the buffers still unknown, again following 32-bit loads from
+        // private shared memory slots to the values stored there (its own analyses: the plain
+        // and cbuf extents above stay exactly what they were; one proven only this way is marked
+        // via_shared, which the switch gates)
+        if (shared_slots.AnyLoad()) {
+            std::map<StorageBufferAddr, StoreExtentAnalysis> shared_analyses;
+            std::map<StorageBufferAddr, StorageCbufExtent> shared_extents;
+            for (const StorageInst& storage_inst : info.to_replace) {
+                if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                    info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                    continue;
+                }
+                const auto cbuf{cbuf_extents.find(storage_inst.storage_buffer)};
+                if (cbuf == cbuf_extents.end() || cbuf->second.ids.bounded) {
+                    continue;
+                }
+                auto analysis{shared_analyses.find(storage_inst.storage_buffer)};
+                if (analysis == shared_analyses.end()) {
+                    analysis = shared_analyses
+                                   .emplace(storage_inst.storage_buffer,
+                                            StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                                program.workgroup_size, true,
+                                                                &shared_slots})
+                                   .first;
+                    shared_extents.emplace(
+                        storage_inst.storage_buffer,
+                        StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+                }
+                analysis->second.AddAccess(*storage_inst.inst,
+                                           shared_extents[storage_inst.storage_buffer]);
+            }
+            for (const auto& [storage_buffer, analysis] : shared_analyses) {
+                StorageCbufExtent& extent{shared_extents[storage_buffer]};
+                if (extent.ids.bounded && analysis.Forwarded()) {
+                    extent.via_shared = true;
+                    cbuf_extents[storage_buffer] = extent;
+                    shared_whys.emplace(storage_buffer,
+                                        ExtentUnknownWhy{.kind = ExtentUnknown::Known});
+                } else if (!extent.ids.bounded) {
+                    shared_whys.emplace(storage_buffer, analysis.Why());
+                }
+            }
+        }
+        // FRITCHII_EXTENT_GUARD: the buffers still unknown, again with the branch conditions on
+        // each store's path, subgroup broadcasts, bit counts and clamps (GuardFacts; its own
+        // analyses: the plain, cbuf and shared extents above stay exactly what they were; one
+        // proven this way is marked via_guard, which the switch gates)
+        std::optional<GuardFacts> guard_facts;
+        std::map<StorageBufferAddr, StoreExtentAnalysis> guard_analyses;
+        std::map<StorageBufferAddr, StorageCbufExtent> guard_extents;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            const auto cbuf{cbuf_extents.find(storage_inst.storage_buffer)};
+            if (cbuf == cbuf_extents.end() || cbuf->second.ids.bounded) {
+                continue;
+            }
+            if (!guard_facts) {
+                guard_facts.emplace(program);
+            }
+            auto analysis{guard_analyses.find(storage_inst.storage_buffer)};
+            if (analysis == guard_analyses.end()) {
+                analysis = guard_analyses
+                               .emplace(storage_inst.storage_buffer,
+                                        StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                            program.workgroup_size, true, nullptr,
+                                                            &*guard_facts})
+                               .first;
+                guard_extents.emplace(storage_inst.storage_buffer,
+                                      StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+            }
+            analysis->second.AddAccess(*storage_inst.inst,
+                                       guard_extents[storage_inst.storage_buffer]);
+        }
+        for (const auto& [storage_buffer, analysis] : guard_analyses) {
+            StorageCbufExtent& extent{guard_extents[storage_buffer]};
+            if (extent.ids.bounded) {
+                extent.via_guard = true;
+                cbuf_extents[storage_buffer] = extent;
+                guard_whys.emplace(storage_buffer, ExtentUnknownWhy{.kind = ExtentUnknown::Known});
+            } else {
+                guard_whys.emplace(storage_buffer, analysis.Why());
+            }
         }
     }
     // Read extents of the loads and atomics. An access left global is routed by address at run
@@ -2188,9 +4075,52 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         program.info.storage_read_extents.push_back(
             read_extent != read_extents.end() ? read_extent->second : StorageWriteExtent{});
     }
+    std::vector<StorageWriteExtra> extras;
+    bool any_unknown{};
+    bool any_written{};
     for (const StorageBufferAddr& storage_buffer : info.set) {
         const bool is_written{info.writes.contains(storage_buffer)};
         const auto extent{extents.find(storage_buffer)};
+        ExtentUnknownWhy write_unknown{};
+        StorageCbufExtent cbuf_extent{};
+        StorageStoreFootprint footprint{};
+        ExtentUnknownWhy shared_why{};
+        ExtentUnknownWhy guard_why{};
+        if (is_written) {
+            if (const auto why{shared_whys.find(storage_buffer)}; why != shared_whys.end()) {
+                shared_why = why->second;
+            }
+            if (const auto why{guard_whys.find(storage_buffer)}; why != guard_whys.end()) {
+                guard_why = why->second;
+            }
+            any_written = true;
+            if (info.untracked_writes) {
+                footprint.why = StoreFootprintWhy::UntrackedWrites;
+            } else if (info.unbounded_writes.contains(storage_buffer)) {
+                footprint.why = StoreFootprintWhy::RuntimeRouted;
+            } else if (const auto found{footprints.find(storage_buffer)};
+                       found != footprints.end()) {
+                footprint = found->second;
+            } else {
+                footprint.why = StoreFootprintWhy::NoStores;
+            }
+            if (info.untracked_writes) {
+                write_unknown.kind = ExtentUnknown::UntrackedWrites;
+            } else if (info.unbounded_writes.contains(storage_buffer)) {
+                write_unknown.kind = ExtentUnknown::RuntimeRouted;
+            } else if (extent != extents.end() && extent->second.bounded) {
+                write_unknown.kind = ExtentUnknown::Known;
+            } else if (const auto why{unknown_whys.find(storage_buffer)};
+                       why != unknown_whys.end()) {
+                write_unknown = why->second;
+            } else {
+                // Written, but no store of it was rebased on it: they stay global
+                write_unknown.kind = ExtentUnknown::UntrackedWrites;
+            }
+            if (const auto cbuf{cbuf_extents.find(storage_buffer)}; cbuf != cbuf_extents.end()) {
+                cbuf_extent = cbuf->second;
+            }
+        }
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = storage_buffer.index,
             .cbuf_offset = storage_buffer.offset,
@@ -2200,6 +4130,19 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .write_extent = is_written && extent != extents.end() ? extent->second
                                                                   : StorageWriteExtent{},
         });
+        extras.push_back({.write_unknown = write_unknown,
+                          .cbuf_extent = cbuf_extent,
+                          .footprint = footprint,
+                          .shared_why = shared_why,
+                          .guard_why = guard_why});
+        any_unknown |= is_written && write_unknown.kind != ExtentUnknown::Known;
+    }
+    if (any_unknown || any_written) {
+        // Kept only for programs with something to report (Info::storage_write_extras; every
+        // written buffer has a FRITCHII_STORE_FOOTPRINT entry)
+        auto& out{program.info.storage_write_extras};
+        out.resize(program.info.storage_buffers_descriptors.size() - extras.size());
+        out.insert(out.end(), extras.begin(), extras.end());
     }
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
@@ -2224,7 +4167,7 @@ size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
     return limit;
 }
 
-void JoinStorageInfo(Info& base, Info& source, size_t limit) {
+std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     // An access left global in either half is routed by address into any buffer of the joined
     // program: then no read extent is known.
@@ -2235,11 +4178,24 @@ void JoinStorageInfo(Info& base, Info& source, size_t limit) {
         source.storage_read_extents.size() == source.storage_buffers_descriptors.size()};
     base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
+    std::vector<u32> bindings;
     auto& read_extents = base.storage_read_extents;
+    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the extras follow the descriptors while
+    // joining (dropped again when neither half had any)
+    const bool any_extras{!base.storage_write_extras.empty() ||
+                          !source.storage_write_extras.empty()};
+    auto& extras = base.storage_write_extras;
+    if (extras.size() != descriptors.size()) {
+        extras.assign(descriptors.size(), StorageWriteExtra{});
+    }
+    const bool source_extras{source.storage_write_extras.size() ==
+                             source.storage_buffers_descriptors.size()};
     for (size_t index = 0; index < source.storage_buffers_descriptors.size(); ++index) {
         auto& desc{source.storage_buffers_descriptors[index]};
         const StorageWriteExtent source_read{reads_known ? source.storage_read_extents[index]
                                                          : StorageWriteExtent{}};
+        const StorageWriteExtra source_extra{source_extras ? source.storage_write_extras[index]
+                                                           : StorageWriteExtra{}};
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {
             return desc.cbuf_index == existing.cbuf_index &&
                    desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count &&
@@ -2251,26 +4207,126 @@ void JoinStorageInfo(Info& base, Info& source, size_t limit) {
                 MergeStorageWriteExtent(read_extents[existing], source_read);
             }
             if (desc.is_written) {
+                StorageWriteExtra& extra{
+                    extras[static_cast<size_t>(std::distance(descriptors.begin(), it))]};
                 if (it->is_written) {
+                    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the half that left it
+                    // unknown names why; the cbuf extents widen like the plain ones (a half's
+                    // proven plain extent is a cbuf extent without terms)
+                    const auto as_cbuf{[](const StorageBufferDescriptor& d,
+                                          const StorageWriteExtra& e) {
+                        return d.write_extent.bounded ? StorageCbufExtent{.ids = d.write_extent}
+                                                      : e.cbuf_extent;
+                    }};
+                    StorageCbufExtent merged_cbuf{as_cbuf(*it, extra)};
+                    MergeStorageCbufExtent(merged_cbuf, as_cbuf(desc, source_extra));
+                    const bool was_bounded{it->write_extent.bounded};
                     MergeStorageWriteExtent(it->write_extent, desc.write_extent);
+                    if (it->write_extent.bounded) {
+                        extra.cbuf_extent = StorageCbufExtent{};
+                    } else {
+                        if (was_bounded) {
+                            extra.write_unknown = source_extra.write_unknown;
+                        }
+                        extra.cbuf_extent = merged_cbuf;
+                    }
+                    // FRITCHII_STORE_FOOTPRINT: not merged (graphics halves only)
+                    extra.footprint = StorageStoreFootprint{};
+                    extra.footprint.why = StoreFootprintWhy::Joined;
                 } else {
                     it->write_extent = desc.write_extent;
+                    extra = source_extra;
                 }
             }
             it->is_written |= desc.is_written;
+            bindings.push_back(static_cast<u32>(it - descriptors.begin()));
             continue;
         }
         if (descriptors.size() >= limit) {
             throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
                                           descriptors.size() + 1, limit);
         }
+        bindings.push_back(static_cast<u32>(descriptors.size()));
         descriptors.push_back(desc);
+        extras.push_back(source_extra);
         if (reads_known) {
             read_extents.push_back(source_read);
         }
     }
     if (!reads_known) {
         read_extents.assign(descriptors.size(), StorageWriteExtent{});
+    }
+    if (!any_extras) {
+        extras.clear();
+    }
+    return bindings;
+}
+
+void RemapStorageBindings(IR::Program& program, std::span<const u32> bindings) {
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            // Each takes the binding as its first argument (see GlobalToStorage and Replace).
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadStorageU8:
+            case IR::Opcode::LoadStorageS8:
+            case IR::Opcode::LoadStorageU16:
+            case IR::Opcode::LoadStorageS16:
+            case IR::Opcode::LoadStorage32:
+            case IR::Opcode::LoadStorage64:
+            case IR::Opcode::LoadStorage128:
+            case IR::Opcode::WriteStorageU8:
+            case IR::Opcode::WriteStorageS8:
+            case IR::Opcode::WriteStorageU16:
+            case IR::Opcode::WriteStorageS16:
+            case IR::Opcode::WriteStorage32:
+            case IR::Opcode::WriteStorage64:
+            case IR::Opcode::WriteStorage128:
+            case IR::Opcode::StorageAtomicIAdd32:
+            case IR::Opcode::StorageAtomicSMin32:
+            case IR::Opcode::StorageAtomicUMin32:
+            case IR::Opcode::StorageAtomicSMax32:
+            case IR::Opcode::StorageAtomicUMax32:
+            case IR::Opcode::StorageAtomicInc32:
+            case IR::Opcode::StorageAtomicDec32:
+            case IR::Opcode::StorageAtomicAnd32:
+            case IR::Opcode::StorageAtomicOr32:
+            case IR::Opcode::StorageAtomicXor32:
+            case IR::Opcode::StorageAtomicExchange32:
+            case IR::Opcode::StorageAtomicCompareExchange32:
+            case IR::Opcode::StorageAtomicIAdd64:
+            case IR::Opcode::StorageAtomicSMin64:
+            case IR::Opcode::StorageAtomicUMin64:
+            case IR::Opcode::StorageAtomicSMax64:
+            case IR::Opcode::StorageAtomicUMax64:
+            case IR::Opcode::StorageAtomicAnd64:
+            case IR::Opcode::StorageAtomicOr64:
+            case IR::Opcode::StorageAtomicXor64:
+            case IR::Opcode::StorageAtomicExchange64:
+            case IR::Opcode::StorageAtomicIAdd32x2:
+            case IR::Opcode::StorageAtomicSMin32x2:
+            case IR::Opcode::StorageAtomicUMin32x2:
+            case IR::Opcode::StorageAtomicSMax32x2:
+            case IR::Opcode::StorageAtomicUMax32x2:
+            case IR::Opcode::StorageAtomicAnd32x2:
+            case IR::Opcode::StorageAtomicOr32x2:
+            case IR::Opcode::StorageAtomicXor32x2:
+            case IR::Opcode::StorageAtomicExchange32x2:
+            case IR::Opcode::StorageAtomicAddF32:
+            case IR::Opcode::StorageAtomicAddF16x2:
+            case IR::Opcode::StorageAtomicAddF32x2:
+            case IR::Opcode::StorageAtomicMinF16x2:
+            case IR::Opcode::StorageAtomicMinF32x2:
+            case IR::Opcode::StorageAtomicMaxF16x2:
+            case IR::Opcode::StorageAtomicMaxF32x2:
+                break;
+            default:
+                continue;
+            }
+            const IR::Value binding{inst.Arg(0)};
+            if (binding.IsImmediate() && binding.U32() < bindings.size()) {
+                inst.SetArg(0, IR::Value{bindings[binding.U32()]});
+            }
+        }
     }
 }
 

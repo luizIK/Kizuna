@@ -3,7 +3,7 @@
 This is a narrowly scoped workaround for the repeated tree/tile trails reported in
 Fortune's Weave, not a proven repair of software DLSS emulation.
 
-The upstream substitute upscaler was only reached after a matrix-shader rejection.
+The original substitute upscaler was only reached after a matrix-shader rejection.
 Restoring HMMA support removed that rejection and made the game run its native DLSS
 network. The preserved trailing-session logs never took the substitute path. That
 establishes a routing difference, not which network instruction or input is wrong.

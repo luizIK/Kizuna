@@ -14,7 +14,15 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/kizuna_branding.h"
+#include "common/lowend_sim.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
+#ifdef __linux__
+#include "common/linux/crash_handler.h"
+#endif
 #include "common/scm_rev.h"
+#include "common/build_stamp.h"
 #include "common/cpu_features.h"
 #include "core/memory.h"
 
@@ -221,7 +229,7 @@ std::string BuildVersionString() {
         std::string_view{Common::g_build_name} == "Fritchii"
             ? fmt::format("{} {} | {}-{}", Common::DisplayBuildName(),
                           Common::DisplayBuildVersion(), branch_name, description)
-            : fmt::format("Lichii Development Build | {}-{}", branch_name, description);
+            : fmt::format("Fritchii Development Build | {}-{}", branch_name, description);
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
     return override_build.empty() ? yuzu_build : override_build;
@@ -241,6 +249,11 @@ void Init(QWidget* root) {
 
     Common::Log::Initialize();
     Common::Log::Start();
+#ifdef _WIN32
+    Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#elif defined(__linux__)
+    Common::Linux::InstallCrashHandler();
+#endif
 
     Network::Init();
 
@@ -249,7 +262,13 @@ void Init(QWidget* root) {
     const auto processor_count = std::thread::hardware_concurrency();
 
     // info logging
-    LOG_INFO(Frontend, "Lichii Version: {}", BuildVersionString());
+    LOG_INFO(Frontend, "Fritchii Version: {}", BuildVersionString());
+    if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
+        LOG_INFO(Frontend, "Build hash: {}", stamp);
+    }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        LOG_INFO(Frontend, "Build tag: {}", tag);
+    }
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;
@@ -271,6 +290,7 @@ void Init(QWidget* root) {
     }
 #endif
     LOG_INFO(Frontend, "Host CPU Threads: {}", processor_count);
+    Common::LowEndSim::LogProcessLimits();
     LOG_INFO(Frontend, "Host OS: {}", PrettyProductName().toStdString());
     LOG_INFO(Frontend, "Host RAM: {:.2f} GiB",
              Common::GetMemInfo().TotalPhysicalMemory / f64{1_GiB});

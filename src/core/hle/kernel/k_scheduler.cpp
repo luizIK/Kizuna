@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 
 #include "common/assert.h"
+#include "common/lowend_sim.h"
 #include "common/bit_util.h"
 #include "common/fiber.h"
 #include "common/logging.h"
@@ -21,11 +24,216 @@
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/physical_core.h"
+#include "video_core/nx2_debug_control.h"
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace Kernel {
 
+namespace {
+
+// EXP98 (live; Fable fable52_answer_yield): an exact early return for guest yields, per core.
+// g_yield_gen[c] moves whenever the scheduling of a thread whose affinity mask (or active core)
+// holds core c changes. A yield that found nothing to do stamps its core and that core's
+// counter; while the counter is unchanged, the same yield would find nothing again.
+struct alignas(64) YieldGen {
+    std::atomic<u64> value{1};
+};
+std::array<YieldGen, Core::Hardware::NUM_CPU_CORES> g_yield_gen;
+
+// Set under the scheduler lock by the first yield that runs with EXP98 != 0, before it can stamp
+// anything, and never cleared. Until then nothing reads the counters, so they are not raised.
+std::atomic<bool> g_yield_gens_live{false};
+
+// Scheduler lock held: the only writers. Plain stores, their visibility rides on the lock word.
+void BumpYieldGens(u64 mask) {
+    while (mask != 0) {
+        const auto core = static_cast<size_t>(std::countr_zero(mask));
+        mask &= mask - 1;
+        if (core < g_yield_gen.size()) {
+            auto& gen = g_yield_gen[core].value;
+            gen.store(gen.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void NoteYieldGens(u64 mask) {
+    if (g_yield_gens_live.load(std::memory_order_relaxed)) [[unlikely]] {
+        BumpYieldGens(mask);
+    }
+}
+
+// The scheduling of `thread` changed: raise the counters of the cores it can sit on.
+void NoteScheduleChange(const KThread* thread) {
+    if (!g_yield_gens_live.load(std::memory_order_relaxed)) [[likely]] {
+        return;
+    }
+    if (thread->IsDummyThread()) {
+        return; // never in the queues
+    }
+    u64 mask = thread->GetAffinityMask().GetAffinityMask();
+    if (const s32 core = thread->GetActiveCore(); core >= 0) {
+        mask |= u64{1} << core;
+    }
+    BumpYieldGens(mask);
+}
+
+u64 YieldGenOf(s32 core) {
+    return g_yield_gen[static_cast<size_t>(core)].value.load(std::memory_order_relaxed);
+}
+
+// Scheduler lock held: the thread's stamp still describes the queues (the verify prediction).
+bool YieldStampMatches(const KThread& cur, u8 kind) {
+    const s32 core = cur.GetYieldCore();
+    return core >= 0 && cur.GetYieldKind() >= kind && YieldGenOf(core) == cur.GetYieldGen();
+}
+
+void CpuPause() {
+    Common::LowEndSim::CpuPauseNote();
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+// EXP98 counters, one padded block per core (written by that core's host thread), summed every
+// 5 s into the "Guest yields (EXP98" line.
+struct alignas(64) YieldStats {
+    std::atomic<u64> forms[3]{};       // svcSleepThread 0, -1, -2
+    std::atomic<u64> early{};          // early returns
+    std::atomic<u64> held_waited{};    // early check found the lock held, waited it out
+    std::atomic<u64> held_fell_back{}; // ... still held after 64 pauses, took the lock
+    std::atomic<u64> stamped{};        // locked, found nothing to do
+    std::atomic<u64> recheck{};
+    std::atomic<u64> rotated{};
+    std::atomic<u64> migrated{};
+    std::atomic<u64> not_runnable{};
+    std::atomic<u64> predicted{};      // mode 2
+    std::atomic<u64> mismatches{};     // mode 2
+};
+std::array<YieldStats, Core::Hardware::NUM_CPU_CORES> g_yield_stats;
+std::atomic<s64> g_yield_next_report{};
+std::atomic<u64> g_yield_mismatch_total{};
+std::atomic<u32> g_yield_mismatch_logged{};
+
+void Add(std::atomic<u64>& counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+YieldStats& YieldStatsOf(s32 core) {
+    return g_yield_stats[static_cast<size_t>(core) % g_yield_stats.size()];
+}
+
+void MaybeReportYields(int mode) {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 next = g_yield_next_report.load(std::memory_order_relaxed);
+    if (next == 0) {
+        g_yield_next_report.compare_exchange_strong(next, now + 5'000'000'000);
+        return;
+    }
+    if (now < next || !g_yield_next_report.compare_exchange_strong(next, now + 5'000'000'000)) {
+        return;
+    }
+    u64 forms[3]{}, early{}, waited{}, fell_back{}, stamped{}, recheck{}, rotated{}, migrated{},
+        not_runnable{}, predicted{}, mismatches{};
+    for (auto& s : g_yield_stats) {
+        for (size_t i = 0; i < 3; ++i) {
+            forms[i] += s.forms[i].exchange(0, std::memory_order_relaxed);
+        }
+        early += s.early.exchange(0, std::memory_order_relaxed);
+        waited += s.held_waited.exchange(0, std::memory_order_relaxed);
+        fell_back += s.held_fell_back.exchange(0, std::memory_order_relaxed);
+        stamped += s.stamped.exchange(0, std::memory_order_relaxed);
+        recheck += s.recheck.exchange(0, std::memory_order_relaxed);
+        rotated += s.rotated.exchange(0, std::memory_order_relaxed);
+        migrated += s.migrated.exchange(0, std::memory_order_relaxed);
+        not_runnable += s.not_runnable.exchange(0, std::memory_order_relaxed);
+        predicted += s.predicted.exchange(0, std::memory_order_relaxed);
+        mismatches += s.mismatches.exchange(0, std::memory_order_relaxed);
+    }
+    const u64 mismatch_total =
+        g_yield_mismatch_total.fetch_add(mismatches, std::memory_order_relaxed) + mismatches;
+    if (mode == 2) {
+        LOG_INFO(Kernel,
+                 "Guest yields (EXP98=2, 5 s, per second): forms 0 {:.0f}, -1 {:.0f}, -2 {:.0f}; "
+                 "early returns {:.0f}; lock held at the check: waited out {:.0f}, fell back "
+                 "{:.0f}; locked: stamped {:.0f}, recheck {:.0f}, rotated {:.0f}, migrated "
+                 "{:.0f}, not runnable {:.0f}; predicted {:.0f}, mismatches {} in 5 s ({} total, "
+                 "must be 0)",
+                 forms[0] / 5.0, forms[1] / 5.0, forms[2] / 5.0, early / 5.0, waited / 5.0,
+                 fell_back / 5.0, stamped / 5.0, recheck / 5.0, rotated / 5.0, migrated / 5.0,
+                 not_runnable / 5.0, predicted / 5.0, mismatches, mismatch_total);
+    } else {
+        LOG_INFO(Kernel,
+                 "Guest yields (EXP98={}, 5 s, per second): forms 0 {:.0f}, -1 {:.0f}, -2 {:.0f}; "
+                 "early returns {:.0f}; lock held at the check: waited out {:.0f}, fell back "
+                 "{:.0f}; locked: stamped {:.0f}, recheck {:.0f}, rotated {:.0f}, migrated "
+                 "{:.0f}, not runnable {:.0f}",
+                 mode, forms[0] / 5.0, forms[1] / 5.0, forms[2] / 5.0, early / 5.0, waited / 5.0,
+                 fell_back / 5.0, stamped / 5.0, recheck / 5.0, rotated / 5.0, migrated / 5.0,
+                 not_runnable / 5.0);
+    }
+}
+
+// Counts a yield of form `form` (0, 1 = -1, 2 = -2); checks the report clock every 256th.
+void CountYieldForm(YieldStats& stats, size_t form, int mode) {
+    const u64 n = stats.forms[form].fetch_add(1, std::memory_order_relaxed);
+    if ((n & 255) == 255) [[unlikely]] {
+        MaybeReportYields(mode);
+    }
+}
+
+// Mode 2: the stamp said "nothing to do" but the locked path did something. `what` is rotated,
+// migrated, recheck or core (the thread's core differs from its stamp).
+void NoteYieldMismatch(YieldStats& stats, const KThread& cur, s32 core, const char* what,
+                       const KThread* other) {
+    Add(stats.mismatches);
+    if (g_yield_mismatch_logged.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    LOG_WARNING(Kernel,
+                "EXP98 mismatch: thread {} core {} (stamp core {}) priority {}: {}; other thread "
+                "{} priority {} mask {:#x}",
+                cur.GetThreadId(), core, cur.GetYieldCore(), cur.GetPriority(), what,
+                other != nullptr ? other->GetThreadId() : u64{0},
+                other != nullptr ? other->GetPriority() : -1,
+                other != nullptr ? other->GetAffinityMask().GetAffinityMask() : u64{0});
+}
+
+// Mode 1: true when the locked path would find nothing to do. The lock word is read first: if it
+// is free, every completed critical section is visible; one that starts later began after this
+// yield entered the kernel. If it is held, wait for it to be free without taking it.
+bool YieldIsKnownNoOp(KernelCore& kernel, const KThread& cur, u8 kind, YieldStats& stats) {
+    const s32 core = cur.GetYieldCore();
+    if (core < 0 || cur.GetYieldKind() < kind) {
+        return false;
+    }
+    const auto& lock = kernel.GlobalSchedulerContext().SchedulerLock();
+    if (lock.IsFree()) [[likely]] {
+        return YieldGenOf(core) == cur.GetYieldGen();
+    }
+    for (int spin = 0; spin < 64; ++spin) {
+        CpuPause();
+        if (lock.IsFree()) {
+            Add(stats.held_waited);
+            return YieldGenOf(core) == cur.GetYieldGen();
+        }
+    }
+    Add(stats.held_fell_back);
+    return false; // busy for long: take the lock as today
+}
+
+} // Anonymous namespace
+
 static void IncrementScheduledCount(Kernel::KThread* thread) {
+    NoteScheduleChange(thread); // EXP98: every process, and threads without one
     if (auto process = thread->GetOwnerProcess(); process) {
         process->IncrementScheduledCount();
     }
@@ -271,6 +479,7 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
                     // The suggested thread isn't bound to its core, so we can migrate it!
                     suggested->SetActiveCore(core_id);
                     priority_queue.ChangeCore(suggested_core, suggested);
+                    NoteScheduleChange(suggested); // EXP98
                     top_threads[core_id] = suggested;
                     cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
                     break;
@@ -300,6 +509,7 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
                         // Perform the migration.
                         suggested->SetActiveCore(core_id);
                         priority_queue.ChangeCore(candidate_core, suggested);
+                        NoteScheduleChange(suggested); // EXP98
                         top_threads[core_id] = suggested;
                         cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
                         break;
@@ -355,6 +565,9 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
         cur_process->AddCpuTime(tick_diff);
     }
     m_last_context_switch_time = cur_tick;
+    if (Nx2ThreadStats::g_enabled) {
+        Nx2ThreadStats::OnSwitch(cur_thread, next_thread, cur_tick, tick_diff);
+    }
 
     // Update our previous thread.
     if (cur_process != nullptr) {
@@ -450,7 +663,7 @@ void KScheduler::ScheduleImplFiber(KernelCore& kernel) {
             // The next thread is nullptr!
 
             // Switch to the idle thread. Note: HOS treats idling as a special case for
-            // performance. This is not *required* for yuzu's purposes, and for singlecore
+            // performance. This is not *required* for the emulator's purposes, and for singlecore
             // compatibility, we can just move the logic that would go here into the execution
             // of the idle thread. If we ever remove singlecore, we should implement this
             // accurately to HOS.
@@ -539,6 +752,13 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
     ASSERT(IsSchedulerLockedByCurrentThread(kernel));
     // Check if the state has changed, because if it hasn't there's nothing to do.
     if (const ThreadState cur_state = thread->GetRawState(); cur_state != old_state) {
+        if (Nx2ThreadStats::g_enabled) {
+            Nx2ThreadStats::OnStateChanged(
+                thread, kernel.System().CoreTiming().GetClockTicks(),
+                (old_state & ThreadState::Mask) == ThreadState::Waiting,
+                cur_state == ThreadState::Runnable,
+                (cur_state & ThreadState::Mask) == ThreadState::Waiting);
+        }
         // Update the priority queues.
         if (old_state == ThreadState::Runnable) {
             // If we were previously runnable, then we're not runnable now, and we should remove.
@@ -582,6 +802,9 @@ void KScheduler::OnThreadAffinityMaskChanged(KernelCore& kernel, KThread* thread
     if (thread->GetRawState() == ThreadState::Runnable) {
         GetPriorityQueue(kernel).ChangeAffinityMask(old_core, old_affinity, thread);
         IncrementScheduledCount(thread);
+        // EXP98: the cores the thread left too (IncrementScheduledCount raised the new ones).
+        NoteYieldGens(old_affinity.GetAffinityMask() |
+                      (old_core >= 0 ? u64{1} << old_core : u64{0}));
         SetSchedulerUpdateNeeded(kernel);
     }
 }
@@ -685,6 +908,12 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
 }
 
 void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
+    // EXP98 1 or 2: the per core early return (below); 0 = the code as it was.
+    if (const int exp98 = VideoCore::Nx2Debug::Experiment(98); exp98 != 0) [[unlikely]] {
+        YieldWithoutCoreMigrationExp98(kernel, exp98);
+        return;
+    }
+
     // Validate preconditions.
     ASSERT(CanSchedule(kernel));
     ASSERT(GetCurrentProcessPointer(kernel) != nullptr);
@@ -724,6 +953,12 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
 }
 
 void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
+    // EXP98 1 or 2: the per core early return (below); 0 = the code as it was.
+    if (const int exp98 = VideoCore::Nx2Debug::Experiment(98); exp98 != 0) [[unlikely]] {
+        YieldWithCoreMigrationExp98(kernel, exp98);
+        return;
+    }
+
     // Validate preconditions.
     ASSERT(CanSchedule(kernel));
     ASSERT(GetCurrentProcessPointer(kernel) != nullptr);
@@ -812,6 +1047,11 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
 }
 
 void KScheduler::YieldToAnyThread(KernelCore& kernel) {
+    // EXP98 leaves this form as it is (OoT does not use it); it only counts it.
+    if (const int exp98 = VideoCore::Nx2Debug::Experiment(98); exp98 != 0) [[unlikely]] {
+        CountYieldForm(YieldStatsOf(GetCurrentCoreId(kernel)), 2, exp98);
+    }
+
     // Validate preconditions.
     ASSERT(CanSchedule(kernel));
     ASSERT(GetCurrentProcessPointer(kernel) != nullptr);
@@ -883,6 +1123,212 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
                 // Otherwise, we have an update to perform.
                 SetSchedulerUpdateNeeded(kernel);
             }
+        }
+    }
+}
+
+// EXP98 (Fable fable52_answer_yield). 1: return early when the thread's stamp says the locked
+// path would find nothing to do (YieldIsKnownNoOp). 2 (verify): never return early; under the
+// lock, compare the stamp's prediction with what the locked path does and count mismatches.
+// Both: a yield that does nothing raises no counter (the old per-process count included), and it
+// stamps the thread instead. The per-process early return is not used in these modes.
+void KScheduler::YieldWithoutCoreMigrationExp98(KernelCore& kernel, int mode) {
+    // Validate preconditions.
+    ASSERT(CanSchedule(kernel));
+    ASSERT(GetCurrentProcessPointer(kernel) != nullptr);
+
+    // Get the current thread and process.
+    KThread& cur_thread = GetCurrentThread(kernel);
+    KProcess& cur_process = GetCurrentProcess(kernel);
+    YieldStats& stats = YieldStatsOf(GetCurrentCoreId(kernel));
+    CountYieldForm(stats, 0, mode);
+
+    if (mode == 1 && YieldIsKnownNoOp(kernel, cur_thread, 1, stats)) {
+        Add(stats.early);
+        // EXP102 (live, pauses; fable52_answer_yield 7): keep the old cadence of a yield
+        // that took the lock, so the worker does not reach its idle wait sooner.
+        for (int pause = VideoCore::Nx2Debug::Experiment(102); pause > 0; --pause) {
+            CpuPause();
+        }
+        return;
+    }
+
+    // Get a reference to the priority queue.
+    auto& priority_queue = GetPriorityQueue(kernel);
+
+    // Perform the yield.
+    {
+        KScopedSchedulerLock sl{kernel};
+
+        // From here on, every scheduling change raises the per core counters.
+        if (!g_yield_gens_live.load(std::memory_order_relaxed)) [[unlikely]] {
+            g_yield_gens_live.store(true, std::memory_order_relaxed);
+        }
+
+        // Mode 2: the prediction, exact under the lock.
+        const bool predicted = mode == 2 && YieldStampMatches(cur_thread, 1);
+        if (predicted) {
+            Add(stats.predicted);
+        }
+
+        const auto cur_state = cur_thread.GetRawState();
+        if (cur_state == ThreadState::Runnable) {
+            const s32 core_id = cur_thread.GetActiveCore();
+
+            // Put the current thread at the back of the queue.
+            KThread* next_thread = priority_queue.MoveToScheduledBack(std::addressof(cur_thread));
+
+            if (next_thread != std::addressof(cur_thread)) {
+                // The next thread is different: we have an update to perform.
+                IncrementScheduledCount(std::addressof(cur_thread));
+                SetSchedulerUpdateNeeded(kernel);
+                Add(stats.rotated);
+                if (predicted) {
+                    NoteYieldMismatch(stats, cur_thread, core_id, "rotated", next_thread);
+                }
+            } else {
+                // Nothing to do: no counter moves; stamp the thread.
+                if (predicted && core_id != cur_thread.GetYieldCore()) {
+                    NoteYieldMismatch(stats, cur_thread, core_id, "core", nullptr);
+                }
+                cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                if (core_id >= 0 && core_id < static_cast<s32>(g_yield_gen.size())) {
+                    cur_thread.SetYieldCache(core_id, YieldGenOf(core_id), 1);
+                }
+                Add(stats.stamped);
+            }
+        } else {
+            Add(stats.not_runnable);
+        }
+    }
+}
+
+void KScheduler::YieldWithCoreMigrationExp98(KernelCore& kernel, int mode) {
+    // Validate preconditions.
+    ASSERT(CanSchedule(kernel));
+    ASSERT(GetCurrentProcessPointer(kernel) != nullptr);
+
+    // Get the current thread and process.
+    KThread& cur_thread = GetCurrentThread(kernel);
+    KProcess& cur_process = GetCurrentProcess(kernel);
+    YieldStats& stats = YieldStatsOf(GetCurrentCoreId(kernel));
+    CountYieldForm(stats, 1, mode);
+
+    if (mode == 1 && YieldIsKnownNoOp(kernel, cur_thread, 2, stats)) {
+        Add(stats.early);
+        // EXP102 (live, pauses; fable52_answer_yield 7): keep the old cadence of a yield
+        // that took the lock, so the worker does not reach its idle wait sooner.
+        for (int pause = VideoCore::Nx2Debug::Experiment(102); pause > 0; --pause) {
+            CpuPause();
+        }
+        return;
+    }
+
+    // Get a reference to the priority queue.
+    auto& priority_queue = GetPriorityQueue(kernel);
+
+    // Perform the yield.
+    {
+        KScopedSchedulerLock sl{kernel};
+
+        // From here on, every scheduling change raises the per core counters.
+        if (!g_yield_gens_live.load(std::memory_order_relaxed)) [[unlikely]] {
+            g_yield_gens_live.store(true, std::memory_order_relaxed);
+        }
+
+        // Mode 2: the prediction, exact under the lock.
+        const bool predicted = mode == 2 && YieldStampMatches(cur_thread, 2);
+        if (predicted) {
+            Add(stats.predicted);
+        }
+
+        const auto cur_state = cur_thread.GetRawState();
+        if (cur_state == ThreadState::Runnable) {
+            // Get the current active core.
+            const s32 core_id = cur_thread.GetActiveCore();
+
+            // Put the current thread at the back of the queue.
+            KThread* next_thread = priority_queue.MoveToScheduledBack(std::addressof(cur_thread));
+
+            // While we have a suggested thread, try to migrate it! (Unchanged, apart from
+            // remembering the thread that set recheck, for the mode 2 log.)
+            bool recheck = false;
+            KThread* recheck_thread = nullptr;
+            KThread* suggested = priority_queue.GetSuggestedFront(core_id);
+            while (suggested != nullptr) {
+                // Check if the suggested thread is the thread running on its core.
+                const s32 suggested_core = suggested->GetActiveCore();
+
+                if (KThread* running_on_suggested_core =
+                        (suggested_core >= 0)
+                            ? kernel.Scheduler(suggested_core).m_state.highest_priority_thread
+                            : nullptr;
+                    running_on_suggested_core != suggested) {
+                    // If the current thread's priority is higher than our suggestion's we prefer
+                    // the next thread to the suggestion. We also prefer the next thread when the
+                    // current thread's priority is equal to the suggestions, but the next thread
+                    // has been waiting longer.
+                    if ((suggested->GetPriority() > cur_thread.GetPriority()) ||
+                        (suggested->GetPriority() == cur_thread.GetPriority() &&
+                         next_thread != std::addressof(cur_thread) &&
+                         next_thread->GetLastScheduledTick() < suggested->GetLastScheduledTick())) {
+                        suggested = nullptr;
+                        break;
+                    }
+
+                    // If we're allowed to do a migration, do one.
+                    // NOTE: Unlike migrations in UpdateHighestPriorityThread, this moves the
+                    // suggestion to the front of the queue.
+                    if (running_on_suggested_core == nullptr ||
+                        running_on_suggested_core->GetPriority() >=
+                            HighestCoreMigrationAllowedPriority) {
+                        suggested->SetActiveCore(core_id);
+                        priority_queue.ChangeCore(suggested_core, suggested, true);
+                        IncrementScheduledCount(suggested);
+                        break;
+                    } else {
+                        // We couldn't perform a migration, but we should check again on a future
+                        // yield.
+                        recheck = true;
+                        recheck_thread = suggested;
+                    }
+                }
+
+                // Get the next suggestion.
+                suggested = priority_queue.GetSuggestedNext(core_id, suggested);
+            }
+
+            const bool rotated = next_thread != std::addressof(cur_thread);
+            const bool migrated = suggested != nullptr;
+            if (rotated || migrated) {
+                // The yield did something: raise the current thread's counters as before, and
+                // perform the update.
+                IncrementScheduledCount(std::addressof(cur_thread));
+                SetSchedulerUpdateNeeded(kernel);
+                Add(migrated ? stats.migrated : stats.rotated);
+                if (predicted) {
+                    NoteYieldMismatch(stats, cur_thread, core_id, migrated ? "migrated" : "rotated",
+                                      migrated ? suggested : next_thread);
+                }
+            } else if (!recheck) {
+                // Nothing to do: no counter moves; stamp the thread.
+                if (predicted && core_id != cur_thread.GetYieldCore()) {
+                    NoteYieldMismatch(stats, cur_thread, core_id, "core", nullptr);
+                }
+                cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                if (core_id >= 0 && core_id < static_cast<s32>(g_yield_gen.size())) {
+                    cur_thread.SetYieldCache(core_id, YieldGenOf(core_id), 2);
+                }
+                Add(stats.stamped);
+            } else {
+                // Recheck: changed nothing, never stamped (as before).
+                Add(stats.recheck);
+                if (predicted) {
+                    NoteYieldMismatch(stats, cur_thread, core_id, "recheck", recheck_thread);
+                }
+            }
+        } else {
+            Add(stats.not_runnable);
         }
     }
 }

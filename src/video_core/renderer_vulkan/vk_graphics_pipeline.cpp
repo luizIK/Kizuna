@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -25,19 +24,25 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
+#include "video_core/memory_stage_link.h"
+#include "video_core/texture_handle_values.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -45,6 +50,8 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/one_follower.h"
+#include "video_core/renderer_vulkan/vk_one_follower_draw.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -201,6 +208,58 @@ struct TextureMemoControl {
         miss_images{}, recorded{}, refused{}, verified{}, mismatches{};
 };
 
+// EDEN_NX2_TEX_BANK_GEN (GraphicsPipeline::TexBankMemo): counts, logged every 10 s while the
+// switch is set, and the verify cadence (value 2: one hit in VERIFY_EVERY resolves the full way).
+// Used by the GPU back thread only.
+struct TexBankControl {
+    static constexpr u64 VERIFY_EVERY = 16;
+
+    static TexBankControl& Get() {
+        static TexBankControl control;
+        return control;
+    }
+
+    [[nodiscard]] bool ShouldVerify() {
+        return ++verify_counter % VERIFY_EVERY == 0;
+    }
+
+    void Frame() {
+        const int value = VideoCore::Nx2Debug::g_tex_bank_gen.load(std::memory_order_relaxed);
+        if (value <= 0 && lookups == 0 && ineligible == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (window_start == std::chrono::steady_clock::time_point{}) {
+            window_start = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - window_start).count();
+        if (seconds < 10.0) {
+            return;
+        }
+        const double hit_share =
+            lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
+        LOG_INFO(Render_Vulkan,
+                 "Texture bank memo (TEX_BANK_GEN={}) last {:.1f} s: {} draws looked up, {} hits "
+                 "({:.1f}%), {} draws of other pipelines | misses: no memo {}, state {}, handle "
+                 "bindings {}, pages {} | recorded {}, refused {}, backed off {} | prepare "
+                 "fallbacks {} | verified {}, mismatches {}",
+                 value, seconds, lookups, hits, hit_share, ineligible, miss_no_memo, miss_state,
+                 miss_cbufs, miss_pages, recorded, refused, backed_off, prepare_fallbacks,
+                 verified, mismatches);
+        lookups = hits = ineligible = miss_no_memo = miss_state = miss_cbufs = miss_pages = 0;
+        recorded = refused = backed_off = prepare_fallbacks = verified = mismatches = 0;
+        window_start = now;
+    }
+
+    u64 verify_counter = 0;
+    u32 mismatches_logged = 0;
+    std::chrono::steady_clock::time_point window_start{};
+    u64 lookups{}, hits{}, ineligible{}, miss_no_memo{}, miss_state{}, miss_cbufs{},
+        miss_pages{}, recorded{}, refused{}, backed_off{}, prepare_fallbacks{}, verified{},
+        mismatches{};
+};
+
 /// A Vulkan handle's bits, for logs (a pointer or a 64-bit integer, depending on the platform).
 template <typename Handle>
 u64 HandleBits(Handle handle) {
@@ -235,6 +294,22 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
         return VK_SHADER_STAGE_MESH_BIT_EXT;
     }
     return slot_stage;
+}
+
+// Votes, ballots, lane ids and shuffles span the guest's 32-thread warp. NVIDIA always runs 32
+// lanes, but Intel picks SIMD16 or SIMD32 per shader: a task shader's ballot then saw half the
+// warp and its meshlet compaction dropped or repeated meshlets (flickering and missing foliage on
+// Arc). Only stages with these ops are pinned, as in compute pipelines; quad ops need no more
+// than 4 lanes.
+bool UsesWarpWidthOps(const Shader::Info& info) {
+    return info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+           info.uses_subgroup_shuffles || info.uses_subgroup_mask;
+}
+
+const void* GuestWarpSizeChain(const Device& device, const Shader::Info& info,
+                               VkShaderStageFlagBits stage,
+                               const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT& ci) {
+    return UsesWarpWidthOps(info) && device.CanRequireGuestWarpSize(stage) ? &ci : nullptr;
 }
 
 // The stage of a pipeline stage slot (vertex, tessellation control and evaluation, geometry,
@@ -405,15 +480,15 @@ bool Passes(const std::array<bool, NUM_STAGES>& stages,
 
 using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
-template <typename Spec, typename... Specs>
+template <bool KeepLast, bool Delta, typename Spec, typename... Specs>
 ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
                           const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
         if (!Passes<Spec>(stages, stage_infos)) {
-            return FindSpec<Specs...>(stages, stage_infos);
+            return FindSpec<KeepLast, Delta, Specs...>(stages, stage_infos);
         }
     }
-    return GraphicsPipeline::MakeConfigureSpecFunc<Spec>();
+    return GraphicsPipeline::MakeConfigureSpecFunc<Spec, KeepLast, Delta>();
 }
 
 struct SimpleVertexFragmentSpec {
@@ -456,14 +531,106 @@ struct DefaultSpec {
     static constexpr bool has_images = true;
 };
 
+/// KeepLast: the delta draw record's instantiation (GraphicsPipeline::Configure's keep_last).
+/// Delta: EXP118's (GraphicsPipeline::ConfigureDelta), the same Spec as Configure's.
+template <bool KeepLast = false, bool Delta = false>
 ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
                                const std::array<Shader::Info, NUM_STAGES>& infos) {
-    return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
-                    DefaultSpec>(stages, infos);
+    return FindSpec<KeepLast, Delta, SimpleVertexSpec, SimpleVertexFragmentSpec,
+                    SimpleStorageSpec, SimpleImageSpec, DefaultSpec>(stages, infos);
+}
+
+/// The stages ConfigureFunc's Spec prepares, one bit each: the memory stage's fill runs the
+/// same per-stage calls (MemStage::FillDraw).
+template <typename Spec, typename... Specs>
+u32 FindSpecStages(const std::array<bool, NUM_STAGES>& stages,
+                   const std::array<Shader::Info, NUM_STAGES>& infos) {
+    if constexpr (sizeof...(Specs) > 0) {
+        if (!Passes<Spec>(stages, infos)) {
+            return FindSpecStages<Specs...>(stages, infos);
+        }
+    }
+    u32 mask = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        mask |= Spec::enabled_stages[stage] ? 1U << stage : 0U;
+    }
+    return mask;
+}
+
+u32 SpecStages(const std::array<bool, NUM_STAGES>& stages,
+               const std::array<Shader::Info, NUM_STAGES>& infos) {
+    return FindSpecStages<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec,
+                          SimpleImageSpec, DefaultSpec>(stages, infos);
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
+
+// Worker builds of kept SPIR-V (the precompiled fast path): how many the driver compiled again
+// instead of finding in its own cache. On an RX 7900 XT those took 0.2-1.1 s each and the draws
+// waiting for them froze the game (tester log t1858), while a cache hit takes a few ms.
+std::atomic<u64> kept_builds{};
+std::atomic<u64> kept_builds_slow{};
+std::atomic<u64> kept_builds_long{};
+std::atomic<std::chrono::nanoseconds::rep> kept_builds_slow_ns{};
+std::atomic<std::chrono::nanoseconds::rep> kept_builds_longest_ns{};
+
+// EXP87 draw templates on the drawing thread (ported), logged every 10 s
+// while EXP87 != 0.
+struct DrawTemplateStats {
+    u64 hits{};
+    u64 misses{};
+    u64 kept{};
+    u64 not_kept{}; ///< Changing sampler variants, too many textures or descriptors not keepable
+    std::array<u64, static_cast<size_t>(VideoCommon::DrawTemplateCheck::Count)> rejected{};
+    u64 prepare_deleted{};
+    u64 verified{};
+    std::array<u64, 4> mismatches{}; ///< Views, samplers, descriptors, rescaling words
+    u64 mismatched_draws{};
+    u64 total_mismatched_draws{};
+    u64 calls{}; ///< ReportDrawTemplates calls: the clock is read once every 1,024
+    int mode{};  ///< The EXP87 value the counts are for: a toggle starts them over
+    std::chrono::steady_clock::time_point next_report{};
+} draw_template_stats;
+
+void ReportDrawTemplates(int mode) {
+    DrawTemplateStats& stats = draw_template_stats;
+    if (stats.mode != mode) {
+        // EXP87 changed: the counts start over, and the first window after it is not logged.
+        stats = {.total_mismatched_draws = stats.total_mismatched_draws, .mode = mode};
+    }
+    if ((++stats.calls & 1023) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < stats.next_report) {
+        return;
+    }
+    if (stats.next_report != std::chrono::steady_clock::time_point{}) {
+        using Check = VideoCommon::DrawTemplateCheck;
+        const auto rejected = [&](Check check) {
+            return stats.rejected[static_cast<size_t>(check)];
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Draw templates in 10 s (EXP87={}): {} hits, {} misses, {} kept, {} not keepable; "
+                 "rejected: {} host memory, {} scale, {} view deleted, {} descriptor bytes, {} "
+                 "prepare deleted images",
+                 mode, stats.hits, stats.misses, stats.kept, stats.not_kept,
+                 rejected(Check::HostMemory), rejected(Check::Scale), rejected(Check::ViewDeleted),
+                 rejected(Check::Descriptors), stats.prepare_deleted);
+        if (mode == 2) {
+            LOG_INFO(Render_Vulkan,
+                     "Draw template verify in 10 s: {} checked, {} mismatched: {} views, {} "
+                     "samplers, {} descriptors, {} rescaling words ({} mismatched in total)",
+                     stats.verified, stats.mismatched_draws, stats.mismatches[0],
+                     stats.mismatches[1], stats.mismatches[2], stats.mismatches[3],
+                     stats.total_mismatched_draws);
+        }
+    }
+    stats = {.total_mismatched_draws = stats.total_mismatched_draws,
+             .mode = mode,
+             .next_report = now + std::chrono::seconds{10}};
+}
 } // Anonymous namespace
 
 void NoteDrawReuseProbeFrame();
@@ -474,6 +641,7 @@ void NoteDrawReuseProbeFrame() {
     }
     // The texture binding memo's frame too (EXP32: verify window, switch changes, its log).
     TextureMemoControl::Get().Frame();
+    TexBankControl::Get().Frame();
 }
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
@@ -484,13 +652,25 @@ std::chrono::nanoseconds GraphicsPipeline::HoldTimeTotal() noexcept {
     return std::chrono::nanoseconds{hold_time_total_ns.load(std::memory_order::relaxed)};
 }
 
-// TODO(crueter): This is the worst-formatted code I have EVER seen
+GraphicsPipeline::KeptBuildStats GraphicsPipeline::TakeKeptBuildStats() noexcept {
+    return KeptBuildStats{
+        .builds = kept_builds.exchange(0, std::memory_order::relaxed),
+        .slow = kept_builds_slow.exchange(0, std::memory_order::relaxed),
+        .long_builds = kept_builds_long.exchange(0, std::memory_order::relaxed),
+        .slow_time = std::chrono::nanoseconds{
+            kept_builds_slow_ns.exchange(0, std::memory_order::relaxed)},
+        .longest = std::chrono::nanoseconds{
+            kept_builds_longest_ns.exchange(0, std::memory_order::relaxed)},
+    };
+}
+
+// TODO: This is the worst-formatted code I have EVER seen
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
     const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
-    Common::ThreadWorker* worker_thread,
+    DrawTemplates& draw_templates_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos, EmitStagesFunc emit_stages,
@@ -499,11 +679,13 @@ GraphicsPipeline::GraphicsPipeline(
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, draw_templates{draw_templates_},
+      template_owner{draw_templates_.NewOwner()}, spv_modules{std::move(stages)},
       library_cache{library_params.library_cache},
       libraries_only{library_params.library_cache && library_params.libraries_only},
       spirv_hashes{library_params.spirv_hashes},
       worker_only_build{worker_thread && static_cast<bool>(emit_stages)},
+      prepared_build{worker_only_build && library_params.prepared},
       mesh_emulation{std::move(mesh_emulation_)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
@@ -536,6 +718,23 @@ GraphicsPipeline::GraphicsPipeline(
     writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+    samples_nothing = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+        return info.texture_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
+               info.image_descriptors.empty() && info.image_buffer_descriptors.empty();
+    });
+    has_handle_table = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return std::ranges::any_of(info.texture_descriptors, [](const auto& desc) {
+            return desc.count > 1 && desc.handle_program != ~0U;
+        });
+    });
+    // EXP87 (the original texture_memo_eligible).
+    template_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+        return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
+               info.image_descriptors.empty() &&
+               std::ranges::all_of(info.texture_descriptors, [](const auto& desc) {
+                   return desc.handle_program == ~0U && !desc.has_secondary;
+               });
     });
 
     if (library_cache) {
@@ -736,6 +935,22 @@ GraphicsPipeline::GraphicsPipeline(
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
+            if (prepared_build) {
+                kept_builds.fetch_add(1, std::memory_order::relaxed);
+            }
+            if (prepared_build && elapsed > KeptBuildLong) {
+                kept_builds_long.fetch_add(1, std::memory_order::relaxed);
+            }
+            if (prepared_build && elapsed > KeptBuildSlow) {
+                const auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+                kept_builds_slow.fetch_add(1, std::memory_order::relaxed);
+                kept_builds_slow_ns.fetch_add(ns, std::memory_order::relaxed);
+                auto longest = kept_builds_longest_ns.load(std::memory_order::relaxed);
+                while (ns > longest && !kept_builds_longest_ns.compare_exchange_weak(
+                                           longest, ns, std::memory_order::relaxed)) {
+                }
+            }
             static std::atomic<u32> logged{};
             if (elapsed > std::chrono::milliseconds{100} ||
                 (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400)) {
@@ -749,12 +964,24 @@ GraphicsPipeline::GraphicsPipeline(
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         present_stages[stage] = infos[stage] != nullptr;
     }
+    // Mesh pipelines can hold the mesh program in slot 1; the pipeline cache drops pipelines
+    // with only one of the two tessellation stages.
+    has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
     configure_func = ConfigureFunc(present_stages, stage_infos);
+    configure_keep_func = ConfigureFunc<true>(present_stages, stage_infos);
+    spec_stages = SpecStages(present_stages, stage_infos);
+    has_texel_buffers = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty();
+    });
+    if (samples_nothing && !IsMeshPipeline()) {
+        configure_delta_func = ConfigureFunc<false, true>(present_stages, stage_infos);
+    }
     build.emplace(worker_thread, std::move(func));
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
     transition_keys.push_back(transition->key);
+    transition_hashes.push_back(transition->key_hash);
     transitions.push_back(transition);
 }
 
@@ -943,16 +1170,472 @@ bool GraphicsPipeline::VerifyTextureMemo(std::span<const VideoCommon::ImageViewI
     return false;
 }
 
-template <typename Spec>
+void GraphicsPipeline::KeepDrawTemplate(DrawTemplate* verified,
+                                        const VideoCommon::DrawTemplateContext& context,
+                                        std::span<const u32> handles, u64 hash,
+                                        std::span<const VideoCommon::ImageViewInOut> views,
+                                        std::span<const VideoCommon::SamplerId> samplers,
+                                        const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
+                                        const RescalingPushConstant& rescaling) {
+    DrawTemplateStats& stats = draw_template_stats;
+    const DescriptorUpdateEntry* const entries = guest_descriptor_queue.UpdateData();
+    if (verified) {
+        const auto same_image = [](const DescriptorUpdateEntry& lhs,
+                                   const DescriptorUpdateEntry& rhs) {
+            return lhs.image.sampler == rhs.image.sampler &&
+                   lhs.image.imageView == rhs.image.imageView &&
+                   lhs.image.imageLayout == rhs.image.imageLayout;
+        };
+        const auto& textures = verified->textures;
+        bool descriptors_differ = false;
+        for (size_t stage = 0; stage < NUM_STAGES && !descriptors_differ; ++stage) {
+            const auto [first, count] = verified->ranges[stage];
+            const DescriptorUpdateEntry* const resolved = entries + ranges[stage].first;
+            descriptors_differ = count != ranges[stage].second ||
+                                 !std::equal(resolved, resolved + count,
+                                             verified->descriptors.data() + first, same_image);
+        }
+        const std::array<bool, 4> differ{
+            !std::ranges::equal(
+                views, textures,
+                [](const auto& view, const auto& texture) { return view.id == texture.view; }),
+            !std::ranges::equal(samplers, textures,
+                                [](const auto& sampler, const auto& texture) {
+                                    return sampler == texture.sampler;
+                                }),
+            descriptors_differ,
+            rescaling.Data() != verified->rescaling,
+        };
+        ++stats.verified;
+        if (std::ranges::find(differ, true) != differ.end()) {
+            ++stats.mismatched_draws;
+            if (stats.total_mismatched_draws++ < 16) {
+                LOG_ERROR(Render_Vulkan,
+                          "Draw template verify: pipeline {:016x} resolved other {}{}{}{}than "
+                          "its template",
+                          key.Hash(), differ[0] ? "views " : "", differ[1] ? "samplers " : "",
+                          differ[2] ? "descriptors " : "", differ[3] ? "rescaling words " : "");
+            }
+        }
+        for (size_t field = 0; field < differ.size(); ++field) {
+            stats.mismatches[field] += differ[field] ? 1 : 0;
+        }
+    }
+    constexpr size_t max_textures = 32;
+    if (views.size() > max_textures || std::ranges::any_of(samplers, [&](auto id) {
+            return texture_cache.GetSampler(id).HasChangingVariants();
+        })) {
+        ++stats.not_kept;
+        return;
+    }
+    DrawTemplate& kept = draw_templates.Insert(context, handles, hash);
+    if (!texture_cache.KeepTemplateTextures(handles, views, samplers, kept.textures)) {
+        DrawTemplates::Erase(kept);
+        ++stats.not_kept;
+        return;
+    }
+    kept.descriptors.clear();
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const auto [first, count] = ranges[stage];
+        kept.ranges[stage] = {static_cast<u32>(kept.descriptors.size()), count};
+        kept.descriptors.insert(kept.descriptors.end(), entries + first, entries + first + count);
+    }
+    kept.rescaling = rescaling.Data();
+    kept.host_serial = gpu_memory->HostPointerSerial();
+    kept.scale_epoch = texture_cache.ScaleEpoch();
+    ++stats.kept;
+}
+
+void GraphicsPipeline::KeepLastDraw(std::span<const VideoCommon::ImageViewInOut> views,
+                                    std::span<const VideoCommon::SamplerId> samplers,
+                                    const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
+                                    const RescalingPushConstant& rescaling, bool handles_read) {
+    KeptDraw& kept = *kept_draw;
+    // ConfigureImpl<Spec, true> filled handles and computed while reading the handles: one handle
+    // word per view, unless they came from a memo.
+    if (!handles_read || kept.handles.size() != views.size()) {
+        kept.valid = false;
+        return;
+    }
+    kept.context = texture_cache.GraphicsTextureContext(template_owner);
+    kept.views.assign(views.begin(), views.end());
+    kept.samplers.assign(samplers.begin(), samplers.end());
+    kept.view_generations.resize(views.size());
+    for (size_t i = 0; i < views.size(); ++i) {
+        kept.view_generations[i] = texture_cache.ImageViewGeneration(views[i].id);
+    }
+    const DescriptorUpdateEntry* const entries = guest_descriptor_queue.UpdateData();
+    kept.descriptors.clear();
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const auto [first, count] = ranges[stage];
+        kept.ranges[stage] = {static_cast<u32>(kept.descriptors.size()), count};
+        kept.descriptors.insert(kept.descriptors.end(), entries + first, entries + first + count);
+    }
+    kept.rescaling = rescaling.Data();
+    kept.scale_epoch = texture_cache.ScaleEpoch();
+    kept.host_serial = gpu_memory->HostPointerSerial();
+    kept.valid = true;
+}
+
+bool GraphicsPipeline::ComputedHandlesChanged(const Tegra::Engines::Maxwell3D& maxwell3d_,
+                                              Tegra::MemoryManager& gpu_memory_) const {
+    for (const KeptDraw::ComputedHandle& handle : kept_draw->computed) {
+        const Shader::Info& info{stage_infos[handle.stage]};
+        const auto& cbufs{maxwell3d_.state.shader_stages[handle.stage].const_buffers};
+        // As ConfigureImpl's read_handle (or its handle table path) computed it.
+        const u32 value{VideoCommon::EvaluateTextureHandle(
+            info, handle.program, gpu_memory_,
+            [&cbufs](u32 cbuf) -> GPUVAddr {
+                return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                  : GPUVAddr{};
+            },
+            handle.alignment, handle.element)};
+        if (value != handle.value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// SEAM >= 3 (EXP123, vk_mem_stage.cpp): every raw handle this draw binds, in the order
+// ConfigureImpl's handle loop reads them, into the draw packet. Called by the early fill, or by
+// ConfigureImpl when no fill made them. `maxwell3d` and `gpu_memory` are the draw's (SetEngine).
+void GraphicsPipeline::FillHandleValues(MemStage& seam, bool null_pointer_handles,
+                                        bool in_configure) {
+    seam.FillHandleValues(false, null_pointer_handles, in_configure, [&](std::vector<u32>& values) {
+        values.reserve(num_image_elements);
+        const auto& stages{maxwell3d->state.shader_stages};
+        using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+        VideoCommon::FillGraphicsHandleValues(
+            std::span<const Shader::Info>{stage_infos}, *gpu_memory,
+            [&stages](size_t stage) {
+                return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
+            },
+            device.GetStorageBufferAlignment(), null_pointer_handles,
+            [&values](u32 raw) { values.push_back(raw); });
+    });
+}
+
+bool GraphicsPipeline::TexBankEligible() {
+    TexBankMemo& memo = tex_bank_memo;
+    if (memo.eligible < 0) [[unlikely]] {
+        // Sampled textures only (no texture or image buffers, no images): what ConfigureImpl
+        // resolves is then the textures' views and samplers, in stage order.
+        bool eligible = num_textures != 0 && num_image_elements == num_textures;
+        tex_bank_cbuf_slots.clear();
+        const auto add_slot = [&](u32 stage, u32 index) {
+            if (index >= Maxwell::MaxConstBuffers) {
+                eligible = false;
+                return;
+            }
+            const std::pair<u32, u32> slot{stage, index};
+            if (std::ranges::find(tex_bank_cbuf_slots, slot) == tex_bank_cbuf_slots.end()) {
+                tex_bank_cbuf_slots.push_back(slot);
+            }
+        };
+        for (size_t stage = 0; eligible && stage < NUM_STAGES; ++stage) {
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                // Handle programs compute the handle from storage buffers: always the full way.
+                if (desc.handle_program != ~0U) {
+                    eligible = false;
+                    break;
+                }
+                add_slot(static_cast<u32>(stage), desc.cbuf_index);
+                if (desc.has_secondary) {
+                    add_slot(static_cast<u32>(stage), desc.secondary_cbuf_index);
+                }
+            }
+        }
+        memo.eligible = eligible ? 1 : 0;
+    }
+    return memo.eligible == 1;
+}
+
+bool GraphicsPipeline::TexBankHit(const TextureCache::TextureMemoState& state,
+                                  bool via_header_index, bool null_pointer_handles,
+                                  int switch_value) {
+    auto& control = TexBankControl::Get();
+    ++control.lookups;
+    TexBankMemo& memo = tex_bank_memo;
+    // The epoch first: the page pointers of another epoch are gone.
+    if (!memo.valid || memo.switch_value != switch_value ||
+        memo.page_epoch != texture_cache.TexBankEpoch()) {
+        ++control.miss_no_memo;
+        return false;
+    }
+    if (memo.state != state || memo.via_header_index != via_header_index ||
+        memo.null_pointer_handles != null_pointer_handles) {
+        ++control.miss_state;
+        return false;
+    }
+    const auto& stages = maxwell3d->state.shader_stages;
+    for (const TexBankMemo::Cbuf& cbuf : memo.cbufs) {
+        const auto& bound = stages[cbuf.stage].const_buffers[cbuf.index];
+        if (bound.enabled != cbuf.enabled || bound.address != cbuf.address ||
+            bound.size != cbuf.size) {
+            ++control.miss_cbufs;
+            return false;
+        }
+    }
+    for (TexBankMemo::Page& page : memo.pages) {
+        if (TextureCache::TexBankPageGen(*page.page) != page.gen) {
+            ++control.miss_pages;
+            return false;
+        }
+    }
+    ++control.hits;
+    memo.hit_since_record = true;
+    return true;
+}
+
+void GraphicsPipeline::RecordTexBank(const TextureCache::TextureMemoState& state,
+                                     std::span<const VideoCommon::ImageViewInOut> views,
+                                     std::span<const u32> sampler_handles,
+                                     std::span<const VideoCommon::SamplerId> samplers,
+                                     bool via_header_index, bool null_pointer_handles,
+                                     int switch_value) {
+    auto& control = TexBankControl::Get();
+    TexBankMemo& memo = tex_bank_memo;
+    // Backoff: a memo never hit before the next record makes the next records rarer.
+    if (memo.countdown != 0) {
+        --memo.countdown;
+        memo.valid = false;
+        ++control.backed_off;
+        return;
+    }
+    if (memo.recorded_once && !memo.hit_since_record) {
+        memo.backoff = static_cast<u8>((std::min)(memo.backoff + 1, 4));
+    } else {
+        memo.backoff = 0;
+    }
+    memo.countdown = static_cast<u8>((1u << memo.backoff) - 1);
+    memo.recorded_once = true;
+    memo.hit_since_record = false;
+    memo.valid = false;
+    const auto refuse = [&control] { ++control.refused; };
+    if (sampler_handles.size() != views.size() || samplers.size() != views.size()) {
+        return refuse();
+    }
+    // An image made, joined, deleted or rescaled while resolving, or the pools moved: the same
+    // state need not give these ids again.
+    if (texture_cache.GraphicsTextureMemoState() != state) {
+        return refuse();
+    }
+    const auto& stages = maxwell3d->state.shader_stages;
+    memo.cbufs.clear();
+    for (const auto& [stage, index] : tex_bank_cbuf_slots) {
+        const auto& bound = stages[stage].const_buffers[index];
+        memo.cbufs.push_back(TexBankMemo::Cbuf{
+            .stage = stage,
+            .index = index,
+            .address = bound.address,
+            .size = bound.size,
+            .enabled = bound.enabled,
+        });
+    }
+    // The GPU pages this draw read: handle words (as read_handle), TIC entries (as
+    // VisitImageView: none past the limit) and TSC entries (as GetSamplerId).
+    boost::container::small_vector<GPUVAddr, 32> gpu_pages;
+    const auto add = [&gpu_pages](GPUVAddr address) {
+        const GPUVAddr page = address & ~GPUVAddr{Core::DEVICE_PAGEMASK};
+        if (std::ranges::find(gpu_pages, page) == gpu_pages.end()) {
+            gpu_pages.push_back(page);
+        }
+    };
+    size_t texture = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        const auto& cbufs = stages[stage].const_buffers;
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index, ++texture) {
+                if (texture >= views.size()) {
+                    return refuse();
+                }
+                if (!(null_pointer_handles &&
+                      VideoCommon::HandleIsStoragePointer(info, desc, index))) {
+                    if (!cbufs[desc.cbuf_index].enabled) {
+                        return refuse();
+                    }
+                    add(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                        (index << desc.size_shift));
+                    if (desc.has_secondary) {
+                        if (!cbufs[desc.secondary_cbuf_index].enabled) {
+                            return refuse();
+                        }
+                        add(cbufs[desc.secondary_cbuf_index].address +
+                            desc.secondary_cbuf_offset);
+                    }
+                }
+                const u32 tic_index = texture_cache.GraphicsTicIndex(views[texture].index);
+                if (tic_index <= state.tic_limit) {
+                    add(state.tic_pool + u64{tic_index} * sizeof(Tegra::Texture::TICEntry));
+                }
+                if (sampler_handles[texture] <= state.tsc_limit) {
+                    add(state.tsc_pool +
+                        u64{sampler_handles[texture]} * sizeof(Tegra::Texture::TSCEntry));
+                }
+            }
+        }
+    }
+    if (texture != views.size()) {
+        return refuse();
+    }
+    const u64 epoch = texture_cache.TexBankEpoch();
+    memo.pages.clear();
+    for (const GPUVAddr gpu_page : gpu_pages) {
+        const std::optional<DAddr> device_page = texture_cache.TexBankDevicePage(gpu_page);
+        if (!device_page) {
+            return refuse();
+        }
+        if (std::ranges::any_of(memo.pages, [&](const TexBankMemo::Page& page) {
+                return page.page->page == *device_page;
+            })) {
+            continue;
+        }
+        bool created = false;
+        TextureCache::TexBankPage* const page = texture_cache.TexBankWatch(*device_page, created);
+        if (texture_cache.TexBankEpoch() != epoch) {
+            // The watches were dropped while adding this one: the pointers taken are gone.
+            return refuse();
+        }
+        memo.pages.push_back(TexBankMemo::Page{
+            .page = page,
+            .gen = TextureCache::TexBankPageGen(*page),
+        });
+        if (created) {
+            // Not trapped yet when this draw read it: a CPU write in between marked nothing.
+            // The next look moves the generation, so the next draw resolves again, trapped.
+            page->recheck = true;
+        }
+    }
+    memo.handles.resize(views.size());
+    memo.views.resize(views.size());
+    for (size_t index = 0; index < views.size(); ++index) {
+        memo.handles[index] = views[index].index;
+        memo.views[index] = views[index].id;
+    }
+    memo.samplers.assign(samplers.begin(), samplers.end());
+    memo.state = state;
+    memo.page_epoch = epoch;
+    memo.switch_value = switch_value;
+    memo.via_header_index = via_header_index;
+    memo.null_pointer_handles = null_pointer_handles;
+    memo.valid = true;
+    ++control.recorded;
+}
+
+template <typename Spec, bool KeepLast, bool Delta>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    // EXP118 (Delta, fritchii_delta_path.h): the pipeline samples nothing and the draw follows its
+    // last with only light state changed. The descriptor pools' sync, the memo switches (the
+    // decision found them off) and the texture steps are left out; with no texture, image or
+    // texture buffer they bind nothing. Every other step below runs as for a full draw.
+    static_assert(!(KeepLast && Delta), "a delta draw keeps nothing");
+    // Delta draws (D2): with KeepLast the handle words and computed handles are kept as they are
+    // read, the rest at the end (KeepLastDraw). Without it nothing below changes: every addition
+    // is under `if constexpr (KeepLast)`.
+    if constexpr (KeepLast) {
+        if (!kept_draw) [[unlikely]] {
+            kept_draw = std::make_unique<KeptDraw>();
+        }
+        kept_draw->valid = false;
+        kept_draw->handles.clear();
+        kept_draw->computed.clear();
+    }
     zero_texture_handles = 0;
+    // SEAM = 2 (EXP123): the memory stage filled this draw's buffer side before the texture work
+    // (MemStage::FillDraw); its calls below are skipped and its sections played in their place.
+    MemStage& mem_stage = buffer_cache.runtime.Seam();
+    const MemStage::DrawPacket* const held = mem_stage.HeldDraw();
+    // FRITCHII_NULL_RENDER (test only, the picture is broken; fable_b_one_follower 7 run 1): the
+    // draw's buffer side alone, which the one-follower design gives the engine thread E, in
+    // today's order: the uniform state, per stage the storage binds, the handle words (read, not
+    // resolved), the texture buffer unbinds, the geometry, the descriptor reservation the binds
+    // write into, per stage the buffer binds, the post-copy barrier. Left out, the render thread
+    // R's part: the descriptor pools' sync, the image views and samplers (and the memos and
+    // templates that keep them), the texture buffer binds (they need the views), the image
+    // descriptors and rescaling, render targets, configure draw. PrepareDraw returns after this.
+    // Only without a held packet (SEAM 0 and 1, the stage off): PrepareDraw checks.
+    if constexpr (!Delta) {
+        if (null_render_next) [[unlikely]] {
+            null_render_next = false;
+            namespace NullProfile = VideoCommon::Nx2Profile;
+            buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks,
+                                                &uniform_buffer_sizes);
+            {
+                NullProfile::Scope scope{NullProfile::Zone::ReadHandles};
+                for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                    if (!Spec::enabled_stages[stage]) {
+                        continue;
+                    }
+                    const NullProfile::FineScope storage_scope{
+                        NullProfile::Zone::StorageBindings};
+                    buffer_cache.UnbindGraphicsStorageBuffers(stage);
+                    if constexpr (Spec::has_storage_buffers) {
+                        size_t ssbo_index{};
+                        for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                            ASSERT(desc.count == 1);
+                            buffer_cache.BindGraphicsStorageBuffer(
+                                stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                desc.is_written, desc.indirect_offset);
+                            ++ssbo_index;
+                        }
+                    }
+                }
+                // The handle words, as the seam's fill reads them (FillHandleValues), kept here.
+                null_render_handles.clear();
+                const auto& stages{maxwell3d->state.shader_stages};
+                using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+                VideoCommon::FillGraphicsHandleValues(
+                    std::span<const Shader::Info>{stage_infos}, *gpu_memory,
+                    [&stages](size_t stage) {
+                        return VideoCommon::GraphicsHandleCbufs<Cbufs>{
+                            stages[stage].const_buffers};
+                    },
+                    device.GetStorageBufferAlignment(),
+                    VideoCore::Nx2Debug::Experiment(21) != 0,
+                    [this](u32 raw) { null_render_handles.push_back(raw); });
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (Spec::enabled_stages[stage]) {
+                    buffer_cache.UnbindGraphicsTextureBuffers(stage);
+                }
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::UpdateBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Geometry};
+                buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                const NullProfile::FineScope geometry_scope{NullProfile::Zone::GeometryBuffers};
+                buffer_cache.BindHostGeometryBuffers(is_indexed);
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::DescriptorAcquire};
+                guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries,
+                                               uses_descriptor_buffer);
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!Spec::enabled_stages[stage]) {
+                    continue;
+                }
+                NullProfile::Scope scope{NullProfile::Zone::BindStageBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Stage,
+                                        static_cast<u32>(stage)};
+                buffer_cache.BindHostStageBuffers(stage);
+            }
+            if (buffer_cache.any_buffer_uploaded) {
+                buffer_cache.runtime.PostCopyBarrier();
+                buffer_cache.any_buffer_uploaded = false;
+            }
+            return false;
+        }
+    }
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
     // EDEN_NX2_EXP32: texture binding memo (TextureMemo), for pipelines whose image bindings are
     // all sampled textures. Their sampler handles are kept and resolved after the lookup.
-    const int memo_switch = VideoCore::Nx2Debug::Experiment(32);
+    const int memo_switch = Delta ? 0 : VideoCore::Nx2Debug::Experiment(32);
     const bool texture_memo_on = memo_switch != 0 && num_textures != 0 &&
                                  num_image_elements == num_textures &&
                                  TextureMemoControl::Get().Usable(memo_switch);
@@ -970,19 +1653,171 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     };
     mark();
-    {
+    if constexpr (!Delta) {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
         texture_cache.SynchronizeDescriptors(false);
     }
     mark();
 
-    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    if (held == nullptr) {
+        buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    }
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    // EDEN_NX2_TEX_BANK_GEN (recomp research idea 2): the
+    // textures of this pipeline's last draw, while the pages their handle words and TIC/TSC
+    // entries were read from kept their generations (TexBankHit). Not with EXP32.
+    // Not while CPU inner invalidation is skipped: constant buffer words then mark no page.
+    const int tex_bank_switch =
+        !Delta && memo_switch == 0 && !Settings::values.skip_cpu_inner_invalidation.GetValue()
+            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tex_bank_gen,
+                                               "EDEN_NX2_TEX_BANK_GEN")
+            : 0;
+    if constexpr (!Delta) {
+        if (tex_bank_switch <= 0 && texture_cache.TexBankWatching()) [[unlikely]] {
+            texture_cache.TexBankReset();
+        }
+    }
+    // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the draw packet, with the
+    // EXP21 value they were made with. When no early fill made them they are made here, before
+    // the bank decision: the fill always runs, a TEX_BANK_GEN hit then does not look at them.
+    const std::vector<u32>* handle_values{};
+    bool packet_null_pointers{};
+    // fable_stage_levelpoints 18.4 row 2 (GPU profile on, the back): the handle reads timed and
+    // the draw classed by its handle range since this pipeline's last draw. The range: the words
+    // each descriptor reads in its constant buffers (a key of their addresses, the write
+    // generations of their pages); a handle program (it reads storage too) makes no key, so its
+    // draws count as "another range". Off: the profile's test and a branch.
+    const bool price_handles = !Delta && VideoCommon::FritchiiPrice::On() &&
+                               VideoCommon::GpuSplit::OnBackThread();
+    const auto price_handle_range{[&](u64& sum) -> u64 {
+        u64 key = 0xcbf29ce484222325ULL;
+        bool keyed = true;
+        sum = 0;
+        const auto add = [&](GPUVAddr begin, u64 bytes) {
+            key = (key ^ begin) * 0x100000001b3ULL;
+            key = (key ^ bytes) * 0x100000001b3ULL;
+            const std::optional<DAddr> device =
+                begin != 0 ? gpu_memory->GpuToCpuAddress(begin) : std::nullopt;
+            const u64 part = device ? Common::PriceGenSum(*device, bytes) : ~u64{0};
+            sum = part == ~u64{0} || sum == ~u64{0} ? ~u64{0} : sum + part;
+        };
+        for (size_t stage = 0; stage < NUM_STAGES && keyed; ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            const auto base = [&cbufs](u32 index) -> GPUVAddr {
+                return index < cbufs.size() && cbufs[index].enabled ? cbufs[index].address
+                                                                    : GPUVAddr{};
+            };
+            const auto range = [&](const auto& desc) {
+                if (desc.handle_program != ~0U || desc.count == 0) {
+                    keyed = desc.count == 0 && keyed;
+                    return;
+                }
+                add(base(desc.cbuf_index) + desc.cbuf_offset,
+                    (u64{desc.count - 1} << desc.size_shift) + sizeof(u32));
+                if constexpr (requires { desc.has_secondary; }) {
+                    if (desc.has_secondary) {
+                        add(base(desc.secondary_cbuf_index) + desc.secondary_cbuf_offset,
+                            sizeof(u32));
+                    }
+                }
+            };
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.image_buffer_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.texture_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.image_descriptors) {
+                range(desc);
+            }
+        }
+        return keyed ? key : 0;
+    }};
+    const auto price_handle_note{[&](size_t site, u64 key, u64 sum, u64 start) {
+        const auto verdict =
+            VideoCommon::FritchiiPrice::ClassifyHandles(key, sum, price_handle_key, price_handle_sum);
+        VideoCommon::FritchiiPrice::g_handles[site].Note(static_cast<size_t>(verdict), 1,
+                                                         VideoCommon::FritchiiPrice::Ticks() -
+                                                             start);
+    }};
+    if constexpr (!Delta) {
+        if (mem_stage.ValuesByValue()) {
+            handle_values = mem_stage.HandleValues(false, packet_null_pointers);
+            if (handle_values == nullptr) {
+                if (mem_stage.HeldFromRing()) [[unlikely]] {
+                    // FRITCHII_MEMSTAGE_THREAD = 2: the stage's packet came without them.
+                    VideoCommon::MemoryStageLink::Note(
+                        VideoCommon::MemoryStageLink::Check::BackHandles,
+                        "a served draw's handles read in Configure");
+                }
+                Profile::Scope scope{Profile::Zone::ReadHandles};
+                u64 price_key = 0;
+                u64 price_sum = 0;
+                u64 price_start = 0;
+                if (price_handles) [[unlikely]] {
+                    price_key = price_handle_range(price_sum);
+                    price_start = VideoCommon::FritchiiPrice::Ticks();
+                }
+                FillHandleValues(mem_stage, VideoCore::Nx2Debug::Experiment(21) != 0, true);
+                if (price_handles) [[unlikely]] {
+                    price_handle_note(0, price_key, price_sum, price_start);
+                }
+                handle_values = mem_stage.HandleValues(false, packet_null_pointers);
+            }
+        } else if (mem_stage.HeldFromRing()) [[unlikely]] {
+            // SEAM below 3 with a ring packet (the ring is ending): handles from game memory.
+            VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::BackHandles,
+                                               "a served draw's handles read below SEAM 3");
+        }
+    }
+    const bool verify_handles{handle_values != nullptr &&
+                              (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0};
+    size_t handle_cursor{};
+    const bool tex_bank_null_pointers{
+        !Delta && (handle_values != nullptr ? packet_null_pointers
+                                            : VideoCore::Nx2Debug::Experiment(21) != 0)};
+    const bool tex_bank_on = tex_bank_switch > 0 && TexBankEligible();
+    if (tex_bank_switch > 0 && !tex_bank_on) {
+        ++TexBankControl::Get().ineligible;
+    }
+    bool tex_bank_hit = false;
+    bool tex_bank_verify = false;
+    TextureCache::TextureMemoState tex_bank_state{};
+    boost::container::small_vector<u32, 96> tex_bank_sampler_handles;
+    if (tex_bank_on) {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        tex_bank_state = texture_cache.GraphicsTextureMemoState();
+        if (TexBankHit(tex_bank_state, via_header_index, tex_bank_null_pointers,
+                       tex_bank_switch)) {
+            tex_bank_verify = tex_bank_switch == 2 && TexBankControl::Get().ShouldVerify();
+            tex_bank_hit = !tex_bank_verify;
+        }
+    }
+    static const bool record_sampled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
+        return value && *value != '\0' && *value != '0';
+    }();
+    // EXP87 (live; ported): the textures may come from a template an
+    // earlier draw kept, also in an earlier frame, keyed on the handle words read below. Not with
+    // EXP32 or TEX_BANK_GEN on (their own memos of the textures), for mesh pipelines, or while
+    // EDEN_NX2_FRAME_DUMP_SAMPLED records (the original left its memo off for that too). 2 = verify.
+    const int template_switch = Delta ? 0 : VideoCore::Nx2Debug::Experiment(87);
+    const bool use_template = template_switch != 0 && template_eligible && memo_switch == 0 &&
+                              tex_bank_switch <= 0 && !record_sampled && !IsMeshPipeline();
+    const bool template_verify = template_switch == 2;
+    boost::container::small_vector<u32, 96> template_handles;
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        {
+        if (held == nullptr) {
             const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
             buffer_cache.UnbindGraphicsStorageBuffers(stage);
             if constexpr (Spec::has_storage_buffers) {
@@ -996,33 +1831,112 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
             }
         }
+        if constexpr (Delta) {
+            // EXP118: no handle to read.
+            return true;
+        }
+        if (tex_bank_hit) {
+            // EDEN_NX2_TEX_BANK_GEN: the textures come from the memo (no handle reads).
+            return true;
+        }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        const auto cbuf_address{[&cbufs](u32 cbuf) -> GPUVAddr {
+            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
+        }};
+        // The handle words and handle programs: one function for the back's own read and the
+        // memory seam's fill (texture_handle_values.h).
+        const VideoCommon::GraphicsHandleCbufs<std::remove_cvref_t<decltype(cbufs)>> cbuf_view{
+            cbufs};
+        const u64 storage_alignment{device.GetStorageBufferAlignment()};
+        // Memory stage step 7 (the 5.4 check with the window open): the game memory a handle's
+        // own read takes, for MemStage::ValueLeftOut: its word or two, or for a handle program
+        // every enabled constant buffer of the stage (its storage words are not known here).
+        const auto handle_ranges{[&](const auto& desc, u32 index) {
+            boost::container::small_vector<std::pair<u64, u64>, 18> ranges;
+            if (desc.handle_program != ~0U) {
+                for (const auto& cbuf : cbufs) {
+                    if (cbuf.enabled && cbuf.size != 0) {
+                        ranges.emplace_back(cbuf.address, cbuf.size);
+                    }
+                }
+                return ranges;
+            }
+            ranges.emplace_back(cbuf_view.Base(desc.cbuf_index) + desc.cbuf_offset +
+                                    (index << desc.size_shift),
+                                sizeof(u32));
+            if constexpr (requires { desc.has_secondary; }) {
+                if (desc.has_secondary) {
+                    ranges.emplace_back(cbuf_view.Base(desc.secondary_cbuf_index) +
+                                            desc.secondary_cbuf_offset,
+                                        sizeof(u32));
+                }
+            }
+            return ranges;
+        }};
+        // SEAM >= 3: the next value of the draw packet, false past its end (a count mismatch,
+        // counted when the loop ends).
+        const auto next_value{[&](u32& value) {
+            if (handle_cursor < handle_values->size()) {
+                value = (*handle_values)[handle_cursor++];
+                return true;
+            }
+            ++handle_cursor;
+            return false;
+        }};
+        const auto raw_handle{[&](const auto& desc, u32 index) -> u32 {
+            if (handle_values == nullptr) {
+                return VideoCommon::RawTextureHandle<false>(info, desc, index, *gpu_memory,
+                                                            cbuf_view, storage_alignment);
+            }
+            u32 value{};
+            if (!next_value(value)) [[unlikely]] {
+                return VideoCommon::RawTextureHandle<false>(info, desc, index, *gpu_memory,
+                                                            cbuf_view, storage_alignment);
+            }
+            if (verify_handles) [[unlikely]] {
+                // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
+                const u32 own{VideoCommon::RawTextureHandle<false>(
+                    info, desc, index, *gpu_memory, cbuf_view, storage_alignment)};
+                // With the window open GPUMem may have written the words since the fill (left
+                // out and counted apart); any other difference is a mismatch.
+                if (own == value ||
+                    !mem_stage.ValueLeftOut(*gpu_memory, handle_ranges(desc, index))) {
+                    mem_stage.NoteValueCheck(
+                        MemStage::Value::Handle, own == value,
+                        VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                        key.unique_hashes[stage + 1], value, own);
+                }
+            }
+            return value;
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
+            const u32 raw{raw_handle(desc, index)};
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                const auto evaluate{[&](u64 storage_alignment) {
-                    return VideoCommon::EvaluateTextureHandle(
-                        info, desc.handle_program, *gpu_memory,
-                        [&](u32 cbuf) -> GPUVAddr {
-                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
-                                                                              : GPUVAddr{};
-                        },
-                        storage_alignment);
-                }};
+                // (for an array, for each element: EDEN_NX2_LIGHT_TABLE_ARRAYS)
                 // The program's storage offsets are relative to the buffer address aligned down
-                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=0 reads
-                // the words at the unaligned address instead (A/B).
-                static const bool align_storage{[] {
-                    const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                    return value == nullptr || *value != '0';
-                }()};
-                const u64 storage_alignment{device.GetStorageBufferAlignment()};
-                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                // to the host storage alignment (StorageOffset); EDEN_NX2_HANDLE_ALIGN=0 reads
+                // the words at the unaligned address instead (A/B, HandleProgramAlignment).
+                if constexpr (KeepLast) {
+                    kept_draw->handles.push_back(raw);
+                    kept_draw->computed.push_back({
+                        .stage = static_cast<u32>(stage),
+                        .program = desc.handle_program,
+                        .element = index,
+                        .value = raw,
+                        .alignment = VideoCommon::HandleProgramAlignment(storage_alignment),
+                    });
+                }
                 if (raw == 0) {
                     ++zero_texture_handles;
                     static std::set<std::pair<u64, u32>> logged;
                     const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
                     if (logged.size() < 64 && logged.insert(key_program).second) {
+                        const auto evaluate{[&](u64 alignment) {
+                            return VideoCommon::EvaluateTextureHandle(info, desc.handle_program,
+                                                                      *gpu_memory, cbuf_address,
+                                                                      alignment, index);
+                        }};
                         LOG_INFO(Render_Vulkan,
                                  "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
                                  "aligned to {} it gives {:#x}, unaligned {:#x}",
@@ -1032,25 +1946,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
                 return TexturePair(raw, via_header_index);
             }
-            ASSERT(cbufs[desc.cbuf_index].enabled);
-            const u32 index_offset{index << desc.size_shift};
-            const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
-            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
-                          std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
-                if (desc.has_secondary) {
-                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
-                                      << desc.secondary_shift_left};
-                    const u32 raw{lhs_raw | rhs_raw};
-                    return TexturePair(raw, via_header_index);
-                }
+            if constexpr (KeepLast) {
+                kept_draw->handles.push_back(raw);
             }
-            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
+            return TexturePair(raw, via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -1073,13 +1972,106 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-        const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+        // Read once per draw (TEX_BANK_GEN keys its memo on the same value).
+        const bool null_pointer_handles{tex_bank_null_pointers};
+        u32 texture{};
         for (const auto& desc : info.texture_descriptors) {
+            if (desc.count > 1 && desc.handle_program != ~0U) {
+                // EDEN_NX2_LIGHT_TABLE_ARRAYS: a table of handles the
+                // shader indexes (one shadow map per light, say), read in one go; elements
+                // repeating a sampler share its lookup. Only translated with the switch on.
+                // Handle programs keep a pipeline out of EXP87's templates and TEX_BANK_GEN
+                // (template_eligible, TexBankEligible); EXP32 resolves the samplers after its
+                // lookup, as for every other texture.
+                const size_t first{views.size()};
+                u32 last_sampler_index{~0U};
+                VideoCommon::SamplerId sampler{};
+                const auto table_element{[&]([[maybe_unused]] u32 element, u32 raw) {
+                    if constexpr (KeepLast) {
+                        kept_draw->handles.push_back(raw);
+                        kept_draw->computed.push_back({
+                            .stage = static_cast<u32>(stage),
+                            .program = desc.handle_program,
+                            .element = element,
+                            .value = raw,
+                            .alignment = device.GetStorageBufferAlignment(),
+                        });
+                    }
+                    const auto handle{TexturePair(raw, via_header_index)};
+                    views.push_back({handle.first});
+                    if (tex_bank_on) {
+                        tex_bank_sampler_handles.push_back(handle.second);
+                    }
+                    if (texture_memo_on || use_template) {
+                        sampler_handles.push_back(handle.second);
+                    } else {
+                        if (handle.second != last_sampler_index) {
+                            sampler = texture_cache.GetSamplerId(handle.second, false);
+                            last_sampler_index = handle.second;
+                        }
+                        samplers.push_back(sampler);
+                    }
+                    if (use_template) {
+                        template_handles.push_back(via_header_index
+                                                       ? handle.first
+                                                       : handle.first | (handle.second << 20));
+                    }
+                }};
+                if (handle_values == nullptr) {
+                    VideoCommon::RawTextureHandleTable(info, desc, *gpu_memory, cbuf_view,
+                                                       storage_alignment, table_element);
+                } else {
+                    // SEAM >= 3: the table's values from the draw packet.
+                    boost::container::small_vector<u32, 16> own;
+                    if (verify_handles || handle_cursor + desc.count > handle_values->size())
+                        [[unlikely]] {
+                        VideoCommon::RawTextureHandleTable(
+                            info, desc, *gpu_memory, cbuf_view, storage_alignment,
+                            [&own](u32, u32 raw) { own.push_back(raw); });
+                    }
+                    for (u32 element = 0; element < desc.count; ++element) {
+                        u32 value{};
+                        if (!next_value(value)) [[unlikely]] {
+                            value = own[element];
+                        } else if (verify_handles) [[unlikely]] {
+                            if (own[element] == value ||
+                                !mem_stage.ValueLeftOut(*gpu_memory,
+                                                        handle_ranges(desc, element))) {
+                                mem_stage.NoteValueCheck(
+                                    MemStage::Value::Handle, own[element] == value,
+                                    VideoCommon::HandleWordAddress(desc, element, cbuf_view),
+                                    key.unique_hashes[stage + 1], value, own[element]);
+                            }
+                        }
+                        table_element(element, value);
+                    }
+                }
+                if (VideoCommon::HandleTableNotes::Wanted()) {
+                    std::vector<u32> tics(desc.count);
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        tics[index] = views[first + index].index;
+                    }
+                    VideoCommon::HandleTableNotes::Note(key.unique_hashes[stage + 1], texture,
+                                                        tics);
+                }
+                ++texture;
+                continue;
+            }
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{null_pointer_handles &&
-                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                      ? VideoCommon::NULL_TEXTURE_HANDLE
-                                      : read_handle(desc, index)};
+                const bool null_handle{null_pointer_handles &&
+                                       VideoCommon::HandleIsStoragePointer(info, desc, index)};
+                if (null_handle && handle_values != nullptr) {
+                    // SEAM >= 3: the packet keeps its place (SKIPPED_HANDLE_VALUE).
+                    ++handle_cursor;
+                }
+                const auto handle{null_handle ? VideoCommon::NULL_TEXTURE_HANDLE
+                                              : read_handle(desc, index)};
+                if constexpr (KeepLast) {
+                    // EXP21's null handle read no word: keep its place (one word per view).
+                    if (kept_draw->handles.size() == views.size()) {
+                        kept_draw->handles.push_back(~0U);
+                    }
+                }
                 // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
                 static const u64 trace_hash{[] {
                     const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};
@@ -1112,15 +2104,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     }
                 }
                 views.push_back({handle.first});
+                if (tex_bank_on) {
+                    tex_bank_sampler_handles.push_back(handle.second);
+                }
 
-                if (texture_memo_on) {
+                if (texture_memo_on || use_template) {
+                    // EXP87: resolved after the template lookup, unless a template gives them.
                     sampler_handles.push_back(handle.second);
                 } else {
                     VideoCommon::SamplerId sampler{
                         texture_cache.GetSamplerId(handle.second, false)};
                     samplers.push_back(sampler);
                 }
+                if (use_template) {
+                    template_handles.push_back(via_header_index
+                                                   ? handle.first
+                                                   : handle.first | (handle.second << 20));
+                }
             }
+            ++texture;
         }
         if constexpr (Spec::has_images) {
             for (const auto& desc : info.image_descriptors) {
@@ -1132,6 +2134,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }};
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
+        // Row 2 at EXP123 below 3: the loop reads the words itself (with the storage binds and
+        // the samplers' and views' indices, all in this time).
+        const bool price_loop = price_handles && handle_values == nullptr && !tex_bank_hit;
+        u64 price_key = 0;
+        u64 price_sum = 0;
+        u64 price_start = 0;
+        if (price_loop) [[unlikely]] {
+            price_key = price_handle_range(price_sum);
+            price_start = VideoCommon::FritchiiPrice::Ticks();
+        }
+        SCOPE_EXIT {
+            if (price_loop) [[unlikely]] {
+                price_handle_note(1, price_key, price_sum, price_start);
+            }
+        };
         if constexpr (Spec::enabled_stages[0]) {
             config_stage(0);
         }
@@ -1147,17 +2164,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if constexpr (Spec::enabled_stages[4]) {
             config_stage(4);
         }
+        if (handle_values != nullptr) {
+            // None taken: a bank hit skipped the loop. Else all must have been.
+            mem_stage.LookedAtHandleValues(false, handle_cursor);
+        }
+        if (tex_bank_hit) {
+            const TexBankMemo& memo = tex_bank_memo;
+            for (const u32 handle : memo.handles) {
+                views.push_back({.index = handle, .blacklist = false, .id = {}});
+            }
+            samplers.assign(memo.samplers.begin(), memo.samplers.end());
+        }
     }
     Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
     ASSERT(views.size() == num_image_elements);
     mark();
+    // EXP87: a template of this pipeline with the same context and handle words, still good
+    // (Check), gives the views and samplers here and the descriptors in prepare_stage.
+    DrawTemplate* draw_template{};
+    VideoCommon::DrawTemplateContext template_context{};
+    const std::span<const u32> template_handles_span{template_handles.data(),
+                                                     template_handles.size()};
+    u64 template_hash{};
+    bool template_hit{};
+    if (use_template) {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        template_context = texture_cache.GraphicsTextureContext(template_owner);
+        template_hash = VideoCommon::HashDrawTemplate(template_context, template_handles_span);
+        draw_template =
+            draw_templates.Find(template_context, template_handles_span, template_hash);
+        if (draw_template) {
+            const VideoCommon::DrawTemplateCheck check =
+                draw_template->Check(gpu_memory->HostPointerSerial(), texture_cache.ScaleEpoch(),
+                                     [this](VideoCommon::ImageViewId id) {
+                                         return texture_cache.ImageViewGeneration(id);
+                                     });
+            if (check != VideoCommon::DrawTemplateCheck::Hit) {
+                ++draw_template_stats.rejected[static_cast<size_t>(check)];
+                DrawTemplates::Erase(*draw_template);
+                draw_template = nullptr;
+            }
+        }
+        template_hit = draw_template != nullptr && !template_verify;
+        if (template_hit) {
+            for (size_t i = 0; i < views.size(); ++i) {
+                views[i].id = draw_template->textures[i].view;
+                samplers.push_back(draw_template->textures[i].sampler);
+            }
+            if (!texture_cache.PrepareTemplateViews(std::span(views.data(), views.size()))) {
+                ++draw_template_stats.prepare_deleted;
+                DrawTemplates::Erase(*draw_template);
+                draw_template = nullptr;
+                template_hit = false;
+                samplers.clear();
+            }
+        }
+        if (template_hit) {
+            ++draw_template_stats.hits;
+            template_misses = 0;
+        } else if (!draw_template) {
+            ++draw_template_stats.misses;
+            ++template_misses;
+        }
+        if (!template_hit) {
+            for (const u32 sampler_handle : sampler_handles) {
+                samplers.push_back(texture_cache.GetSamplerId(sampler_handle, false));
+            }
+        }
+    }
     // EXP32: a hit takes the ids (here) and the descriptors (prepare_stage) of the pipeline's
     // previous draw; a hit picked for verification resolves and pushes the full way, then
     // compares (VerifyTextureMemo). Every other draw with the memo on records it.
     bool memo_hit = false;
     bool memo_verify = false;
     TextureCache::TextureMemoState memo_state{};
-    {
+    if constexpr (!Delta) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         if (texture_memo_on) {
             memo_state = texture_cache.GraphicsTextureMemoState();
@@ -1187,9 +2268,72 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                              Spec::has_images);
             }
-        } else {
+        } else if (tex_bank_hit) {
+            // EDEN_NX2_TEX_BANK_GEN: the memo's views, prepared as VisitImageView prepares a
+            // table entry it read before.
+            const TexBankMemo& memo = tex_bank_memo;
+            for (size_t index = 0; index < views.size(); ++index) {
+                views[index].id = memo.views[index];
+            }
+            if (!texture_cache.PrepareTexBankViews(memo.views)) {
+                // Preparing deleted images: resolve the views the full way (the handles and
+                // samplers stand; samplers are never deleted).
+                ++TexBankControl::Get().prepare_fallbacks;
+                texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                             Spec::has_images);
+            }
+        } else if (!template_hit) {
+            // A template hit (EXP87) took its views and prepared them above.
             texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                          Spec::has_images);
+        }
+        if (tex_bank_on && !tex_bank_hit) {
+            const std::span<const VideoCommon::ImageViewInOut> views_span{views.data(),
+                                                                          views.size()};
+            if (tex_bank_verify) {
+                // EDEN_NX2_TEX_BANK_GEN=2: a hit resolved the full way; the memo must agree.
+                auto& control = TexBankControl::Get();
+                ++control.verified;
+                const TexBankMemo& memo = tex_bank_memo;
+                size_t bad = views.size();
+                if (memo.views.size() == views.size() && memo.handles.size() == views.size() &&
+                    memo.samplers.size() == samplers.size() && samplers.size() == views.size()) {
+                    for (size_t index = 0; index < views.size(); ++index) {
+                        if (memo.handles[index] != views[index].index ||
+                            memo.views[index] != views[index].id ||
+                            memo.samplers[index] != samplers[index]) {
+                            bad = index;
+                            break;
+                        }
+                    }
+                } else {
+                    bad = 0;
+                }
+                if (bad != views.size()) {
+                    ++control.mismatches;
+                    if (control.mismatches_logged < 16) {
+                        ++control.mismatches_logged;
+                        const bool sized = bad < memo.views.size() && bad < memo.handles.size() &&
+                                           bad < memo.samplers.size();
+                        LOG_WARNING(
+                            Render_Vulkan,
+                            "Texture bank memo mismatch (TEX_BANK_GEN=2): pipeline {:016x} (vs "
+                            "{:016x} fs {:016x}) texture {} of {}: memo handle {:#x} view {} "
+                            "sampler {} | fresh handle {:#x} view {} sampler {}",
+                            key.Hash(), key.unique_hashes[1], key.unique_hashes[5], bad,
+                            views.size(), sized ? memo.handles[bad] : 0U,
+                            sized ? memo.views[bad].index : 0U,
+                            sized ? memo.samplers[bad].index : 0U, views[bad].index,
+                            views[bad].id.index, bad < samplers.size() ? samplers[bad].index : 0U);
+                    }
+                }
+            }
+            RecordTexBank(tex_bank_state, views_span,
+                          std::span<const u32>(tex_bank_sampler_handles.data(),
+                                               tex_bank_sampler_handles.size()),
+                          std::span<const VideoCommon::SamplerId>(samplers.data(),
+                                                                  samplers.size()),
+                          via_header_index, tex_bank_null_pointers, tex_bank_switch);
         }
     }
     ASSERT(samplers.size() == num_textures);
@@ -1215,10 +2359,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.rt, sizeof(regs.rt));
         DrawReuseProbe::Get().Note(this, full, textures, no_cbufs);
     }
-    static const bool record_sampled = [] {
-        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-        return value && *value != '\0' && *value != '0';
-    }();
     if (record_sampled) {
         sampled_images.clear();
         size_t view_index{};
@@ -1244,10 +2384,50 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
+    if (texture_cache.DepthCensusOn()) [[unlikely]] {
+        // EDEN_NX2_DEPTH_CENSUS: which of the D32 targets made this frame this draw samples,
+        // with the sampler and how the shader reads it (views laid out as in record_sampled).
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            }
+            if constexpr (Spec::has_image_buffers) {
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 i = 0; i < desc.count; ++i, ++view_index, ++sampler_index) {
+                    if (view_index >= views.size()) {
+                        break;
+                    }
+                    const bool has_sampler = sampler_index < samplers.size() &&
+                                             samplers[sampler_index] != VideoCommon::SamplerId{};
+                    texture_cache.CensusNoteSampled(
+                        views[view_index].id,
+                        has_sampler ? &texture_cache.GetSampler(samplers[sampler_index]).Descriptor()
+                                    : nullptr,
+                        desc.census_use, desc.is_depth);
+                }
+            }
+            if constexpr (Spec::has_images) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+    }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
         VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
         const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+            if (held != nullptr) {
+                // A held draw has no texel buffers (else it fills here, LateFill): the fill
+                // unbound them.
+                return;
+            }
             size_t index{};
             const auto add_buffer{[&](const auto& desc) {
                 constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
@@ -1304,7 +2484,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if constexpr (Spec::enabled_stages[4]) {
             bind_stage_info(4);
         }
-    } else {
+    } else if (held == nullptr) {
         if constexpr (Spec::enabled_stages[0]) {
             buffer_cache.UnbindGraphicsTextureBuffers(0);
         }
@@ -1328,9 +2508,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     mark();
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
-        const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
-        buffer_cache.BindHostGeometryBuffers(is_indexed);
+        if (held != nullptr) {
+            // SEAM = 2: the geometry section filled before the texture work, played here.
+            mem_stage.PlayHeld(held->geometry);
+        } else {
+            // The geometry section: filled here, played as the bracket ends.
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Geometry};
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+            const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
+            buffer_cache.BindHostGeometryBuffers(is_indexed);
+        }
     }
     mark();
     {
@@ -1345,6 +2532,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     // EXP32: what a draw that did not hit pushes, to be recorded (or compared, when verifying).
     boost::container::small_vector<DescriptorUpdateEntry, 32> fresh_descriptors;
+    std::array<std::pair<u32, u32>, NUM_STAGES> template_ranges{}; ///< EXP87, per stage
     boost::container::small_vector<u8, 32> fresh_rescaled;
     u8* fresh_rescaled_cursor{};
     size_t memo_descriptor_index{};
@@ -1359,9 +2547,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         fresh_rescaled_cursor = fresh_rescaled.data();
     }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        // FRITCHII_DELAY_BACK_KIND=2 ("S", fable_stage_levelpoints 18.3): every 4th stage bind,
+        // on the back thread, outside the zone. Off: one relaxed load and a branch.
+        VideoCommon::GpuSplit::DelayBackIf(VideoCommon::GpuSplit::BackDelayKind::StageBinds);
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            buffer_cache.BindHostStageBuffers(stage);
+            if (held != nullptr) {
+                // SEAM = 2: the stage's section, filled before the texture work.
+                mem_stage.PlayHeld(held->stage[stage]);
+            } else {
+                // The stage's buffer entries and descriptors, played before its image
+                // descriptors.
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Stage, static_cast<u32>(stage)};
+                buffer_cache.BindHostStageBuffers(stage);
+            }
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
@@ -1369,6 +2568,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 // Libraries: the fragment stage's rescaling bits start at fixed indices.
                 rescaling.Seek(GPL_FRAGMENT_TEXTURE_SCALING_BASE, GPL_FRAGMENT_IMAGE_SCALING_BASE);
             }
+            // EXP87's ranges are also the kept draw's (D2: KeepLast).
+            const size_t template_first{
+                use_template || KeepLast ? guest_descriptor_queue.UpdateCount() : 0};
             if (memo_hit) {
                 // The stage's textures as the pipeline's previous draw pushed them (only sampled
                 // textures: no image descriptors to mark modified).
@@ -1390,9 +2592,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const DescriptorUpdateEntry* const pushed{guest_descriptor_queue.UpdateData()};
                 fresh_descriptors.insert(fresh_descriptors.end(), pushed + first,
                                          pushed + guest_descriptor_queue.UpdateCount());
+            } else if (template_hit) {
+                // EXP87: the stage's descriptors as the template's draw pushed them.
+                const auto [first, count] = draw_template->ranges[stage];
+                guest_descriptor_queue.AddEntries(draw_template->descriptors.data() + first,
+                                                  count);
             } else {
                 PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                      rescaling, samplers_it, views_it);
+            }
+            if (use_template || KeepLast) {
+                template_ranges[stage] = {
+                    static_cast<u32>(template_first),
+                    static_cast<u32>(guest_descriptor_queue.UpdateCount() - template_first)};
             }
         }
         const auto& info{stage_infos[stage]};
@@ -1437,6 +2649,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                           std::span<const u32>(sampler_handles.data(), sampler_handles.size()),
                           samplers_span, descriptors_span, rescaled_span);
     }
+    if (template_hit) {
+        rescaling.Assign(draw_template->rescaling);
+    } else if (use_template &&
+               (draw_template != nullptr || template_misses <= 16 || (template_misses & 15) == 0)) {
+        // A pipeline whose draws never repeat keeps one template in 16.
+        KeepDrawTemplate(draw_template, template_context, template_handles_span, template_hash,
+                         std::span(views.data(), views.size()),
+                         std::span(samplers.data(), samplers.size()), template_ranges, rescaling);
+    }
+    if (use_template) {
+        ReportDrawTemplates(template_switch);
+    }
+    if constexpr (KeepLast) {
+        KeepLastDraw(std::span(views.data(), views.size()),
+                     std::span(samplers.data(), samplers.size()), template_ranges, rescaling,
+                     !tex_bank_hit);
+    }
     if (mesh_emulation) {
         if (!mesh_output_buffer) {
             return false;
@@ -1453,7 +2682,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
-    if (buffer_cache.any_buffer_uploaded) {
+    if (held != nullptr && (held->flags & MemStage::PostCopyBarrier) != 0) {
+        // FRITCHII_MEMSTAGE_THREAD = 2: the stage's fill uploaded (the mark came in the packet).
+        mem_stage.PlayPostCopyBarrier();
+    } else if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
@@ -1461,20 +2693,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
-        // KIZUNA-STAMP-NEUTRAL-BEGIN
-        // (changes no compiled pipeline, so it stays out of NX2_SHADER_STAMP: Nx2ShaderStamp.cmake)
-        if (texture_cache.RenderTargetsFailed()) {
-            // No memory for a render target even after reclaiming: skip this draw. The next frame
-            // looks it up again; drawing into the null view would use an attachment that is not there.
-            return false;
-        }
-        // KIZUNA-STAMP-NEUTRAL-END
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
+    }
+    if (texture_cache.RenderTargetsOutOfMemory()) [[unlikely]] {
+        // CheezyEmu a08015f893: a bound target got no memory; skip the draw.
+        return false;
     }
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
@@ -1483,6 +2711,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     bool configured;
     {
         Profile::Scope scope{Profile::Zone::ConfigureDraw};
+        if (occl_flag_parent != nullptr) [[unlikely]] {
+            occl_prepass_rescaling = rescaling.Data(); // FRITCHII_OCCL_FLAG pre-pass
+            occl_prepass_render_area = render_area;
+        }
         configured = ConfigureDraw(rescaling, render_area);
     }
     if (step_trace) [[unlikely]] {
@@ -1506,11 +2738,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return configured;
 }
 
+bool GraphicsPipeline::ConfigureAfterOcclPrepass(const GraphicsPipeline& variant) {
+    RescalingPushConstant rescaling;
+    rescaling.Assign(variant.occl_prepass_rescaling);
+    return ConfigureDraw(rescaling, variant.occl_prepass_render_area);
+}
+
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
         LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
                      num_descriptor_entries, guest_descriptor_queue.UpdateCount());
+        // One follower step 4: an unlent draw R built wrong. Counted (must be 0), not drawn,
+        // and step 4 stops for the session (every later draw lent) before more go wrong.
+        if (VideoCommon::OneFollower::PlayingUnlentDraw()) [[unlikely]] {
+            OneFollowerDraw::ReportDescriptorMismatch(*this, num_descriptor_entries,
+                                                      guest_descriptor_queue.UpdateCount());
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::BuildDescriptors,
+                                           "unlent draw: descriptor count against its pipeline");
+            VideoCommon::OneFollower::DisableUnlend(
+                "an unlent draw's descriptor count did not match its pipeline");
+        }
         return false;
     }
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
@@ -1663,7 +2911,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 .payload_words = mesh_emulation->payload_stride,
                 .capacity_words = capacity,
                 .block_words = mesh_emulation->block_words,
-                .vertices_per_group = mesh_emulation->max_primitives * 3,
+                .vertices_per_group =
+                    mesh_emulation->max_primitives * mesh_emulation->primitive_vertices,
                 .max_groups = device.GetMaxComputeWorkGroupCount()[0],
             };
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
@@ -1687,6 +2936,30 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
+    }
+    if (buffer_cache.runtime.Player().ListDrawArgsRequested()) {
+        // List draws (nx2_list_draw.h): outside the render pass, before the
+        // draw's counters start.
+        using Link = VideoCommon::MemoryStageLink;
+        MemStage& seam = buffer_cache.runtime.Seam();
+        const MemStage::DrawPacket* const ring_packet =
+            seam.HeldFromRing() ? seam.HeldDraw() : nullptr;
+        if (ring_packet != nullptr && (ring_packet->flags & MemStage::ListArgs) != 0) {
+            // FRITCHII_MEMSTAGE_LIST_DRAWS: GPUMem's fill bound the two words and took their
+            // buffer and offset where this call took them (GetDrawIndirectBuffer after the
+            // geometry section), at the same position in the stream.
+            buffer_cache.runtime.Player().RecordListDrawArgs(
+                ring_packet->indirect.buffer, ring_packet->indirect.offset, IsMeshPipeline());
+            Link::Get().NoteListDrawn();
+        } else {
+            if (Link::BackServed()) [[unlikely]] {
+                Link::Note(Link::Check::ListArgsMissing, "ConfigureDraw");
+            }
+            const auto [list_buffer, list_offset] = seam.Ref(
+                MemStage::Site::ListArgs, [&] { return buffer_cache.GetDrawIndirectBuffer(); });
+            buffer_cache.runtime.Player().RecordListDrawArgs(list_buffer->Handle(), list_offset,
+                                                             IsMeshPipeline());
+        }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {
@@ -1756,6 +3029,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            // FRITCHII_SLOW_GPU: the programs a slow submission's draws ran (one TLS load off).
+            vk::NoteBoundProgram(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 key.unique_hashes[1] != 0 ? key.unique_hashes[1]
+                                                           : key.unique_hashes[0],
+                                 key.unique_hashes[5]);
         }
         const VkShaderStageFlags push_stages =
             mesh_emulation ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
@@ -2308,7 +3586,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     PipelineStates states;
     FillStates(states);
     const bool is_mesh{states.is_mesh};
-    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
         .requiredSubgroupSize = GuestWarpSize,
@@ -2323,19 +3601,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
         const bool emulated_vertex{mesh_emulation && stage == 0};
-        [[maybe_unused]] auto& stage_ci =
-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .stage = emulated_vertex
-                             ? VK_SHADER_STAGE_VERTEX_BIT
-                             : StageFlag(stage_infos[stage],
-                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
-                .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            });
+        const VkShaderStageFlagBits stage_flag{
+            emulated_vertex ? VK_SHADER_STAGE_VERTEX_BIT
+                            : StageFlag(stage_infos[stage],
+                                        MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
+        shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = emulated_vertex ? nullptr
+                                     : GuestWarpSizeChain(device, stage_infos[stage], stage_flag,
+                                                          subgroup_size_ci),
+            .flags = 0,
+            .stage = stage_flag,
+            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        });
     }
     // Mesh emulation draws a plain triangle list without vertex attributes.
     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
@@ -2351,7 +3631,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        // The mesh program's output topology (points and lines since Fritchii's point fallback).
+        .topology = !mesh_emulation                           ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                    : mesh_emulation->primitive_vertices == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                    : mesh_emulation->primitive_vertices == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                                              : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .primitiveRestartEnable = VK_FALSE,
     };
     VkPipelineCreateFlags flags{};
@@ -2362,7 +3646,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
+    // Through Fritchii's pipeline binary store when it is on (FRITCHII_PIPELINE_BINARY).
+    pipeline = PipelineBinary::CreateGraphicsPipeline(device, {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = flags,
@@ -2527,6 +3812,11 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
     // The library's own set layouts, identically defined to the linked pipeline's (same
     // signature in the key), so the library outlives the pipeline that built it.
     std::array<VkDescriptorSetLayout, NUM_STAGES> set_layouts{};
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!InPart(part, stage)) {
@@ -2541,13 +3831,14 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
         if (!spv_modules[stage]) {
             continue;
         }
-        // Same stage info as the monolithic pipeline (MakePipeline), which sets no subgroup size.
+        // Same stage info as the monolithic pipeline (MakePipeline).
+        const VkShaderStageFlagBits stage_flag{
+            StageFlag(stage_infos[stage], MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
         shader_stages.push_back({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = GuestWarpSizeChain(device, stage_infos[stage], stage_flag, subgroup_size_ci),
             .flags = 0,
-            .stage = StageFlag(stage_infos[stage],
-                               MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+            .stage = stage_flag,
             .module = *spv_modules[stage],
             .pName = "main",
             .pSpecializationInfo = nullptr,

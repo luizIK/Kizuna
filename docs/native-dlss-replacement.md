@@ -6,7 +6,7 @@ eight temporal-upscaling passes, including depth, motion, history and optional R
 This is separate from the presentation filters that scale the finished window image.
 
 Fire Emblem uses the jitter-only spatial workaround by default. Explicit `fsr` and `dlss`
-comparison modes enable temporal replacement for its validated input contract. The upstream
+comparison modes enable temporal replacement for its validated input contract. The original
 temporal blend and RCAS fallback remain available if a temporal backend is unavailable.
 Invalid consumed inputs leave the native dispatch enabled. An already-rejected native
 tensor shader remains an explicit dispatch failure. General tensor emulation remains.
@@ -16,7 +16,7 @@ tensor shader remains an explicit dispatch failure. General tensor emulation rem
 Selection currently recognizes Fire Emblem: Fortune's Weave's captured prepass and output
 shader, under its exact program ID. Temporal mode requires matching B10G11R11 input/output,
 R16G16 motion, D32 depth and a fresh jitter sample. Spatial mode requires only the matching
-color/output and fresh jitter. The upstream temporal contract uses reversed depth,
+color/output and fresh jitter. The original temporal contract uses reversed depth,
 normalized motion toward the previous frame, HDR color and jitter in render pixels.
 Resolution scaling scales the render extent and jitter together. History resets on size
 changes, first use and evaluation gaps longer than 250 ms. An explicit game camera-cut
@@ -89,25 +89,25 @@ start.
   the game's own bias.
 - FSR 4 (Windows, AMD's driver, off by default): with "AMD FSR 4" picked,
   the same inputs, jitter and RCAS setting go to AMD's FSR 4 through AMD's FidelityFX runtime
-  (FidelityFX SDK 2.4.0, FSR Upscaling 4.1.2). Nothing of AMD's ships with Lichii: the setting's
+  (FidelityFX SDK 2.4.0, FSR Upscaling 4.1.2). Nothing of AMD's ships with Fritchii: the setting's
   panel downloads `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from
   the SDK's GitHub repository at the release commit into the user folder's `fidelityfx` folder,
   after showing AMD's licence, only when the user presses its download button. Each file must match its pinned size and SHA-256
   (`vulkan_common/ffx_files.h`) and carry AMD's Authenticode signature, checked after the
   download and again before loading. AMD's runtime picks the model (FP8 on RDNA 4, INT8 on RDNA 3
-  and RDNA 2); the choice is only offered for those GPUs. Only an upscale context is created:
-  no frame generation. `VK_EXT_shader_float8` and the
+  and RDNA 2); the choice is only offered for those GPUs. Only an upscale context is created.
+  `VK_EXT_shader_float8` and the
   `shaderFloat16` device feature are enabled for it only while it's picked. FSR 3.1
   stays created and takes over if the files are missing or don't check out, AMD's runtime offers
   no FSR 4 for the GPU, the context can't be created or a dispatch fails. The log says which, and
   shows `Ocarina FSR 4 evaluated` while it runs.
-- #644 (`82494c4820`, `74a2d20c90`, `4352c06bbf`) supplies the effects capture, used by FSR only
+- A ported change supplies the effects capture, used by FSR only
   (DLSS gets no bias mask and runs as before). FSR uses its R16F current/history bias as both
   reactive and transparency/composition masks; missing capture uses zero masks, not stale
   history. The DLSS preset changes were not imported.
 - RCAS uses `fsr_sharpening_slider` with the existing inverted 0–200 mapping (stops × 100;
   stored 200 disables sharpening). HUD handling
-  and the Max Resolution 1440p-to-4K presentation composition are shared with #606.
+  and the Max Resolution 1440p-to-4K presentation composition are shared with another ported change.
 - FXAA and SMAA are skipped on frames either temporal backend drew.
 - Any unexpected input, a busy frame slot, a rescaled image (resolution scale other than 1x) or
   a failed evaluation leaves the game's pass to run. The log names the reason as
@@ -135,7 +135,7 @@ and makes later evaluations fall back; it does not wait for the scheduler worker
 The old `EDEN_NX2_DLSS_STANDIN` variable is not read. The internal `standin` backend override
 does not select Fire Emblem's intercepted dispatch. The RCAS sharpness setting controls FSR
 and fallback sharpening. NVIDIA model-selection overrides
-from the upstream implementation remain available for diagnostic comparisons.
+from the original implementation remain available for diagnostic comparisons.
 
 ## Build and distribution
 
@@ -161,8 +161,7 @@ NVIDIA app's signed DLSS model. The UI and Windows loading path require Windows 
 ## Provenance
 
 This backport is AI-assisted and requires human review and testing before distribution.
-It carries upstream work by Duck912 from Eglantine commits `08dbcc7e3b3d`, `11cebf56014a`
-and PR #434 through `f9d0c802e8e4`, plus Jonas's warning fix `537c1f4e173a`. The empty-extension requirement
-fix `1889602c7a0d` is a separately included follow-up. Existing SPDX notices and AMD/NVIDIA
-license text are retained. The upstream nx2 merge also carries newer asynchronous recording
+It carries ported work (two commits and a pull request, plus a warning fix). The empty-extension requirement
+fix is a separately included follow-up. Existing SPDX notices and AMD/NVIDIA
+license text are retained. The original nx2 merge also carries newer asynchronous recording
 and fallback changes while retaining the fork's signature checks and input validation.

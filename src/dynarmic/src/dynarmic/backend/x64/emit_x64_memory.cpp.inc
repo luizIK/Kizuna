@@ -27,6 +27,18 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
     if (do_not_fastmem.count(marker) > 0) {
         return std::nullopt;
     }
+    // Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): an access that faulted on another core.
+    if (shared_fastmem_marks) {
+        bool marked = false;
+        {
+            std::shared_lock lock{shared_fastmem_marks->mutex};
+            marked = shared_fastmem_marks->marks.count(marker) > 0;
+        }
+        if (marked) {
+            NoteSharedFastmemMarkUsed(*shared_fastmem_marks, unsigned(conf.processor_id));
+            return std::nullopt;
+        }
+    }
     return marker;
 }
 
@@ -60,6 +72,13 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+    // Fritchii (FRITCHII_JIT_SHARED): the patch table, the markers and the block map are the
+    // process's, written by whichever core compiles; the compile lock covers them. No thread holds
+    // it while running generated code, so the faulting core can always take it.
+    std::unique_lock<std::mutex> shared_lock;
+    if (shared_code) {
+        shared_lock = std::unique_lock<std::mutex>{shared_code->compile_mutex};
+    }
     const u64 base = std::bit_cast<u64>(code.getCode());
     const auto iter = rip_ >= base && rip_ - base <= UINT32_MAX
                         ? std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), u32(rip_ - base),
@@ -73,7 +92,32 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         if (iter->recompile) {
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
             do_not_fastmem.insert(marker);
-            InvalidateBasicBlocks({std::get<0>(marker)});
+            if (shared_fastmem_marks) {
+                // Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): the other cores compile this
+                // access without fastmem from now on (their blocks already compiled still fault
+                // once each, as before).
+                std::unique_lock lock{shared_fastmem_marks->mutex};
+                if (shared_fastmem_marks->marks.insert(marker).second) {
+                    shared_fastmem_marks->faults.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            bool drop = true;
+            if (shared_code) {
+                // FRITCHII_JIT_SHARED: another core may still run a copy dropped before (its own
+                // dispatch table drops it at its next entry); only the block now in the map, the
+                // one holding this access, goes, not the one compiled again without fastmem.
+                const auto current = block_descriptors.find(iter->location);
+                const u64 entry = current != block_descriptors.end() ? std::bit_cast<u64>(current->second.entrypoint) : 0;
+                drop = entry != 0 && rip_ >= entry && rip_ - entry < current->second.size;
+            }
+            if (drop) {
+                InvalidateBasicBlocks({std::get<0>(marker)});
+            }
+            if (drop && ::Common::Nx2Hitch::SplitEnabled()) {
+                // Fritchii (FRITCHII_HITCH_SPLIT): a block dropped to be compiled again without
+                // fastmem for this access (once per access and core).
+                ::Common::Nx2Hitch::AddCount(::Common::Nx2Hitch::Cause::CodeDropFastmem, 0, 1);
+            }
         }
         return result;
     }
@@ -245,7 +289,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(code, inst, {}, args[1]);
 
         code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        code.MovCoreRef(code.ABI_PARAM1, CoreRef::Conf, reinterpret_cast<u64>(&conf));
         if (ordered) {
             code.mfence();
         }
@@ -262,7 +306,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(code, nullptr);
 
         code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        code.MovCoreRef(code.ABI_PARAM1, CoreRef::Conf, reinterpret_cast<u64>(&conf));
         ctx.reg_alloc.AllocStackSpace(code, 16 + ABI_SHADOW_SPACE);
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
         if (ordered) {
@@ -302,10 +346,11 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.mov(code.ABI_RETURN, u32(1));
     code.movzx(tmp.cvt32(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
     code.test(tmp.cvt8(), tmp.cvt8());
-    code.je(end);
+    // Fritchii (FRITCHII_JIT_PIN): the call's pin stores and reloads may outgrow a short jump.
+    code.je(end, code.Pins().regs.empty() ? code.T_AUTO : code.T_NEAR);
     code.xor_(tmp.cvt32(), tmp.cvt32());
     code.xchg(tmp.cvt8(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
-    code.mov(code.ABI_PARAM1, u64(&conf));
+    code.MovCoreRef(code.ABI_PARAM1, CoreRef::Conf, u64(&conf));
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
         code.CallLambda([](AxxUserConfig& conf, Axx::VAddr vaddr, T value) -> u32 {
@@ -364,7 +409,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    code.MovCoreRef(tmp, CoreRef::MonitorAddress, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
     code.mov(qword[tmp], vaddr);
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
@@ -391,7 +436,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    code.MovCoreRef(tmp, CoreRef::MonitorValue, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
 
     EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
@@ -443,14 +488,14 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     code.movzx(tmp.cvt32(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
     code.test(tmp.cvt8(), tmp.cvt8());
     code.je(*end, code.T_NEAR);
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    code.MovCoreRef(tmp, CoreRef::MonitorAddress, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
     code.cmp(qword[tmp], vaddr);
     code.jne(*end, code.T_NEAR);
 
     EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    code.MovCoreRef(tmp, CoreRef::MonitorValue, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
 
     if constexpr (bitsize == 128) {
         code.mov(rax, qword[tmp + 0]);

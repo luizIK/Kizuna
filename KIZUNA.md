@@ -1,10 +1,48 @@
 # Kizuna
 
-Kizuna is a personal fork of **Fritchii v5.8.4** (itself derived from Lichii and Eden/yuzu),
+Kizuna is a personal fork of **Fritchii v6.2** (itself derived from Lichii and Eden/yuzu),
 tuned for a 8 GB GPU (AMD RX 6600). All credit for the emulator goes to the authors of those
 projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright notices.
 
-## What differs from Fritchii v5.8.4
+## What differs from Fritchii v6.2 (since v1.21)
+
+v1.21 merged the `fritchii-v6.2` tag into the `kizuna` branch (a merge commit, so a later
+Fritchii release merges the same way). The emulator itself (`src/video_core`, `src/core`,
+`src/common`) is v6.2's as released: v6.2 already has what Kizuna had added to v5.8.4 (clean_words
+on, Lichii #1458 and #1459, its own `VK_KHR_pipeline_binary` store, on by default on AMD's
+Windows driver, the wait at Windows' commit limit, Lichii #1335 behind a switch), and its shader
+stamp guard refuses any stamp but v6.2's. What Kizuna changes on top:
+
+- **Name and look.** "Kizuna vX.Y" in the window title, About, the log's first line and the
+  messages (`common/kizuna_branding.h`, from the release tag); the "Ink" theme, the logo and icon,
+  the console-style home screen (`fritchii/home.cpp`). No Fritchii Discord or donation links.
+- **lichii.exe.** Fritchii v6 builds `fritchii.exe` plus a small `lichii.exe` forwarder; Kizuna
+  builds the emulator itself as `lichii.exe` and no forwarder (`src/yuzu/CMakeLists.txt`,
+  `src/CMakeLists.txt`), and its updater replaces and restarts `lichii.exe`.
+- **Updater** on `kizuna-vX.Y` releases of luizIK/Kizuna only (`frontend_common/update_checker.cpp`).
+- **Hotkeys.** Ctrl+U switches Ocarina between 30 and 60 FPS, Ctrl+Shift+U its high refresh
+  mode, each with a notice over the game; a notice also warns when Windows has under 3 GiB of
+  commit left.
+- **Built-in switch `FRITCHII_AMD_OVERALLOCATE=1`** (Kizuna v1.19, a test switch upstream): AMD's
+  driver overflows device memory into system memory instead of failing allocations (an RX 6600
+  with Discord in a call lost its session without it). `=0` in `nx2_switches.txt` turns it off.
+- **Build.** The `kizuna-windows` workflow: MinGW clang, `-march=x86-64-v3 -mtune=znver3`, and the
+  old `eglantine.profdata` (Fritchii removed it in v6.2 and builds its releases with a private
+  OoT-trained profile, so official Fritchii binaries may be somewhat faster than Kizuna's).
+
+Dropped with the merge (v6.2 has its own way, or the feature is gone upstream): Kizuna's quick
+shader preparation, its pipeline binary store, render target and buffer out-of-memory recovery,
+the 192 MiB VRAM reserve, ASTC uneven-mip handling (v6.2 keeps those textures as RGBA8, so no
+dark grid lines on the terrain), the shader-freeze tweaks of v1.13-v1.15, the occlusion query
+list reuse of v1.17, `kizuna_crash_report` (v6.2's crash handler logs a "Host crash" line and
+writes `eden_crash.dmp` in the log folder) and frame generation (removed in v6.2, 9f95262d0).
+The shader stamp is v6.2's, so the first start of v1.21 prepares shaders once.
+
+## History: v1.0 to v1.20 on Fritchii v5.8.4
+
+What follows describes the fork as it was on v5.8.4; most of it was replaced in v1.21.
+
+### What differed from Fritchii v5.8.4
 
 - **Out-of-memory recovery for render targets.** When a render target cannot be allocated
   (`VK_ERROR_OUT_OF_DEVICE_MEMORY`), the texture cache frees memory right away (emergency
@@ -204,27 +242,14 @@ projects; this fork keeps their GPLv3 license (`LICENSE.txt`) and copyright noti
 
 ## Keeping the "Preparing shaders" cache valid
 
-The marker of a finished preparation (`precompiled_prepared.fork-v54.txt`) holds the precompiled
-file's size and last write time, the driver, the shader stamp and the GPU. The time has to be
-read the way the Fritchii (MSVC) builds read it, as FILETIME ticks (100 ns since 1601):
-the MinGW standard library counts nanoseconds from another epoch and drops the fractions of a
-second, so a marker written by Fritchii never matched and the whole preparation ran again.
-`VideoCommon::FileWriteTicks` (`pipeline_cache_files.cpp`) reads it with the Windows API on
-MinGW; the marker, the warm-up stamps and the merge log use it.
-
-Upstream stamps the shader preparation (`NX2_SHADER_STAMP`, `CMakeModules/Nx2ShaderStamp.cmake`)
-with a hash of the shader recompiler and of `vk_graphics_pipeline.*`, `vk_compute_pipeline.*`,
-`fixed_pipeline_state.*` and `nx2_precompile.*`. Any edit to those files changes the stamp, and
-the first start then rebuilds every pipeline (1 to 2 hours, about 120,000 of them). Kizuna avoids
-this in two ways:
-
-- Prefer changes outside those files.
-- When a change in one of them cannot alter a compiled pipeline (a guard in the draw path, say),
-  wrap it in `// KIZUNA-STAMP-NEUTRAL-BEGIN` / `// KIZUNA-STAMP-NEUTRAL-END` (one block per
-  file, each marker alone on its line). The stamp script hashes the file without that block, so
-  the stamp stays equal to upstream's and a shader cache built by Fritchii v5.8.4 is reused.
-
-Never mark code that changes shader translation or pipeline creation as neutral.
+`NX2_SHADER_STAMP` (`CMakeModules/Nx2ShaderStamp.cmake`) hashes the shader recompiler,
+`vk_graphics_pipeline.*`, `vk_compute_pipeline.*`, `fixed_pipeline_state.*` and `nx2_precompile.*`.
+A new stamp sends every player through the preparation again, and since v6.2 the build stops on
+any stamp outside `KnownStamps` (v6.2's: `143b6220486fb09b` from a CRLF checkout, as on the
+Windows runner, `3dc8b3ea00f9b392` from an LF one). Keep those files equal to Fritchii's. A
+member that can't change a compiled pipeline can go in a header between `FRITCHII_STAMP_SKIP_BEGIN`
+and `FRITCHII_STAMP_SKIP_END` (only the headers in `SkipBlocksIn`). Kizuna's old
+`KIZUNA-STAMP-NEUTRAL` markers are gone with v5.8.4. After each build, check the stamp in the exe.
 
 ## Building
 

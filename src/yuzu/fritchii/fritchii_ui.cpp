@@ -171,6 +171,8 @@ QIcon IconTinted(const QString& name, const QColor& color, int px) {
         return {};
     }
     return QIcon(RenderSvg(file.readAll(), color, px));
+}
+
 void ShowNotice(QWidget* anchor, const QString& text) {
     static QPointer<QLabel> label;
     static QPointer<QTimer> timer;
